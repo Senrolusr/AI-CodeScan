@@ -1,0 +1,40 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Backend runtime data
+/backend/data/audit.db
+/backend/data/project_cache/
+/backend/data/stage_artifacts/
+/backend/uploads/
+/backend/reports/
+!/backend/data/.gitkeep
+!/backend/uploads/.gitkeep
+!/backend/reports/.gitkeep
+
+# Frontend build output
+/frontend/node_modules/
+/frontend/dist/
+/frontend/dist-ssr/
+
+# Root export / reports
+/reports/
+!/reports/.gitkeep
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*

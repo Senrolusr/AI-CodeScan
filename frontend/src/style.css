@@ -1,0 +1,205 @@
+/* ── Theme: Light (default) ── */
+:root {
+  /* Text */
+  --text-primary: #303133;
+  --text-secondary: #606266;
+  --text-muted: #909399;
+
+  /* Backgrounds */
+  --bg-page: #f5f7fa;
+  --bg-card: #fff;
+  --bg-alt: #fafafa;
+  --bg-header: #fff;
+
+  /* Borders */
+  --border-default: #ebeef5;
+  --border-light: #e6e6e6;
+
+  /* Semantic — light surfaces */
+  --bg-success: #f0f9eb;
+  --border-success: #e1f3d8;
+  --text-success: #2f6b1f;
+  --bg-warning: #fdf6ec;
+  --border-warning: #faecd8;
+  --text-warning: #8a5a00;
+  --bg-danger: #fef0f0;
+  --border-danger: #fde2e2;
+  --text-danger: #c45656;
+  --bg-info: #ecf5ff;
+  --border-info: #d9ecff;
+  --text-info: #3a7ecf;
+
+  /* Recommendation */
+  --bg-recommendation: #f6ffed;
+  --border-recommendation: #d9f7be;
+  --text-recommendation: #2f6b1f;
+
+  /* Code & POC */
+  --bg-code: #1e1e1e;
+  --text-code: #d4d4d4;
+  --bg-poc: #fff3cd;
+  --border-poc: #ffc107;
+
+  /* Sidebar */
+  --bg-sidebar: #304156;
+  --text-sidebar: #bfcbd9;
+  --text-sidebar-active: #409EFF;
+  --border-sidebar: #3a4a5b;
+}
+
+/* ── Theme: Dark ── */
+html.dark {
+  --text-primary: #CFD3DC;
+  --text-secondary: #A3A6AD;
+  --text-muted: #6C6E72;
+
+  --bg-page: #141414;
+  --bg-card: #1d1d1d;
+  --bg-alt: #191919;
+  --bg-header: #1d1d1d;
+
+  --border-default: #414243;
+  --border-light: #414243;
+
+  --bg-success: #1a2e1a;
+  --border-success: #2d4a2d;
+  --text-success: #7ecf7e;
+  --bg-warning: #2e2a1a;
+  --border-warning: #4a452d;
+  --text-warning: #d4a94e;
+  --bg-danger: #2e1a1a;
+  --border-danger: #4a2d2d;
+  --text-danger: #e07070;
+  --bg-info: #1a2430;
+  --border-info: #2d3d50;
+  --text-info: #6da8d6;
+
+  --bg-recommendation: #1a2e1a;
+  --border-recommendation: #2d4a2d;
+  --text-recommendation: #7ecf7e;
+
+  --bg-code: #0d0d0d;
+  --text-code: #c8c8c8;
+  --bg-poc: #2e2a1a;
+  --border-poc: #5a4e2d;
+
+  --bg-sidebar: #141414;
+  --text-sidebar: #8a8e96;
+  --text-sidebar-active: #409EFF;
+  --border-sidebar: #2c2c2c;
+}
+
+/* ── Base ── */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: "Helvetica Neue", Helvetica, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  width: 100%;
+  height: 100vh;
+}
+
+/* ── Code display ── */
+pre.code-block {
+  background: var(--bg-code);
+  color: var(--text-code);
+  padding: 16px;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.6;
+  font-family: "Consolas", "Monaco", "Courier New", monospace;
+}
+
+/* ── POC display ── */
+.poc-block {
+  background: var(--bg-poc);
+  border: 1px solid var(--border-poc);
+  border-radius: 6px;
+  padding: 12px;
+  font-family: monospace;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ── Layout ── */
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+.flex-wrap-gap {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ── Typography ── */
+.text-primary { color: var(--text-primary); }
+.text-secondary { color: var(--text-secondary); }
+.text-muted {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.card-title {
+  font-weight: bold;
+}
+
+/* ── Backgrounds ── */
+.bg-page { background: var(--bg-page); }
+.bg-card { background: var(--bg-card); }
+.bg-alt { background: var(--bg-alt); }
+
+/* ── Semantic surfaces ── */
+.success-surface {
+  background: var(--bg-success);
+  border: 1px solid var(--border-success);
+  border-radius: 10px;
+  color: var(--text-success);
+}
+.warning-surface {
+  background: var(--bg-warning);
+  border: 1px solid var(--border-warning);
+  border-radius: 10px;
+  color: var(--text-warning);
+}
+.danger-surface {
+  background: var(--bg-danger);
+  border: 1px solid var(--border-danger);
+  border-radius: 10px;
+  color: var(--text-danger);
+}
+.info-surface {
+  background: var(--bg-info);
+  border: 1px solid var(--border-info);
+  border-radius: 10px;
+  color: var(--text-info);
+}
+
+/* ── Notice / Recommendation ── */
+.warning-notice {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-warning);
+  color: var(--text-warning);
+  line-height: 1.6;
+}
+.recommendation-item {
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--bg-recommendation);
+  border: 1px solid var(--border-recommendation);
+  color: var(--text-recommendation);
+  line-height: 1.7;
+}
