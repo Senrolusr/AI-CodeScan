@@ -1243,8 +1243,7 @@ def _build_import_graph(project_dir: str, file_tree: list) -> dict:
         if f.get("size", 0) > MAX_FILE_SIZE:
             continue
         try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as fh:
-                content = fh.read()
+            content = _read_source_text(full_path)
         except Exception:
             continue
 
@@ -1424,6 +1423,15 @@ _MIDDLEWARE_PATTERNS = [
 ]
 
 
+def _first_match_group(match: re.Match[str] | None) -> str:
+    """优先返回第一个捕获组；无捕获组时退回完整匹配文本。"""
+    if not match:
+        return ""
+    if match.lastindex and match.lastindex >= 1:
+        return str(match.group(1) or "")
+    return str(match.group(0) or "")
+
+
 def _build_middleware_map(project_dir: str, file_tree: list, code_chunks: list[dict]) -> dict:
     """Extract middleware registrations and auth decorator mappings."""
     files = _flatten_files(file_tree)
@@ -1437,8 +1445,7 @@ def _build_middleware_map(project_dir: str, file_tree: list, code_chunks: list[d
         if f.get("size", 0) > MAX_FILE_SIZE:
             continue
         try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as fh:
-                content = fh.read()
+            content = _read_source_text(full_path)
         except Exception:
             continue
 
@@ -1451,7 +1458,7 @@ def _build_middleware_map(project_dir: str, file_tree: list, code_chunks: list[d
         # Detect auth decorators
         for pattern in _AUTH_DECORATOR_PATTERNS:
             for match in pattern.finditer(content):
-                deco_name = match.group(1) or match.group(0).lstrip("@")
+                deco_name = _first_match_group(match).lstrip("@")
                 if deco_name not in auth_decorators:
                     auth_decorators[deco_name] = {"file_path": fp, "count": 0}
                 auth_decorators[deco_name]["count"] += 1
@@ -1462,7 +1469,7 @@ def _build_middleware_map(project_dir: str, file_tree: list, code_chunks: list[d
         content = str(chunk.get("content", "")[:8000])
         for pattern in _AUTH_DECORATOR_PATTERNS:
             for match in pattern.finditer(content):
-                deco_name = match.group(1) or match.group(0).lstrip("@")
+                deco_name = _first_match_group(match).lstrip("@")
                 # Find nearby route definitions
                 route_match = re.search(r'(?:app|router|bp|blueprint|api)\.(get|post|put|delete|patch)\(\s*["\']([^"\']*)["\']', content[match.end():match.end() + 200])
                 if not route_match:
@@ -1525,8 +1532,7 @@ def _identify_security_critical_files(
         if f.get("size", 0) > MAX_FILE_SIZE:
             continue
         try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as fh:
-                content = fh.read()
+            content = _read_source_text(full_path)
         except Exception:
             continue
 
@@ -1831,11 +1837,22 @@ def _read_project_file(project_dir: str, filename: str) -> str:
         if filename in files:
             file_path = os.path.join(root, filename)
             try:
-                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read(200_000)
+                return _read_source_text(file_path)[:200_000]
             except OSError:
                 return ""
     return ""
+
+
+def _read_source_text(full_path: str) -> str:
+    """优先按 UTF-8 读取源码，失败后回退常见中文编码，尽量减少规则证据乱码。"""
+    for encoding in ["utf-8", "utf-8-sig", "gb18030", "gbk", "big5", "latin-1"]:
+        try:
+            with open(full_path, "r", encoding=encoding) as fh:
+                return fh.read()
+        except UnicodeDecodeError:
+            continue
+    with open(full_path, "r", encoding="utf-8", errors="replace") as fh:
+        return fh.read()
 
 
 def _flatten_files(tree: list) -> list:
@@ -1868,8 +1885,7 @@ def get_code_chunks(project_dir: str, file_tree: list, max_chunk_size: int = 300
         stats["files_considered"] += 1
 
         try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as fh:
-                content = fh.read()
+            content = _read_source_text(full_path)
         except Exception:
             continue
 
@@ -2463,7 +2479,7 @@ def _extract_rust_routes(file_path: str, content: str, prefix_override: str = ""
 
 
 def _extract_php_routes(file_path: str, content: str, prefix_override: str = "") -> list[dict]:
-    """Extract PHP Laravel and Symfony routes."""
+    """Extract PHP Laravel, Symfony and common dynamic-controller routes."""
     routes = []
 
     # Laravel: Route::get/post/put/delete/patch/any('/path', ...)
@@ -2512,7 +2528,106 @@ def _extract_php_routes(file_path: str, content: str, prefix_override: str = "")
                 "file_path": file_path, "auth": _guess_auth_type(content),
                 "params": _extract_route_params(full_path), "notes": "Static route extraction (Symfony)",
             })
+
+    # 兼容 Ginkgo/PHPEMS 一类的动态控制器分发模式，补出阶段一需要的路由骨架。
+    routes.extend(_extract_php_dynamic_controller_routes(file_path, content))
+
+    # 兼容 api/*.php 这类独立入口脚本，避免支付回调、Webhook 等入口被漏掉。
+    routes.extend(_extract_php_entry_script_routes(file_path, content))
     return routes
+
+
+def _extract_php_dynamic_controller_routes(file_path: str, content: str) -> list[dict]:
+    """Extract best-effort routes for PHP dynamic controller dispatchers."""
+    normalized_path = file_path.replace("\\", "/")
+    controller_match = re.search(
+        r"(?:^|/)app/([^/]+)/controller/([^/.]+)\.([^.\/]+)\.php$",
+        normalized_path,
+        re.I,
+    )
+    if not controller_match:
+        return []
+
+    module_name, controller_name, surface_name = controller_match.groups()
+    has_dynamic_dispatch = (
+        re.search(r"\$action\s*=\s*\$this->\w+->url\s*\(\s*3\s*\)", content)
+        and re.search(r"method_exists\s*\(\s*\$this\s*,\s*\$action\s*\)", content)
+        and re.search(r"\$this->\s*\$action\s*\(", content)
+    )
+    if not has_dynamic_dispatch:
+        return []
+
+    actions = []
+    seen_actions = set()
+    for action_match in re.finditer(r"(?:public|protected|private)\s+function\s+([A-Za-z_]\w*)\s*\(", content):
+        action_name = action_match.group(1)
+        normalized_action = action_name.lower()
+        if normalized_action == "display" or normalized_action.startswith("__"):
+            continue
+        if normalized_action in seen_actions:
+            continue
+        seen_actions.add(normalized_action)
+        actions.append(action_name)
+
+    if not actions:
+        return []
+
+    route_key = f"{module_name}-{surface_name}-{controller_name}"
+    routes = []
+
+    default_action = "index" if any(action.lower() == "index" for action in actions) else actions[0]
+    default_path = _normalize_route_path(f"/index.php?{route_key}")
+    routes.append(
+        {
+            "method": "ANY",
+            "path": default_path,
+            "handler": f"{module_name}/{controller_name}.{surface_name}::{default_action}",
+            "file_path": file_path,
+            "auth": _guess_auth_type(content),
+            "params": _extract_route_params(default_path),
+            "notes": "Static route extraction (PHP dynamic controller)",
+        }
+    )
+
+    for action_name in actions:
+        if action_name.lower() == "index":
+            continue
+        action_path = _normalize_route_path(f"/index.php?{route_key}-{action_name}")
+        routes.append(
+            {
+                "method": "ANY",
+                "path": action_path,
+                "handler": f"{module_name}/{controller_name}.{surface_name}::{action_name}",
+                "file_path": file_path,
+                "auth": _guess_auth_type(content),
+                "params": _extract_route_params(action_path),
+                "notes": "Static route extraction (PHP dynamic controller)",
+            }
+        )
+    return routes
+
+
+def _extract_php_entry_script_routes(file_path: str, content: str) -> list[dict]:
+    """Extract best-effort routes for standalone PHP entry scripts."""
+    normalized_path = file_path.replace("\\", "/")
+    if not re.match(r"^api/[^/]+\.php$", normalized_path, re.I):
+        return []
+    if "class app" not in content or "$app->run()" not in content:
+        return []
+
+    route_path = _normalize_route_path(f"/{normalized_path}")
+    handler_name = f"{os.path.splitext(os.path.basename(normalized_path))[0]}::run"
+    return [
+        {
+            "method": "ANY",
+            "path": route_path,
+            "handler": handler_name,
+            "file_path": file_path,
+            "auth": _guess_auth_type(content),
+            "params": _extract_route_params(route_path),
+            "notes": "Static route extraction (PHP entry script)",
+        }
+    ]
 
 
 def _extract_python_async_routes(file_path: str, content: str, prefix_override: str = "") -> list[dict]:

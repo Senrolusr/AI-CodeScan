@@ -64,10 +64,6 @@ class AuditCreate(BaseModel):
     llm_config_id: int
 
 
-class RunPhaseRequest(BaseModel):
-    phase: int  # 1-4
-
-
 class AuditTaskOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -129,6 +125,7 @@ class VulnerabilityOut(BaseModel):
     dedupe_key: str
     diff_status: str
     confirmed_status: str
+    verification_state: str = "candidate"
     confidence: str = "medium"
 
 

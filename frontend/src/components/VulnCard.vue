@@ -3,7 +3,16 @@ import { useI18n } from '../i18n'
 
 defineProps({ vuln: Object })
 const emit = defineEmits(['click'])
-const { statusLabel, severityLabel, severityColor, diffStatusLabel, pocTagType, t } = useI18n()
+const {
+  statusLabel,
+  severityLabel,
+  severityColor,
+  diffStatusLabel,
+  pocTagType,
+  verificationStateLabel,
+  verificationStateType,
+  t,
+} = useI18n()
 </script>
 
 <template>
@@ -30,6 +39,9 @@ const { statusLabel, severityLabel, severityColor, diffStatusLabel, pocTagType, 
       </el-tag>
       <el-tag size="small" :type="vuln.diff_status === 'existing' ? 'info' : 'danger'">
         {{ diffStatusLabel(vuln.diff_status) }}
+      </el-tag>
+      <el-tag size="small" :type="verificationStateType(vuln.verification_state)">
+        {{ verificationStateLabel(vuln.verification_state) }}
       </el-tag>
       <el-tag size="small" :type="pocTagType(vuln.poc_validation_status)">
         {{ vuln.poc_validation_status === 'valid' ? t('pocValid') : vuln.poc_validation_status === 'invalid' ? t('pocInvalid') : t('pocUnknown') }}

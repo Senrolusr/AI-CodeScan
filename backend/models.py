@@ -86,4 +86,5 @@ class Vulnerability(Base):
     dedupe_key = Column(String(128), default="", index=True)
     diff_status = Column(String(50), default="new")  # new/existing
     confirmed_status = Column(String(50), default="pending")  # pending/confirmed/false_positive/fixed
+    verification_state = Column(String(20), default="candidate")  # verified/candidate
     confidence = Column(String(20), default="medium")  # high/medium/low

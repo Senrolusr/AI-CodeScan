@@ -1,4 +1,4 @@
-"""Supervisor 多 Agent 审计编排器。"""
+"""Supervisor multi-agent audit orchestrator."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from database import async_session
 from models import AuditStage, AuditTask, LlmConfig, Project, Vulnerability
@@ -42,6 +42,232 @@ from services.audit_engine import (
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_rerun_stage_nums(rerun_agents: list) -> list[int]:
+    stage_nums = []
+    for item in rerun_agents or []:
+        value = item.get("stage_num") if isinstance(item, dict) else item
+        if isinstance(value, int) or str(value).isdigit():
+            stage_num = int(value)
+            if 2 <= stage_num <= 9 and stage_num not in stage_nums:
+                stage_nums.append(stage_num)
+    return stage_nums
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_rerun_execution(stages: list[AuditStage], requested_stage_nums: list[int]) -> dict:
+    requested = _normalize_rerun_stage_nums(requested_stage_nums)
+    stage_map = {stage.stage_num: stage for stage in stages}
+    executed_stage_nums: list[int] = []
+    failed_stage_nums: list[int] = []
+    stage_results: list[dict] = []
+
+    for stage_num in requested:
+        stage = stage_map.get(stage_num)
+        if not stage:
+            continue
+        executed_stage_nums.append(stage_num)
+        vuln_count = 0
+        findings = stage.findings if isinstance(stage.findings, dict) else {}
+        vulnerabilities = findings.get("vulnerabilities", [])
+        if isinstance(vulnerabilities, list):
+            vuln_count = len(vulnerabilities)
+        if stage.status != "completed":
+            failed_stage_nums.append(stage_num)
+        stage_results.append(
+            {
+                "stage_num": stage_num,
+                "status": stage.status,
+                "vulnerability_count": vuln_count,
+            }
+        )
+
+    return {
+        "triggered": bool(requested),
+        "requested_stage_nums": requested,
+        "executed_stage_nums": executed_stage_nums,
+        "failed_stage_nums": failed_stage_nums,
+        "stage_results": stage_results,
+    }
+
+
+def _finalize_review_result(review: dict, stages: list[AuditStage]) -> dict:
+    normalized = dict(review) if isinstance(review, dict) else {}
+    normalized["request_rerun"] = bool(normalized.get("request_rerun"))
+    normalized["rerun_agents"] = _normalize_rerun_stage_nums(normalized.get("rerun_agents"))
+
+    findings_assessment = normalized.get("findings_assessment")
+    if not isinstance(findings_assessment, dict):
+        findings_assessment = {}
+    questionable_count = max(0, _safe_int(findings_assessment.get("questionable_count"), 0))
+    coverage_gaps = findings_assessment.get("coverage_gaps", [])
+    if not isinstance(coverage_gaps, list):
+        coverage_gaps = []
+    findings_assessment["questionable_count"] = questionable_count
+    findings_assessment["high_quality_count"] = max(0, _safe_int(findings_assessment.get("high_quality_count"), 0))
+    findings_assessment["coverage_gaps"] = [str(item).strip() for item in coverage_gaps if str(item).strip()][:12]
+    normalized["findings_assessment"] = findings_assessment
+
+    rerun_execution = normalized.get("rerun_execution")
+    if isinstance(rerun_execution, dict):
+        requested_stage_nums = _normalize_rerun_stage_nums(rerun_execution.get("requested_stage_nums"))
+        executed_stage_nums = _normalize_rerun_stage_nums(rerun_execution.get("executed_stage_nums"))
+        failed_stage_nums = _normalize_rerun_stage_nums(rerun_execution.get("failed_stage_nums"))
+        if not failed_stage_nums:
+            stage_results = rerun_execution.get("stage_results", [])
+            if isinstance(stage_results, list):
+                failed_stage_nums = [
+                    _safe_int(item.get("stage_num"))
+                    for item in stage_results
+                    if isinstance(item, dict) and str(item.get("status", "") or "").strip() != "completed"
+                ]
+                failed_stage_nums = [num for num in failed_stage_nums if 2 <= num <= 9]
+        rerun_execution = {
+            "triggered": bool(rerun_execution.get("triggered") or requested_stage_nums or executed_stage_nums),
+            "requested_stage_nums": requested_stage_nums,
+            "executed_stage_nums": executed_stage_nums,
+            "failed_stage_nums": failed_stage_nums,
+            "stage_results": rerun_execution.get("stage_results", []) if isinstance(rerun_execution.get("stage_results"), list) else [],
+        }
+        normalized["rerun_execution"] = rerun_execution
+    else:
+        rerun_execution = None
+
+    closure_status = "accepted"
+    next_action = "none"
+    status_summary = "审核通过，无需重跑。"
+    unresolved_stage_nums: list[int] = []
+
+    if rerun_execution and rerun_execution.get("triggered"):
+        requested = rerun_execution.get("requested_stage_nums", [])
+        executed = rerun_execution.get("executed_stage_nums", [])
+        failed = rerun_execution.get("failed_stage_nums", [])
+        unresolved_stage_nums = normalized["rerun_agents"] or failed
+        if failed:
+            closure_status = "manual_followup_required"
+            next_action = "manual_review"
+            status_summary = f"已自动重跑 {', '.join(f'Stage {num}' for num in executed)}，但以下阶段仍执行失败：{', '.join(f'Stage {num}' for num in failed)}。"
+        elif normalized["request_rerun"] and normalized["rerun_agents"]:
+            closure_status = "manual_followup_required"
+            next_action = "manual_review"
+            status_summary = f"已自动重跑 {', '.join(f'Stage {num}' for num in executed)}，但复核后仍建议继续关注 {', '.join(f'Stage {num}' for num in normalized['rerun_agents'])}。"
+        else:
+            closure_status = "auto_rerun_resolved"
+            next_action = "none"
+            status_summary = f"已自动重跑 {', '.join(f'Stage {num}' for num in executed)}，复核后未再要求重跑。"
+    elif normalized["request_rerun"] and normalized["rerun_agents"]:
+        closure_status = "rerun_recommended"
+        next_action = "rerun"
+        unresolved_stage_nums = normalized["rerun_agents"]
+        status_summary = f"审核建议重跑 {', '.join(f'Stage {num}' for num in normalized['rerun_agents'])}。"
+    elif findings_assessment["coverage_gaps"] or questionable_count > 0:
+        closure_status = "accepted_with_notes"
+        next_action = "monitor"
+        status_summary = "审核完成，但仍存在覆盖缺口或待人工关注项。"
+
+    normalized["review_closure"] = {
+        "status": closure_status,
+        "next_action": next_action,
+        "status_summary": status_summary,
+        "requested_stage_nums": normalized["rerun_agents"],
+        "executed_stage_nums": rerun_execution.get("executed_stage_nums", []) if rerun_execution else [],
+        "failed_stage_nums": rerun_execution.get("failed_stage_nums", []) if rerun_execution else [],
+        "unresolved_stage_nums": unresolved_stage_nums,
+        "questionable_count": questionable_count,
+        "coverage_gap_count": len(findings_assessment["coverage_gaps"]),
+        "auto_handled": closure_status == "auto_rerun_resolved",
+    }
+
+    review_summary = str(normalized.get("review_summary", "") or "").strip()
+    if status_summary and status_summary not in review_summary:
+        normalized["review_summary"] = f"{status_summary}\n\n{review_summary}".strip() if review_summary else status_summary
+    elif not review_summary:
+        normalized["review_summary"] = status_summary
+
+    additional_guidance = str(normalized.get("additional_guidance", "") or "").strip()
+    if not additional_guidance:
+        if closure_status == "manual_followup_required":
+            normalized["additional_guidance"] = "自动重跑已完成，但仍有问题未收敛。请优先人工复核上述阶段的覆盖范围、证据链和 PoC 完整性。"
+        elif closure_status == "accepted_with_notes":
+            normalized["additional_guidance"] = "当前结果可以先使用；如果后续需要进一步降低漏报率，建议优先补扫上述覆盖缺口。"
+
+    return normalized
+
+
+async def _run_supervisor_review_closure(
+    session,
+    task,
+    stages,
+    llm_config,
+    project,
+    code_chunks,
+    static_routes,
+    rule_hits,
+    source_sink_hints,
+    agent_plan,
+):
+    audit_memory = _build_audit_memory(list(stages))
+    review = await _run_supervisor_review(session, task, stages, llm_config, audit_memory, agent_plan)
+    rerun_stage_nums = _normalize_rerun_stage_nums(review.get("rerun_agents"))
+    if review.get("request_rerun") and rerun_stage_nums:
+        await _reset_agent_stages_for_rerun(session, task.id, stages, rerun_stage_nums)
+        rerun_plan = {"selected_agents": [{"stage_num": stage_num} for stage_num in rerun_stage_nums], "skipped_agents": []}
+        await _execute_sub_agents(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, rerun_plan)
+        stages = await _reload_task_stages(session, task.id)
+        audit_memory = _build_audit_memory(list(stages))
+        rerun_execution = _build_rerun_execution(stages, rerun_stage_nums)
+        review = await _run_supervisor_review(
+            session,
+            task,
+            stages,
+            llm_config,
+            audit_memory,
+            agent_plan,
+            extra_findings={"rerun_execution": rerun_execution},
+        )
+    return review, stages
+
+
+async def _reset_agent_stages_for_rerun(session, task_id: int, stages: list[AuditStage], stage_nums: list[int]) -> None:
+    """Reset target stages before rerun so completed stages are not skipped."""
+    if not stage_nums:
+        return
+
+    target_stage_ids = []
+    for stage in stages:
+        if stage.stage_num not in stage_nums:
+            continue
+        stage.status = "pending"
+        stage.findings = []
+        stage.prompt_used = ""
+        stage.llm_response = ""
+        stage.compressed_summary = {}
+        stage.started_at = None
+        stage.completed_at = None
+        target_stage_ids.append(stage.id)
+
+    if target_stage_ids:
+        await session.execute(
+            delete(Vulnerability).where(
+                Vulnerability.task_id == task_id,
+                Vulnerability.stage_id.in_(target_stage_ids),
+            )
+        )
+    await session.commit()
+
+
+async def _reload_task_stages(session, task_id: int) -> list[AuditStage]:
+    result = await session.execute(
+        select(AuditStage).where(AuditStage.task_id == task_id).order_by(AuditStage.stage_num)
+    )
+    return result.scalars().all()
+
 from services.config import MAX_CONCURRENT_AGENTS
 
 
@@ -57,7 +283,7 @@ async def _load_audit_context(session, task_id: int):
     llm_config = result.scalar_one_or_none()
     if not llm_config:
         task.status = "failed"
-        task.error_message = "模型配置不存在"
+        task.error_message = "LLM config not found"
         await session.commit()
         return None
 
@@ -65,7 +291,7 @@ async def _load_audit_context(session, task_id: int):
     project = result.scalar_one_or_none()
     if not project:
         task.status = "failed"
-        task.error_message = "项目不存在"
+        task.error_message = "Project not found"
         await session.commit()
         return None
 
@@ -98,8 +324,15 @@ async def _load_audit_context(session, task_id: int):
     }
 
 
-async def run_multi_agent_audit(task_id: int, stage_nums: list[int] | None = None):
-    """多 Agent 审计入口。"""
+def _set_task_phase(task: AuditTask, phase_num: int) -> None:
+    summary = dict(task.summary) if isinstance(task.summary, dict) else {}
+    summary["current_phase"] = phase_num
+    summary["multi_agent_phase_mode"] = True
+    task.summary = summary
+
+
+async def run_multi_agent_audit(task_id: int):
+    """Run the full multi-agent audit flow."""
     async with async_session() as session:
         ctx = await _load_audit_context(session, task_id)
         if not ctx:
@@ -116,37 +349,52 @@ async def run_multi_agent_audit(task_id: int, stage_nums: list[int] | None = Non
         pre_discovery = ctx["pre_discovery"]
 
         try:
-            # Phase 1: 架构 Agent（Stage 1）
+            # Phase 1: architecture agent (Stage 1)
+            _set_task_phase(task, 1)
+            await session.commit()
             await _run_phase1_architecture(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, pre_discovery)
-
             if await _is_task_cancelled(session, task_id):
                 return
 
-            # Phase 2: Supervisor 规划
+            # Phase 2: supervisor planning
+            _set_task_phase(task, 2)
+            await session.commit()
             audit_memory = _build_audit_memory(list(stages))
             agent_plan = await _run_supervisor_planning(session, task, stages, llm_config, project, audit_memory, rule_hits, source_sink_hints)
 
             if await _is_task_cancelled(session, task_id):
                 return
 
-            # Phase 3: 子 Agent 并行执行
+            # Phase 3: sub-agents in parallel
+            _set_task_phase(task, 3)
+            await session.commit()
             await _execute_sub_agents(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, agent_plan)
+            stages = await _reload_task_stages(session, task.id)
 
             if await _is_task_cancelled(session, task_id):
                 return
 
-            # Phase 4: Supervisor 审核
-            audit_memory = _build_audit_memory(list(stages))
-            review = await _run_supervisor_review(session, task, stages, llm_config, audit_memory, agent_plan)
-
-            if review.get("request_rerun") and review.get("rerun_agents"):
-                rerun_plan = {"selected_agents": review["rerun_agents"], "skipped_agents": []}
-                await _execute_sub_agents(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, rerun_plan)
+            # Phase 4: supervisor review
+            _set_task_phase(task, 4)
+            await session.commit()
+            review, stages = await _run_supervisor_review_closure(
+                session,
+                task,
+                stages,
+                llm_config,
+                project,
+                code_chunks,
+                static_routes,
+                rule_hits,
+                source_sink_hints,
+                agent_plan,
+            )
 
             if await _is_task_cancelled(session, task_id):
                 return
 
             task.status = "completed"
+            task.current_stage = 0
             task.completed_at = datetime.now(timezone.utc)
             await _refresh_task_summary(session, task, scan_stats=scan_stats, rule_hits=rule_hits)
             await session.commit()
@@ -160,91 +408,8 @@ async def run_multi_agent_audit(task_id: int, stage_nums: list[int] | None = Non
             await session.commit()
 
 
-PHASE_NAMES = {1: "架构分析", 2: "Supervisor 规划", 3: "并行审计", 4: "Supervisor 审核"}
-
-
-async def run_multi_agent_phase(task_id: int, phase_num: int):
-    """按 Phase 执行多 Agent 审计，完成后 paused 或 completed。"""
-    async with async_session() as session:
-        ctx = await _load_audit_context(session, task_id)
-        if not ctx:
-            return
-        task = ctx["task"]
-        llm_config = ctx["llm_config"]
-        project = ctx["project"]
-        stages = ctx["stages"]
-        code_chunks = ctx["code_chunks"]
-        static_routes = ctx["static_routes"]
-        scan_stats = ctx["scan_stats"]
-        rule_hits = ctx["rule_hits"]
-        source_sink_hints = ctx["source_sink_hints"]
-        pre_discovery = ctx["pre_discovery"]
-
-        try:
-            next_phase = None
-
-            if phase_num == 1:
-                await _run_phase1_architecture(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, pre_discovery)
-                if await _is_task_cancelled(session, task_id):
-                    return
-                next_phase = 2
-
-            elif phase_num == 2:
-                audit_memory = _build_audit_memory(list(stages))
-                _plan = await _run_supervisor_planning(session, task, stages, llm_config, project, audit_memory, rule_hits, source_sink_hints)
-                if await _is_task_cancelled(session, task_id):
-                    return
-                next_phase = 3
-
-            elif phase_num == 3:
-                summary = task.summary if isinstance(task.summary, dict) else {}
-                agent_plan = summary.get("agent_plan")
-                if not agent_plan or not isinstance(agent_plan, dict):
-                    agent_plan = _build_default_plan(rule_hits, source_sink_hints)
-                await _execute_sub_agents(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, agent_plan)
-                if await _is_task_cancelled(session, task_id):
-                    return
-                next_phase = 4
-
-            elif phase_num == 4:
-                summary = task.summary if isinstance(task.summary, dict) else {}
-                agent_plan = summary.get("agent_plan", {})
-                audit_memory = _build_audit_memory(list(stages))
-                review = await _run_supervisor_review(session, task, stages, llm_config, audit_memory, agent_plan)
-                if review.get("request_rerun") and review.get("rerun_agents"):
-                    rerun_plan = {"selected_agents": review["rerun_agents"], "skipped_agents": []}
-                    await _execute_sub_agents(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, rerun_plan)
-                if await _is_task_cancelled(session, task_id):
-                    return
-                task.status = "completed"
-                task.completed_at = datetime.now(timezone.utc)
-                await _refresh_task_summary(session, task, scan_stats=scan_stats, rule_hits=rule_hits)
-                await session.commit()
-                logger.info("Multi-agent task %s completed (Phase 4)", task_id)
-                return
-
-            if next_phase:
-                await session.refresh(task)
-                summary = dict(task.summary) if isinstance(task.summary, dict) else {}
-                summary["current_phase"] = next_phase
-                summary["multi_agent_phase_mode"] = True
-                task.summary = summary
-                task.status = "paused"
-                task.current_stage = 0
-                await _refresh_task_summary(session, task, scan_stats=scan_stats, rule_hits=rule_hits)
-                await session.commit()
-                logger.info("Multi-agent task %s Phase %s completed, paused for Phase %s", task_id, phase_num, next_phase)
-
-        except Exception as exc:
-            logger.error("Multi-agent task %s Phase %s failed: %s", task_id, phase_num, exc)
-            task.status = "failed"
-            task.error_message = str(exc)[:2000]
-            task.completed_at = datetime.now(timezone.utc)
-            await session.commit()
-
-
 async def _run_phase1_architecture(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, pre_discovery=None):
-    """Phase 1: 执行架构 Agent（Stage 1 多轮）。"""
+    """Phase 1: run the architecture agent with multi-pass scanning."""
     stage_map = {s.stage_num: s for s in stages}
     stage = stage_map.get(1)
     if not stage or stage.status == "completed":
@@ -277,11 +442,11 @@ async def _run_phase1_architecture(session, task, stages, llm_config, project, c
 
 
 async def _run_supervisor_planning(session, task, stages, llm_config, project, audit_memory, rule_hits, source_sink_hints):
-    """Phase 2: Supervisor 规划。"""
+    """Phase 2: run supervisor planning."""
     stage_map = {s.stage_num: s for s in stages}
     plan_stage = stage_map.get(-1)
     if not plan_stage:
-        plan_stage = AuditStage(task_id=task.id, stage_num=-1, stage_name="Supervisor 规划", agent_role="supervisor_plan", status="pending")
+        plan_stage = AuditStage(task_id=task.id, stage_num=-1, stage_name="审计规划", agent_role="supervisor_plan", status="pending")
         session.add(plan_stage)
         await session.commit()
         await session.refresh(plan_stage)
@@ -297,7 +462,7 @@ async def _run_supervisor_planning(session, task, stages, llm_config, project, a
         result = await call_llm_with_meta(llm_config, SUPERVISOR_PLANNING_SYSTEM, user_prompt)
         _accumulate_token_usage(task, result.get("meta"))
         if not result["success"]:
-            raise RuntimeError(f"Supervisor 规划失败：{result['error']['message']}")
+            raise RuntimeError(f"Supervisor planning failed: {result['error']['message']}")
 
         agent_plan = _parse_structured_response(result["content"], result.get("meta"))
         if isinstance(agent_plan, dict) and agent_plan.get("parse_error"):
@@ -323,12 +488,12 @@ async def _run_supervisor_planning(session, task, stages, llm_config, project, a
         return _build_default_plan(rule_hits, source_sink_hints)
 
 
-async def _run_supervisor_review(session, task, stages, llm_config, audit_memory, agent_plan):
-    """Phase 4: Supervisor 审核。"""
+async def _run_supervisor_review(session, task, stages, llm_config, audit_memory, agent_plan, extra_findings: dict | None = None):
+    """Phase 4: run supervisor review."""
     stage_map = {s.stage_num: s for s in stages}
     review_stage = stage_map.get(-2)
     if not review_stage:
-        review_stage = AuditStage(task_id=task.id, stage_num=-2, stage_name="Supervisor 审核", agent_role="supervisor_review", status="pending")
+        review_stage = AuditStage(task_id=task.id, stage_num=-2, stage_name="审核复核", agent_role="supervisor_review", status="pending")
         session.add(review_stage)
         await session.commit()
         await session.refresh(review_stage)
@@ -344,16 +509,22 @@ async def _run_supervisor_review(session, task, stages, llm_config, audit_memory
         result = await call_llm_with_meta(llm_config, SUPERVISOR_REVIEW_SYSTEM, user_prompt)
         _accumulate_token_usage(task, result.get("meta"))
         if not result["success"]:
-            raise RuntimeError(f"Supervisor 审核失败：{result['error']['message']}")
+            raise RuntimeError(f"Supervisor review failed: {result['error']['message']}")
 
         review = _parse_structured_response(result["content"], result.get("meta"))
         if isinstance(review, dict) and review.get("parse_error"):
-            review = {"review_summary": "审核响应解析失败，跳过迭代", "request_rerun": False, "rerun_agents": []}
-
+            review = {"review_summary": "审核响应解析失败，已跳过自动重跑。", "request_rerun": False, "rerun_agents": []}
+        if isinstance(review, dict) and isinstance(extra_findings, dict):
+            # Feed rerun execution back into the review payload for frontend visibility.
+            review.update(extra_findings)
+        review = _finalize_review_result(review if isinstance(review, dict) else {}, stages)
         review_stage.findings = review if isinstance(review, dict) else {"raw": str(review)[:5000]}
         review_stage.llm_response = result["content"][:10000]
         review_stage.status = "completed"
         review_stage.completed_at = datetime.now(timezone.utc)
+        summary = dict(task.summary) if isinstance(task.summary, dict) else {}
+        summary["review_outcome"] = review.get("review_closure", {}) if isinstance(review, dict) else {}
+        task.summary = summary
         await session.commit()
         return review
 
@@ -361,13 +532,21 @@ async def _run_supervisor_review(session, task, stages, llm_config, audit_memory
         review_stage.status = "failed"
         review_stage.completed_at = datetime.now(timezone.utc)
         review_stage.llm_response = str(exc)[:2000]
+        summary = dict(task.summary) if isinstance(task.summary, dict) else {}
+        summary["review_outcome"] = {
+            "status": "review_failed",
+            "next_action": "manual_review",
+            "status_summary": "审核失败，需要人工复核。",
+            "auto_handled": False,
+        }
+        task.summary = summary
         await session.commit()
         logger.warning("Supervisor review failed: %s", exc)
         return {"review_summary": "审核失败", "request_rerun": False, "rerun_agents": []}
 
 
 async def _execute_sub_agents(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, agent_plan):
-    """Phase 3: 并行执行选中的子 Agent。"""
+    """Phase 3: execute selected sub-agents in parallel."""
     if not isinstance(agent_plan, dict):
         agent_plan = {}
 
@@ -427,14 +606,14 @@ async def _execute_sub_agents(session, task, stages, llm_config, project, code_c
                 if focus_guidance or focus_files or focus_routes or focus_functions or focus_data_flows:
                     flow_text = ""
                     if focus_data_flows:
-                        flow_text = "\n关键数据流：" + "；".join(str(f) for f in focus_data_flows[:5])
+                        flow_text = "\nKey data flows: " + "; ".join(str(f) for f in focus_data_flows[:5])
                     func_text = ""
                     if focus_functions:
-                        func_text = "\n关键函数：" + ", ".join(str(f) for f in focus_functions[:12])
+                        func_text = "\nKey functions: " + ", ".join(str(f) for f in focus_functions[:12])
                     supervisor_focus = AGENT_FOCUS_PREFIX.format(
-                        focus_guidance=(focus_guidance or "无额外指导") + flow_text,
-                        focus_files=", ".join(str(f) for f in focus_files[:10]) or "无",
-                        focus_routes=", ".join(str(r) for r in focus_routes[:10]) or "无",
+                        focus_guidance=(focus_guidance or "No extra guidance") + flow_text,
+                        focus_files=", ".join(str(f) for f in focus_files[:10]) or "None",
+                        focus_routes=", ".join(str(r) for r in focus_routes[:10]) or "None",
                     ) + func_text
 
                 selected_chunks = _select_stage_chunks(
@@ -477,38 +656,103 @@ async def _execute_sub_agents(session, task, stages, llm_config, project, code_c
 
 
 def _build_planning_context(project, audit_memory: dict, rule_hits: list, source_sink_hints: list) -> dict:
-    """构建 Supervisor 规划的用户 Prompt 上下文。"""
+    """Build the supervisor planning prompt context."""
     arch_info = audit_memory.get("architecture_info", {}) if isinstance(audit_memory, dict) else {}
     if not isinstance(arch_info, dict):
         arch_info = {}
 
     routes = audit_memory.get("route_inventory", []) if isinstance(audit_memory, dict) else []
     entry_points = audit_memory.get("entry_points", []) if isinstance(audit_memory, dict) else []
+    evidence_files = audit_memory.get("evidence_files", []) if isinstance(audit_memory, dict) else []
 
     rule_hits_summary = _summarize_rule_hits(rule_hits)
     source_sink_summary = _summarize_source_sink_hints(source_sink_hints)
 
     agent_specs_lines = []
     for stage_num in range(2, 10):
-        spec = STAGE_SPECS.get(stage_num, f"阶段 {stage_num}")
+        spec = STAGE_SPECS.get(stage_num, f"Stage {stage_num}")
         hit_count = len([h for h in rule_hits if isinstance(h, dict) and stage_num in (h.get("stage_nums") or [])])
         hint_count = len([h for h in source_sink_hints if isinstance(h, dict) and stage_num in (h.get("stage_nums") or [])])
-        agent_specs_lines.append(f"- Stage {stage_num}：{spec}（规则命中 {hit_count}，源-汇线索 {hint_count}）")
+        agent_specs_lines.append(f"- Stage {stage_num}: {spec} (rule hits={hit_count}, source-sink hints={hint_count})")
 
     return {
-        "tech_stack": getattr(project, "tech_stack", "") or "未知",
-        "file_count": audit_memory.get("evidence_files_count", 0) if isinstance(audit_memory, dict) else 0,
+        "tech_stack": getattr(project, "tech_stack", "") or "Unknown",
+        "file_count": len(evidence_files),
         "route_count": len(routes),
         "entry_point_count": len(entry_points),
-        "architecture_summary": json.dumps(arch_info, ensure_ascii=False)[:4000] if arch_info else "无",
+        "architecture_summary": json.dumps(arch_info, ensure_ascii=False)[:4000] if arch_info else "None",
         "rule_hits_summary": rule_hits_summary,
         "source_sink_summary": source_sink_summary,
         "agent_specs": "\n".join(agent_specs_lines),
     }
 
 
+def _build_route_key(method: str, path: str) -> tuple[str, str] | None:
+    normalized_method = str(method or "UNKNOWN").strip().upper() or "UNKNOWN"
+    normalized_path = str(path or "").strip()
+    if not normalized_path:
+        return None
+    return normalized_method, normalized_path
+
+
+def _build_uncovered_route_summary(audit_memory: dict, stages) -> str:
+    if not isinstance(audit_memory, dict):
+        return "No route inventory"
+
+    inventory = audit_memory.get("route_inventory", [])
+    if not isinstance(inventory, list) or not inventory:
+        return "No route inventory"
+
+    covered_route_keys: set[tuple[str, str]] = set()
+    audited_inventory = audit_memory.get("audited_route_inventory", [])
+    if isinstance(audited_inventory, list):
+        for route in audited_inventory:
+            if not isinstance(route, dict):
+                continue
+            route_key = _build_route_key(route.get("method", "UNKNOWN"), route.get("path", ""))
+            if route_key:
+                covered_route_keys.add(route_key)
+
+    for stage in stages:
+        findings = stage.findings if isinstance(stage.findings, dict) else {}
+        vulns = findings.get("vulnerabilities", [])
+        if not isinstance(vulns, list):
+            continue
+        for vuln in vulns:
+            if not isinstance(vuln, dict):
+                continue
+            endpoint = str(vuln.get("endpoint", "") or "").strip()
+            if not endpoint:
+                continue
+            if " " in endpoint:
+                method, path = endpoint.split(" ", 1)
+            else:
+                method, path = "UNKNOWN", endpoint
+            route_key = _build_route_key(method, path)
+            if route_key:
+                covered_route_keys.add(route_key)
+
+    uncovered = []
+    for route in inventory:
+        if not isinstance(route, dict):
+            continue
+        route_key = _build_route_key(route.get("method", "UNKNOWN"), route.get("path", ""))
+        if route_key and route_key not in covered_route_keys:
+            uncovered.append(route)
+
+    if not uncovered:
+        return "No uncovered routes found"
+
+    samples = [
+        f"{str(route.get('method', 'UNKNOWN')).upper()} {route.get('path', '')}"
+        for route in uncovered[:12]
+        if isinstance(route, dict)
+    ]
+    return f"{len(uncovered)} uncovered routes: {'; ' .join(samples)}"
+
+
 def _build_review_context(audit_memory: dict, agent_plan: dict, stages) -> dict:
-    """构建 Supervisor 审核的用户 Prompt 上下文。"""
+    """Build the supervisor review prompt context."""
     stage_summaries = []
     executed = []
     total_vulns = 0
@@ -529,31 +773,24 @@ def _build_review_context(audit_memory: dict, agent_plan: dict, stages) -> dict:
                 if sev in severity_dist:
                     severity_dist[sev] += 1
             stage_summaries.append(
-                f"Stage {stage.stage_num}（{stage.stage_name}）：{count} 个漏洞"
+                f"Stage {stage.stage_num} ({stage.stage_name}): {count} findings"
             )
 
-    confirmed_routes = set()
-    if isinstance(audit_memory, dict):
-        for route in audit_memory.get("route_inventory", [])[:200]:
-            if isinstance(route, dict):
-                path = str(route.get("path", "")).strip()
-                if path:
-                    confirmed_routes.add(path)
-
+    uncovered_routes = _build_uncovered_route_summary(audit_memory, stages)
     return {
-        "executed_agents": "、".join(executed) or "无",
+        "executed_agents": ", ".join(executed) or "None",
         "total_vulns": total_vulns,
-        "severity_distribution": "、".join(f"{k}:{v}" for k, v in severity_dist.items()),
-        "agent_results_summary": "\n".join(stage_summaries) or "无结果",
-        "uncovered_routes": "暂未实现路由覆盖分析" if confirmed_routes else "无路由信息",
-        "original_plan": json.dumps(agent_plan, ensure_ascii=False)[:2000] if isinstance(agent_plan, dict) else "无",
+        "severity_distribution": ", ".join(f"{k}:{v}" for k, v in severity_dist.items()),
+        "agent_results_summary": "\n".join(stage_summaries) or "No results",
+        "uncovered_routes": uncovered_routes,
+        "original_plan": json.dumps(agent_plan, ensure_ascii=False)[:2000] if isinstance(agent_plan, dict) else "None",
     }
 
 
 def _summarize_rule_hits(rule_hits: list) -> str:
-    """按阶段分组汇总规则命中。"""
+    """Summarize rule hits by stage."""
     if not rule_hits:
-        return "无规则命中"
+        return "No rule hits"
     by_stage: dict[int, list] = {}
     for hit in rule_hits:
         if not isinstance(hit, dict):
@@ -564,14 +801,14 @@ def _summarize_rule_hits(rule_hits: list) -> str:
     for stage_num in sorted(by_stage.keys()):
         hits = by_stage[stage_num]
         sample_files = list({str(h.get("file_path", "")) for h in hits[:5]})[:3]
-        lines.append(f"Stage {stage_num}：{len(hits)} 次命中，文件示例：{', '.join(sample_files)}")
-    return "\n".join(lines) if lines else "无规则命中"
+        lines.append(f"Stage {stage_num}: {len(hits)} hits; sample files: {', ' .join(sample_files)}")
+    return "\n".join(lines) if lines else "No rule hits"
 
 
 def _summarize_source_sink_hints(hints: list) -> str:
-    """按阶段分组汇总源-汇线索。"""
+    """Summarize source-sink hints by stage."""
     if not hints:
-        return "无源-汇线索"
+        return "No source-sink hints"
     by_stage: dict[int, list] = {}
     for hint in hints:
         if not isinstance(hint, dict):
@@ -581,12 +818,12 @@ def _summarize_source_sink_hints(hints: list) -> str:
     lines = []
     for stage_num in sorted(by_stage.keys()):
         count = len(by_stage[stage_num])
-        lines.append(f"Stage {stage_num}：{count} 条线索")
-    return "\n".join(lines) if lines else "无源-汇线索"
+        lines.append(f"Stage {stage_num}: {count} hints")
+    return "\n".join(lines) if lines else "No source-sink hints"
 
 
 def _build_default_plan(rule_hits: list, source_sink_hints: list) -> dict:
-    """当 Supervisor 规划失败时，基于规则命中数生成默认计划。"""
+    """Build a fallback agent plan from static evidence counts."""
     stage_evidence: dict[int, int] = {}
     for hit in rule_hits:
         if not isinstance(hit, dict):
@@ -607,12 +844,12 @@ def _build_default_plan(rule_hits: list, source_sink_hints: list) -> dict:
             selected.append({
                 "stage_num": stage_num,
                 "priority": len(selected) + 1,
-                "focus_guidance": f"基于 {evidence} 条静态证据进行审计",
+                "focus_guidance": f"Audit based on {evidence} static evidence signals",
                 "focus_files": [],
                 "focus_routes": [],
             })
         else:
-            skipped.append({"stage_num": stage_num, "skip_reason": "无静态证据支持"})
+            skipped.append({"stage_num": stage_num, "skip_reason": "No supporting static evidence"})
 
     if not selected:
         selected = [{"stage_num": sn, "priority": i + 1, "focus_guidance": "", "focus_files": [], "focus_routes": []} for i, sn in enumerate(range(2, 10))]

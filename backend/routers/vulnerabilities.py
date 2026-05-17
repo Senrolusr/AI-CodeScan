@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import case, select
 from database import get_db
 from models import Vulnerability
 from schemas import VulnStatusUpdate, VulnerabilityOut
@@ -14,6 +14,7 @@ async def list_vulnerabilities(
     task_id: int = None,
     severity: str = None,
     confirmed_status: str = None,
+    verification_state: str = None,
     limit: int = None,
     db: AsyncSession = Depends(get_db),
 ):
@@ -24,7 +25,12 @@ async def list_vulnerabilities(
         query = query.where(Vulnerability.severity.in_(_severity_match_values(severity)))
     if confirmed_status:
         query = query.where(Vulnerability.confirmed_status == confirmed_status)
-    query = query.order_by(Vulnerability.id.desc())
+    if verification_state:
+        query = query.where(Vulnerability.verification_state == verification_state)
+    query = query.order_by(
+        case((Vulnerability.verification_state == "verified", 0), else_=1),
+        Vulnerability.id.desc(),
+    )
     if limit:
         query = query.limit(min(limit, 200))
     result = await db.execute(query)

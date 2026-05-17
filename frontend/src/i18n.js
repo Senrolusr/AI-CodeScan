@@ -173,6 +173,8 @@ const zhMessages = {
   stageOneOverview: '阶段一概览',
   passCount: '执行轮次',
   codeCoverage: '代码覆盖率',
+  auditScopeCoverage: '审计集覆盖率',
+  auditScopeCoverageNote: '仅针对纳入阶段一审计集的高价值代码块，不代表全仓源码 100% 覆盖。',
   coveredFiles: '已覆盖文件',
   compactedFiles: '压缩文件',
   staticRoutes: '静态入口',
@@ -181,6 +183,10 @@ const zhMessages = {
   riskWindowCompression: '风险窗口压缩',
   earlyStopReason: '提前停止原因',
   roundsDetail: '轮次明细',
+  executedRounds: '共执行 {count} 轮架构扫描',
+  latestRoundsOnly: '默认仅展示最近 {count} 轮，另有 {hidden} 轮作为调试明细隐藏',
+  showAllRounds: '显示全部轮次',
+  hideAllRounds: '收起历史轮次',
   scannedFiles: '扫描文件',
   summaryDelta: '摘要增量',
   hasSummary: '有摘要',
@@ -306,6 +312,10 @@ const zhMessages = {
   viewStageOneDetail: '查看阶段一详情',
   viewArtifact: '查看产物',
   rerunStage: '重跑本阶段',
+  reviewRerunExecuted: '已自动重跑阶段',
+  reviewRerunRequested: '审核建议重跑阶段',
+  reviewRerunPending: '待重跑阶段',
+  reviewAdditionalGuidance: '补充指导',
   debugSummary: '提示词长度={prompt}，选中分块={chunks}，代码长度={code}，静态路由={routes}，前文长度={context}',
   debugInfo: '调试信息',
   stageOneCoverageSummary: '阶段一覆盖摘要',
@@ -334,9 +344,9 @@ const zhMessages = {
   dataFlows: '数据流',
   moreItems: '更多',
   phaseArch: '架构分析',
-  phasePlan: 'Supervisor 规划',
-  phaseAudit: '子 Agent 并行审计',
-  phaseReview: 'Supervisor 审核',
+  phasePlan: '审计规划',
+  phaseAudit: '并行审计',
+  phaseReview: '审核复核',
   phaseReport: '报告生成与 QA',
   runNextPhase: '执行下一阶段：{name}',
   phaseProgress: 'Phase 进度',
@@ -350,6 +360,7 @@ const zhMessages = {
   missingMustCover: '未覆盖安全文件',
   securityBoundaries: '安全关键文件',
   confidence: '置信度',
+  verificationState: '验证态',
   confidenceHigh: '高',
   confidenceMedium: '中',
   confidenceLow: '低',
@@ -526,6 +537,8 @@ const enMessages = {
   stageOneOverview: 'Stage 1 Overview',
   passCount: 'Passes',
   codeCoverage: 'Code Coverage',
+  auditScopeCoverage: 'Audit Scope Coverage',
+  auditScopeCoverageNote: 'Only covers high-value code chunks included in the Stage 1 audit scope, not 100% of the whole repository.',
   coveredFiles: 'Covered Files',
   compactedFiles: 'Compacted Files',
   staticRoutes: 'Static Routes',
@@ -534,6 +547,10 @@ const enMessages = {
   riskWindowCompression: 'Risk Window Compression',
   earlyStopReason: 'Early Stop Reason',
   roundsDetail: 'Pass Details',
+  executedRounds: '{count} architecture passes executed',
+  latestRoundsOnly: 'Showing the latest {count} passes by default; {hidden} older passes are hidden as debug details',
+  showAllRounds: 'Show all passes',
+  hideAllRounds: 'Hide older passes',
   scannedFiles: 'Scanned Files',
   summaryDelta: 'Summary Delta',
   hasSummary: 'Has Summary',
@@ -659,6 +676,10 @@ const enMessages = {
   viewStageOneDetail: 'View Stage 1 Detail',
   viewArtifact: 'View Artifact',
   rerunStage: 'Rerun Stage',
+  reviewRerunExecuted: 'Auto-reran stages',
+  reviewRerunRequested: 'Review requested rerun',
+  reviewRerunPending: 'Stages pending rerun',
+  reviewAdditionalGuidance: 'Additional guidance',
   debugSummary: 'prompt={prompt}, selected chunks={chunks}, code={code}, static routes={routes}, previous context={context}',
   debugInfo: 'Debug Info',
   stageOneCoverageSummary: 'Stage 1 Coverage Summary',
@@ -703,6 +724,7 @@ const enMessages = {
   missingMustCover: 'Uncovered Security Files',
   securityBoundaries: 'Security Critical Files',
   confidence: 'Confidence',
+  verificationState: 'Verification State',
   confidenceHigh: 'High',
   confidenceMedium: 'Medium',
   confidenceLow: 'Low',
@@ -798,6 +820,17 @@ export function useI18n() {
     { valid: 'success', invalid: 'danger', unknown: 'info' }[status] || 'info'
   )
 
+  const verificationStateLabel = (value) => {
+    if (locale.value === 'en') {
+      return value === 'verified' ? 'Verified' : 'Candidate'
+    }
+    return value === 'verified' ? '已验证' : '候选'
+  }
+
+  const verificationStateType = (value) => (
+    value === 'verified' ? 'success' : 'warning'
+  )
+
   const formatPercent = (value) => `${Math.round((Number(value || 0) || 0) * 100)}%`
 
   const formatDateTime = (value) => {
@@ -850,6 +883,8 @@ export function useI18n() {
     diffStatusLabel,
     boolLabel,
     pocTagType,
+    verificationStateLabel,
+    verificationStateType,
     formatPercent,
     formatDateTime,
     formatDate,

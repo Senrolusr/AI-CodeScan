@@ -7,7 +7,16 @@ import { useI18n } from '../i18n'
 
 const props = defineProps({ id: [String, Number] })
 const router = useRouter()
-const { t, statusLabel, severityLabel, severityColor, diffStatusLabel, pocTagType } = useI18n()
+const {
+  t,
+  statusLabel,
+  severityLabel,
+  severityColor,
+  diffStatusLabel,
+  pocTagType,
+  verificationStateLabel,
+  verificationStateType,
+} = useI18n()
 
 const vuln = ref(null)
 const loading = ref(true)
@@ -62,6 +71,9 @@ const changeStatus = async (status) => {
             </el-tag>
             <el-tag :type="vuln.diff_status === 'existing' ? 'info' : 'danger'">
               {{ diffStatusLabel(vuln.diff_status) }}
+            </el-tag>
+            <el-tag :type="verificationStateType(vuln.verification_state)">
+              {{ verificationStateLabel(vuln.verification_state) }}
             </el-tag>
             <el-tag :type="pocTagType(vuln.poc_validation_status)">
               {{ vuln.poc_validation_status === 'valid' ? t('pocValid') : vuln.poc_validation_status === 'invalid' ? t('pocInvalid') : t('pocUnknown') }}
@@ -157,6 +169,11 @@ const changeStatus = async (status) => {
               </el-descriptions-item>
               <el-descriptions-item :label="t('diffStatus')">
                 {{ diffStatusLabel(vuln.diff_status) }}
+              </el-descriptions-item>
+              <el-descriptions-item :label="t('verificationState')">
+                <el-tag size="small" :type="verificationStateType(vuln.verification_state)">
+                  {{ verificationStateLabel(vuln.verification_state) }}
+                </el-tag>
               </el-descriptions-item>
               <el-descriptions-item :label="t('confidence')">
                 <el-tag

@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { getAudit, getAuditStageArtifact, getAuditStages } from '../api'
+import { getAudit, getAuditStage, getAuditStageArtifact } from '../api'
 import { useI18n } from '../i18n'
 import { usePolling } from '../composables/usePolling'
 
@@ -12,7 +12,7 @@ const { t, statusLabel, boolLabel, formatPercent } = useI18n()
 
 const loading = ref(true)
 const task = ref(null)
-const stages = ref([])
+const stageOneStage = ref(null)
 const artifact = ref(null)
 const artifactLoading = ref(false)
 const routeFilter = ref({ keyword: '', auth: '' })
@@ -24,8 +24,13 @@ const polling = usePolling({
   fetchFn: async () => { await loadBase(); await loadArtifact() },
 })
 
-const stageOneStage = computed(() => stages.value.find(stage => stage.stage_num === 1) || null)
 const stageOneCoverage = computed(() => stageOneStage.value?.compressed_summary?.coverage || {})
+const stageOneCoverageRatio = computed(() => {
+  const total = Number(stageOneCoverage.value.audit_scope_chunk_count || stageOneCoverage.value.total_chunk_count || 0)
+  const scanned = Number(stageOneCoverage.value.scanned_chunk_count || 0)
+  return scanned / Math.max(total || 1, 1)
+})
+const stageOneCoverageNote = computed(() => stageOneCoverage.value.audit_scope_note || t('auditScopeCoverageNote'))
 const stageOneArchitecture = computed(() => stageOneStage.value?.findings?.architecture_info || {})
 const stageOneSummary = computed(() => stageOneStage.value?.findings?.stage_summary || '')
 const stageOneEntryPoints = computed(() => {
@@ -57,6 +62,22 @@ const filteredStageOneRoutes = computed(() => {
 })
 const stageOneEarlyStop = computed(() => artifact.value?.payload?.early_stop || { triggered: false, reason: '', after_pass: 0 })
 const stageOnePasses = computed(() => Array.isArray(artifact.value?.payload?.passes) ? artifact.value.payload.passes : [])
+const showAllPasses = ref(false)
+const stageOnePassSummary = computed(() => artifact.value?.payload?.pass_summary || {
+  executed_pass_count: stageOnePasses.value.length,
+  total_prompt_length: 0,
+  total_code_length: 0,
+  max_coverage_ratio: 0,
+  avg_signal_gain: 0,
+  peak_signal_gain: 0,
+  new_path_total: 0,
+  compacted_chunk_total: 0,
+})
+const displayedStageOnePasses = computed(() => {
+  if (showAllPasses.value || stageOnePasses.value.length <= 3) return stageOnePasses.value
+  return stageOnePasses.value.slice(-3)
+})
+const hiddenStageOnePassCount = computed(() => Math.max(stageOnePasses.value.length - displayedStageOnePasses.value.length, 0))
 const routeGapSummary = computed(() => artifact.value?.payload?.route_gap_summary || { static_route_count: 0, confirmed_route_count: 0, missing_route_count: 0, missing_route_samples: [] })
 const missingRouteSamples = computed(() => Array.isArray(routeGapSummary.value?.missing_route_samples) ? routeGapSummary.value.missing_route_samples : [])
 
@@ -68,14 +89,15 @@ const authLabel = (value) => ({
   None: t('authNone'),
 }[value] || value || t('unknown'))
 
+// 阶段一专页直接拉取完整单阶段详情，避免依赖轻量阶段列表。
 const loadBase = async () => {
-  const [taskRes, stagesRes] = await Promise.all([getAudit(props.id), getAuditStages(props.id)])
+  const [taskRes, stageRes] = await Promise.all([getAudit(props.id), getAuditStage(props.id, 1)])
   task.value = taskRes.data
-  stages.value = stagesRes.data
+  stageOneStage.value = stageRes.data
 }
 
 const loadArtifact = async () => {
-  const stageOne = stages.value.find(stage => stage.stage_num === 1)
+  const stageOne = stageOneStage.value
   if (!stageOne?.artifact_path) {
     artifact.value = null
     return
@@ -107,6 +129,10 @@ onMounted(async () => {
   polling.start()
 })
 
+const togglePassDetails = () => {
+  showAllPasses.value = !showAllPasses.value
+}
+
 const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, limit) : []
 </script>
 
@@ -125,7 +151,7 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
       </div>
     </div>
 
-    <!-- Project Profile Card -->
+    <!-- 项目概况卡片 -->
     <el-card v-if="stageOneStage" style="margin-bottom: 20px; border-left: 4px solid #409EFF">
       <template #header>
         <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px">
@@ -135,7 +161,7 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
         </div>
       </template>
 
-      <!-- Stage Summary -->
+      <!-- 阶段摘要 -->
       <div v-if="stageOneSummary" style="margin-bottom: 20px; padding: 16px 20px; background: linear-gradient(135deg, #f0f7ff 0%, #f5f0ff 100%); border-radius: 10px; line-height: 1.9; font-size: 15px; color: var(--text-primary)">
         <div style="font-weight: bold; font-size: 14px; color: #409EFF; margin-bottom: 8px; letter-spacing: 1px">{{ t('projectOverview') }}</div>
         {{ stageOneSummary }}
@@ -144,7 +170,7 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
         {{ t('noProjectSummary') }}
       </div>
 
-      <!-- Tech Stack Grid -->
+      <!-- 技术栈概览 -->
       <el-descriptions :column="4" border size="small" style="margin-bottom: 20px">
         <el-descriptions-item :label="t('techStack')" :span="1">
           <template v-if="stageOneArchitecture.tech_stack">
@@ -157,9 +183,9 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
         <el-descriptions-item :label="t('authMechanism')">{{ stageOneArchitecture.auth_mechanism || '-' }}</el-descriptions-item>
       </el-descriptions>
 
-      <!-- Entry Points / Output Points / Modules / Data Flows -->
+      <!-- 入口点 / 输出点 / 核心模块 / 数据流 -->
       <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px">
-        <!-- Entry Points -->
+        <!-- 入口点 -->
         <div v-if="stageOneEntryPoints.length" style="padding: 14px 16px; background: var(--bg-success); border-radius: 10px; border: 1px solid var(--border-success)">
           <div style="font-weight: bold; color: #67C23A; margin-bottom: 10px; font-size: 14px">{{ t('entryPoints') }} ({{ stageOneEntryPoints.length }})</div>
           <div style="display: flex; gap: 6px; flex-wrap: wrap">
@@ -168,7 +194,7 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
           </div>
         </div>
 
-        <!-- Output Points -->
+        <!-- 输出点 -->
         <div v-if="stageOneOutputPoints.length" style="padding: 14px 16px; background: var(--bg-warning); border-radius: 10px; border: 1px solid var(--border-warning)">
           <div style="font-weight: bold; color: #E6A23C; margin-bottom: 10px; font-size: 14px">{{ t('outputPoints') }} ({{ stageOneOutputPoints.length }})</div>
           <div style="display: flex; gap: 6px; flex-wrap: wrap">
@@ -177,7 +203,7 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
           </div>
         </div>
 
-        <!-- Modules -->
+        <!-- 核心模块 -->
         <div v-if="stageOneModules.length" style="padding: 14px 16px; background: var(--bg-alt); border-radius: 10px; border: 1px solid var(--border-default)">
           <div style="font-weight: bold; color: var(--text-muted); margin-bottom: 10px; font-size: 14px">{{ t('coreModules') }} ({{ stageOneModules.length }})</div>
           <div style="display: flex; gap: 6px; flex-wrap: wrap">
@@ -186,7 +212,7 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
           </div>
         </div>
 
-        <!-- Data Flows -->
+        <!-- 数据流 -->
         <div v-if="stageOneDataFlows.length" style="padding: 14px 16px; background: var(--bg-danger); border-radius: 10px; border: 1px solid var(--border-danger)">
           <div style="font-weight: bold; color: #F56C6C; margin-bottom: 10px; font-size: 14px">{{ t('dataFlows') }} ({{ stageOneDataFlows.length }})</div>
           <div style="display: flex; flex-direction: column; gap: 4px">
@@ -198,14 +224,17 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
         </div>
       </div>
 
-      <!-- Quick Stats Bar -->
+      <!-- 快速统计 -->
       <div style="margin-top: 20px; display: flex; gap: 24px; flex-wrap: wrap; padding: 12px 16px; background: var(--bg-alt); border-radius: 8px; font-size: 13px; color: var(--text-secondary)">
         <span>{{ t('staticRoutes') }}: <strong>{{ stageOneRoutes.length }}</strong></span>
         <span>{{ t('entryPoints') }}: <strong>{{ stageOneEntryPoints.length }}</strong></span>
         <span>{{ t('outputPoints') }}: <strong>{{ stageOneOutputPoints.length }}</strong></span>
         <span>{{ t('coreModules') }}: <strong>{{ stageOneModules.length }}</strong></span>
         <span>{{ t('dataFlows') }}: <strong>{{ stageOneDataFlows.length }}</strong></span>
-        <span>{{ t('codeCoverage') }}: <strong>{{ formatPercent((stageOneCoverage.scanned_chunk_count || 0) / Math.max(stageOneCoverage.total_chunk_count || 1, 1)) }}</strong></span>
+        <span>{{ t('auditScopeCoverage') }}: <strong>{{ formatPercent(stageOneCoverageRatio) }}</strong></span>
+      </div>
+      <div style="margin-top: 8px; color: var(--text-muted); font-size: 12px; line-height: 1.6">
+        {{ stageOneCoverageNote }}
       </div>
     </el-card>
 
@@ -218,7 +247,7 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
       </template>
       <el-descriptions :column="4" border size="small">
         <el-descriptions-item :label="t('passCount')">{{ artifact?.payload?.pass_count || 0 }}/{{ stageOneStage.findings?._debug?.planned_batch_count || artifact?.payload?.pass_count || 0 }}</el-descriptions-item>
-        <el-descriptions-item :label="t('codeCoverage')">{{ formatPercent((stageOneCoverage.scanned_chunk_count || 0) / Math.max(stageOneCoverage.total_chunk_count || 1, 1)) }}</el-descriptions-item>
+        <el-descriptions-item :label="t('auditScopeCoverage')">{{ formatPercent(stageOneCoverageRatio) }}</el-descriptions-item>
         <el-descriptions-item :label="t('coveredFiles')">{{ stageOneCoverage.covered_paths?.length || 0 }}</el-descriptions-item>
         <el-descriptions-item :label="t('compactedFiles')">{{ stageOneCoverage.compacted_paths?.length || 0 }}</el-descriptions-item>
         <el-descriptions-item :label="t('staticRoutes')">{{ routeGapSummary.static_route_count || 0 }}</el-descriptions-item>
@@ -226,14 +255,44 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
         <el-descriptions-item :label="t('missingRoutes')">{{ routeGapSummary.missing_route_count || 0 }}</el-descriptions-item>
         <el-descriptions-item :label="t('riskWindowCompression')">{{ stageOneCoverage.signal_window_chunk_count || 0 }}</el-descriptions-item>
       </el-descriptions>
+      <div style="margin-top: 10px; color: var(--text-muted); font-size: 12px; line-height: 1.6">
+        {{ stageOneCoverageNote }}
+      </div>
       <div v-if="stageOneEarlyStop.triggered" style="margin-top: 14px; padding: 10px 12px; border-radius: 8px; background: var(--bg-warning); color: var(--text-warning); line-height: 1.6">
         {{ t('earlyStopReason') }}: {{ stageOneEarlyStop.reason || `${t('round')} ${stageOneEarlyStop.after_pass}` }}
       </div>
     </el-card>
 
     <el-card style="margin-bottom: 20px">
-      <template #header><span class="card-title">{{ t('roundsDetail') }}</span></template>
-      <el-table v-if="stageOnePasses.length" :data="stageOnePasses" size="small" stripe max-height="420">
+      <template #header>
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap">
+          <span class="card-title">{{ t('roundsDetail') }}</span>
+          <el-button
+            v-if="stageOnePasses.length > 3"
+            size="small"
+            text
+            type="primary"
+            @click="togglePassDetails"
+          >
+            {{ showAllPasses ? t('hideAllRounds') : t('showAllRounds') }}
+          </el-button>
+        </div>
+      </template>
+      <div v-if="stageOnePasses.length" style="margin-bottom: 12px; padding: 12px 14px; border-radius: 8px; background: var(--bg-alt); color: var(--text-secondary); font-size: 13px; line-height: 1.7">
+        <div>
+          {{ t('executedRounds', { count: stageOnePassSummary.executed_pass_count || stageOnePasses.length }) }}
+          <span v-if="hiddenStageOnePassCount > 0 && !showAllPasses" style="margin-left: 8px; color: var(--text-muted)">
+            {{ t('latestRoundsOnly', { count: displayedStageOnePasses.length, hidden: hiddenStageOnePassCount }) }}
+          </span>
+        </div>
+        <div style="margin-top: 6px; display: flex; gap: 16px; flex-wrap: wrap">
+          <span>{{ t('promptLength') }}: <strong>{{ stageOnePassSummary.total_prompt_length || 0 }}</strong></span>
+          <span>{{ t('codeLength') }}: <strong>{{ stageOnePassSummary.total_code_length || 0 }}</strong></span>
+          <span>{{ t('signalGain') }}: <strong>{{ stageOnePassSummary.peak_signal_gain || 0 }}</strong></span>
+          <span>{{ t('auditScopeCoverage') }}: <strong>{{ formatPercent(stageOnePassSummary.max_coverage_ratio || 0) }}</strong></span>
+        </div>
+      </div>
+      <el-table v-if="stageOnePasses.length" :data="displayedStageOnePasses" size="small" stripe max-height="420">
         <el-table-column type="expand">
           <template #default="{ row }">
             <div style="padding: 8px 12px">
@@ -261,7 +320,7 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
           </template>
         </el-table-column>
         <el-table-column prop="pass_index" :label="t('round')" width="70" />
-        <el-table-column :label="t('codeCoverage')" width="90"><template #default="{ row }">{{ formatPercent(row.progress?.coverage_ratio) }}</template></el-table-column>
+        <el-table-column :label="t('auditScopeCoverage')" width="110"><template #default="{ row }">{{ formatPercent(row.progress?.coverage_ratio) }}</template></el-table-column>
         <el-table-column :label="t('newFiles')" width="90"><template #default="{ row }">{{ row.progress?.new_path_count || 0 }}</template></el-table-column>
         <el-table-column :label="t('signalGain')" width="90"><template #default="{ row }">{{ row.progress?.signal_gain || 0 }}</template></el-table-column>
         <el-table-column :label="t('promptLength')" width="110"><template #default="{ row }">{{ row.user_prompt_length || 0 }}</template></el-table-column>

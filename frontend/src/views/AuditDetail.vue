@@ -7,12 +7,12 @@ import {
   deleteReport,
   exportReport,
   getAudit,
+  getAuditStage,
   getAuditStageArtifact,
   getAuditStages,
   getAuditVulns,
   getReports,
   retryAudit,
-  runPhase,
 } from '../api'
 import StageProgress from '../components/StageProgress.vue'
 import VulnCard from '../components/VulnCard.vue'
@@ -22,7 +22,18 @@ import { usePolling } from '../composables/usePolling'
 
 const props = defineProps({ id: [String, Number] })
 const router = useRouter()
-const { locale, t, statusLabel, severityLabel, statusType, formatPercent, formatDateTime, formatTimeOnly } = useI18n()
+const {
+  locale,
+  t,
+  statusLabel,
+  severityLabel,
+  statusType,
+  verificationStateLabel,
+  verificationStateType,
+  formatPercent,
+  formatDateTime,
+  formatTimeOnly,
+} = useI18n()
 
 const task = ref(null)
 const stages = ref([])
@@ -31,11 +42,12 @@ const reports = ref([])
 const loading = ref(true)
 const exporting = ref(false)
 const actionLoading = ref(false)
-const filter = ref({ severity: '', confirmed_status: '' })
+const filter = ref({ severity: '', confirmed_status: '', verification_state: '' })
 const stageOneArtifact = ref(null)
 const stageOneArtifactLoading = ref(false)
 const expandedRuleHits = ref([])
 const ruleHitsExpanded = ref(false)
+const stageOneDetail = ref(null)
 
 const taskStatus = computed(() => task.value?.status || '')
 const polling = usePolling({
@@ -56,7 +68,7 @@ const stageMap = computed(() => {
   return m
 })
 
-const archStage = computed(() => stageMap.value[1])
+const archStage = computed(() => stageOneDetail.value || stageMap.value[1] || null)
 const planStage = computed(() => stageMap.value[-1])
 const auditStages = computed(() => stages.value.filter(s => s.stage_num >= 2 && s.stage_num <= 9))
 const reviewStage = computed(() => stageMap.value[-2])
@@ -72,19 +84,23 @@ const isMultiAgentPhaseMode = computed(() => {
   const summary = task.value.summary
   return summary && typeof summary === 'object' && summary.multi_agent_phase_mode
 })
-const canRunNextPhase = computed(() => {
-  if (!task.value) return false
-  return isMultiAgentPhaseMode.value && ['paused', 'pending'].includes(task.value.status) && currentPhase.value >= 1 && currentPhase.value <= 4
-})
 
-const stageOneStage = computed(() => stageMap.value[1] || null)
+const stageOneStage = computed(() => stageOneDetail.value || stageMap.value[1] || null)
 const stageOneCoverage = computed(() => {
   const coverage = stageOneStage.value?.compressed_summary?.coverage
   return coverage && typeof coverage === 'object' ? coverage : {}
 })
+const stageOneCoverageRatio = computed(() => {
+  const total = Number(stageOneCoverage.value.audit_scope_chunk_count || stageOneCoverage.value.total_chunk_count || 0)
+  const scanned = Number(stageOneCoverage.value.scanned_chunk_count || 0)
+  return scanned / Math.max(total || 1, 1)
+})
+const stageOneCoverageNote = computed(() => stageOneCoverage.value.audit_scope_note || t('auditScopeCoverageNote'))
 const stageOneRouteCount = computed(() => {
-  const routes = stageOneStage.value?.findings?.architecture_info?.routes
-  return Array.isArray(routes) ? routes.length : 0
+  const arch = stageOneStage.value?.findings?.architecture_info
+  if (!arch || typeof arch !== 'object') return 0
+  if (Number.isFinite(Number(arch._route_count))) return Number(arch._route_count)
+  return Array.isArray(arch.routes) ? arch.routes.length : 0
 })
 const stageOneGapSummary = computed(() => {
   const gapSummary = stageOneArtifact.value?.payload?.route_gap_summary
@@ -138,6 +154,23 @@ const severityStats = computed(() => {
   }
   return buildSeverityStats(vulns.value || [])
 })
+const verificationStats = computed(() => {
+  const summaryValue = task.value?.summary?.verification_stats
+  if (summaryValue && typeof summaryValue === 'object') {
+    return {
+      verified: Number(summaryValue.verified || 0),
+      candidate: Number(summaryValue.candidate || 0),
+    }
+  }
+  return (vulns.value || []).reduce(
+    (acc, vuln) => {
+      const key = vuln?.verification_state === 'verified' ? 'verified' : 'candidate'
+      acc[key] += 1
+      return acc
+    },
+    { verified: 0, candidate: 0 },
+  )
+})
 const rescanRecommendations = computed(() => {
   const summaryValue = task.value?.summary?.rescan_recommendations
   if (Array.isArray(summaryValue) && summaryValue.length) return summaryValue
@@ -148,7 +181,7 @@ const rescanRecommendations = computed(() => {
   })
 })
 
-// Extended architecture info from Stage 1
+// 阶段列表默认走轻量接口，阶段一详情单独拉取，避免轮询时携带完整 payload。
 const archInfo = computed(() => {
   const ai = archStage.value?.findings?.architecture_info
   return ai && typeof ai === 'object' ? ai : {}
@@ -159,7 +192,7 @@ const securityBoundaries = computed(() => archInfo.value.security_boundaries && 
 const externalIntegrations = computed(() => Array.isArray(archInfo.value.external_integrations) ? archInfo.value.external_integrations : [])
 const gapAnalysis = computed(() => archInfo.value._gap_analysis && typeof archInfo.value._gap_analysis === 'object' ? archInfo.value._gap_analysis : null)
 
-// Pre-discovery summary
+// 预扫描概况
 const preDiscovery = computed(() => {
   const pd = task.value?.summary?.pre_discovery
   return pd && typeof pd === 'object' ? pd : null
@@ -171,9 +204,14 @@ const preDiscoveryTech = computed(() => {
 const preDiscoverySecurityCount = computed(() => preDiscovery.value?.security_files?.total_critical_count || 0)
 
 const loadTaskAndStages = async () => {
-  const [taskRes, stagesRes] = await Promise.all([getAudit(props.id), getAuditStages(props.id)])
+  const [taskRes, stagesRes, stageOneRes] = await Promise.all([
+    getAudit(props.id),
+    getAuditStages(props.id),
+    getAuditStage(props.id, 1).catch(() => null),
+  ])
   task.value = taskRes.data
   stages.value = stagesRes.data
+  stageOneDetail.value = stageOneRes?.data || null
   await loadStageOneArtifact()
 }
 
@@ -200,7 +238,7 @@ const loadReports = async () => {
 }
 
 const loadStageOneArtifact = async () => {
-  const stageOne = stages.value.find(stage => stage.stage_num === 1)
+  const stageOne = stageOneStage.value || stages.value.find(stage => stage.stage_num === 1)
   if (!stageOne?.artifact_path) {
     stageOneArtifact.value = null
     return
@@ -286,19 +324,6 @@ const handleRetry = async () => {
   }
 }
 
-const handleRunPhase = async () => {
-  actionLoading.value = true
-  try {
-    await runPhase(props.id, currentPhase.value)
-    await loadTaskAndStages()
-    polling.start()
-  } catch (e) {
-    ElMessage.error(e.friendlyMessage || t('startAuditFailed'))
-  } finally {
-    actionLoading.value = false
-  }
-}
-
 const handleFilter = () => loadVulns()
 const stageSummary = (stage) => {
   if (stage.status === 'failed') {
@@ -314,7 +339,9 @@ const stageSummary = (stage) => {
     if (arch.framework) parts.push(`${t('framework')}：${arch.framework}`)
     if (arch.database) parts.push(`${t('database')}：${arch.database}`)
     if (arch.auth_mechanism) parts.push(`${t('authMechanism')}：${arch.auth_mechanism}`)
-    const routeCount = Array.isArray(arch.routes) ? arch.routes.length : 0
+    const routeCount = Number.isFinite(Number(arch._route_count))
+      ? Number(arch._route_count)
+      : (Array.isArray(arch.routes) ? arch.routes.length : 0)
     if (routeCount) parts.push(t('routesIdentified', { count: routeCount }))
     if (parts.length) return parts.join('；') + '。'
   }
@@ -342,13 +369,14 @@ const supervisorSummary = (stage) => {
   if (findings.raw_response) return String(findings.raw_response).slice(0, 300)
   return stageSummary(stage)
 }
+const cleanRuleHitText = (value) => String(value || '').replace(/\uFFFD+/g, '').replace(/\s+/g, ' ').trim()
 const stageRecoveryNote = (stage) => {
   if (!stage?.findings || typeof stage.findings !== 'object' || !stage.findings._salvaged) return ''
   return stage.findings.parse_error || t('stageRecoveryFallback')
 }
-const formatRuleHitTitle = (hit) => hit?.title || hit?.label || t('noRuleHit')
+const formatRuleHitTitle = (hit) => cleanRuleHitText(hit?.title || hit?.label || t('noRuleHit')) || t('noRuleHit')
 const formatRuleHitEvidence = (hit) => {
-  const text = String(hit?.evidence || '').replace(/\s+/g, ' ').trim()
+  const text = cleanRuleHitText(hit?.evidence || '')
   if (!text) return '--'
   return text.length > 280 ? `${text.slice(0, 280)}...` : text
 }
@@ -375,8 +403,8 @@ const stageStyle = (status) => {
   }
 }
 const phasePillStyle = (p) => {
-  const done = p < currentPhase.value
-  const active = p === currentPhase.value
+  const done = task.value?.status === 'completed' || p < currentPhase.value
+  const active = task.value?.status !== 'completed' && p === currentPhase.value
   const running = active && task.value?.status === 'running'
   return {
     display: 'flex', alignItems: 'center', gap: '6px',
@@ -386,6 +414,8 @@ const phasePillStyle = (p) => {
     border: active ? '2px solid currentColor' : '1px solid var(--border-default)',
   }
 }
+const isPhaseDone = (phaseNum) => task.value?.status === 'completed' || phaseNum < currentPhase.value
+const isPhaseRunning = (phaseNum) => task.value?.status === 'running' && phaseNum === currentPhase.value
 const debugSummary = (stage) => {
   const debug = stage?.findings?._debug || {}
   return t('debugSummary', {
@@ -412,9 +442,23 @@ const agentFocusGuidance = (stageNum) => {
 }
 const vulnCountForStage = (stageNum) => {
   const s = stageMap.value[stageNum]
-  if (!s?.findings?.vulnerabilities) return 0
+  if (!s?.findings || typeof s.findings !== 'object') return 0
+  if (Number.isFinite(Number(s.findings._vulnerability_count))) return Number(s.findings._vulnerability_count)
   return Array.isArray(s.findings.vulnerabilities) ? s.findings.vulnerabilities.length : 0
 }
+const reviewRerunExecution = computed(() => {
+  const value = reviewStage.value?.findings?.rerun_execution
+  return value && typeof value === 'object' ? value : null
+})
+const reviewRequestedStageNums = computed(() => {
+  const nums = reviewStage.value?.findings?.rerun_agents
+  if (!Array.isArray(nums)) return []
+  return nums
+    .map(item => (item && typeof item === 'object' ? item.stage_num : item))
+    .filter(item => Number.isFinite(Number(item)))
+    .map(item => Number(item))
+})
+const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', ')
 </script>
 
 <template>
@@ -436,13 +480,13 @@ const vulnCountForStage = (stageNum) => {
         </div>
       </div>
 
-      <!-- Progress -->
+      <!-- 进度概览 -->
       <el-card style="margin-bottom: 20px">
         <template #header><span class="card-title">{{ t('auditProgress') }}</span></template>
         <StageProgress :stages="stages" :current="task.current_stage" />
       </el-card>
 
-      <!-- Phase Control (multi-agent mode only) -->
+      <!-- 多阶段控制 -->
       <el-card v-if="isMultiAgentPhaseMode" style="margin-bottom: 20px">
         <template #header><span class="card-title">{{ t('phaseProgress') }}</span></template>
         <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 16px">
@@ -451,13 +495,13 @@ const vulnCountForStage = (stageNum) => {
             :key="p"
             :style="phasePillStyle(p)"
           >
-            <span v-if="p < currentPhase">&#10003;</span>
-            <span v-else-if="p === currentPhase && task.status === 'running'" style="display: inline-block; width: 12px; height: 12px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite"></span>
+            <span v-if="isPhaseDone(p)">&#10003;</span>
+            <span v-else-if="isPhaseRunning(p)" style="display: inline-block; width: 12px; height: 12px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite"></span>
             <span v-else style="display: inline-block; width: 12px; height: 12px; border-radius: 50%; background: currentColor; opacity: 0.3"></span>
             {{ t(PHASE_KEY_MAP[p]) }}
           </div>
         </div>
-        <!-- Pre-discovery summary -->
+        <!-- 预扫描概况 -->
         <div v-if="preDiscovery" style="margin-bottom: 12px; padding: 10px 14px; border-radius: 8px; background: var(--bg-info); border: 1px solid var(--border-info); font-size: 13px; color: var(--text-primary); line-height: 1.7">
           <span style="font-weight: 600; color: #409EFF">{{ t('projectProfile') }}：</span>
           <span v-if="preDiscoveryTech.language?.length">{{ t('techStack') }} {{ preDiscoveryTech.language.join(', ') }}</span>
@@ -466,23 +510,21 @@ const vulnCountForStage = (stageNum) => {
           <span v-if="preDiscoveryTech.orm?.length"> / {{ preDiscoveryTech.orm.join(', ') }}</span>
           <span style="margin-left: 12px; color: var(--text-muted)">{{ t('routeCount') }}: {{ scanStats.route_count || 0 }} / {{ t('securityBoundaries') }}: {{ preDiscoverySecurityCount }}</span>
         </div>
-        <el-button
-          v-if="canRunNextPhase"
-          type="primary"
-          :loading="actionLoading"
-          @click="handleRunPhase"
-        >
-          {{ t('runNextPhase', { name: t(PHASE_KEY_MAP[currentPhase]) }) }}
-        </el-button>
+        <div v-if="task.status === 'pending'" class="text-muted">
+          {{ statusLabel(task.status) }}...
+        </div>
         <div v-else-if="task.status === 'running'" class="text-muted">
           {{ t(PHASE_KEY_MAP[currentPhase]) }} {{ t('running') }}...
         </div>
         <div v-else-if="task.status === 'completed'" style="color: #67C23A; font-size: 13px; font-weight: bold">
           &#10003; {{ t('completed') }}
         </div>
+        <div v-else-if="task.status === 'failed' || task.status === 'cancelled' || task.status === 'paused'" class="text-muted">
+          {{ statusLabel(task.status) }}
+        </div>
       </el-card>
 
-      <!-- Scan Overview -->
+      <!-- 扫描概览 -->
       <el-card style="margin-bottom: 20px">
         <template #header><span class="card-title">{{ t('scanOverview') }}</span></template>
         <el-descriptions :column="4" border size="small">
@@ -567,11 +609,11 @@ const vulnCountForStage = (stageNum) => {
         </div>
       </el-card>
 
-      <!-- Phase-grouped Timeline -->
+      <!-- 分阶段时间线 -->
       <el-card style="margin-bottom: 20px">
         <template #header><span class="card-title">{{ t('stageDetails') }}</span></template>
         <el-timeline>
-          <!-- Phase 1: Architecture -->
+          <!-- 第一阶段：架构分析 -->
           <el-timeline-item
             type="primary"
             :hollow="!archStage || archStage.status === 'pending'"
@@ -594,7 +636,7 @@ const vulnCountForStage = (stageNum) => {
               </el-collapse-item>
             </el-collapse>
 
-            <!-- Extended Architecture Info -->
+            <!-- 扩展架构信息 -->
             <div v-if="archStage?.status === 'completed' && (middlewareChain.length || databaseModels.length || securityBoundaries || externalIntegrations.length)" style="margin-top: 12px">
               <el-descriptions :column="3" border size="small">
                 <el-descriptions-item v-if="middlewareChain.length" :label="t('middlewareChain')">
@@ -624,7 +666,7 @@ const vulnCountForStage = (stageNum) => {
               </div>
             </div>
 
-            <!-- Gap Analysis -->
+            <!-- 覆盖缺口分析 -->
             <div v-if="gapAnalysis && gapAnalysis.overall_health !== 'ok'" style="margin-top: 10px; padding: 8px 12px; border-radius: 8px; background: var(--bg-danger); border: 1px solid var(--border-danger); font-size: 12px; color: var(--text-danger); line-height: 1.6">
               <span style="font-weight: 600">{{ t('gapAnalysis') }}：</span>
               <span v-if="gapAnalysis.missing_routes?.length">{{ t('missingRoutes') }}: {{ gapAnalysis.missing_routes.length }}</span>
@@ -633,7 +675,7 @@ const vulnCountForStage = (stageNum) => {
             </div>
           </el-timeline-item>
 
-          <!-- Phase 2: Supervisor Planning -->
+          <!-- 第二阶段：Supervisor 规划 -->
           <el-timeline-item
             color="#9b59b6"
             :hollow="!planStage || planStage.status === 'pending'"
@@ -650,7 +692,7 @@ const vulnCountForStage = (stageNum) => {
             <div v-if="!planStage" class="text-muted">{{ t('waitPhase1Complete') }}</div>
           </el-timeline-item>
 
-          <!-- Phase 3: Sub Agent Audit -->
+          <!-- 第三阶段：子 Agent 审计 -->
           <el-timeline-item
             color="#e6a23c"
             :hollow="auditStages.every(s => s.status === 'pending')"
@@ -692,7 +734,7 @@ const vulnCountForStage = (stageNum) => {
             </div>
           </el-timeline-item>
 
-          <!-- Phase 4: Supervisor Review -->
+          <!-- 第四阶段：Supervisor 审核 -->
           <el-timeline-item
             color="#9b59b6"
             :hollow="!reviewStage || reviewStage.status === 'pending'"
@@ -706,12 +748,26 @@ const vulnCountForStage = (stageNum) => {
               <span style="color: var(--text-muted); font-size: 12px">{{ formatTimeOnly(reviewStage.started_at) }} ~ {{ formatTimeOnly(reviewStage.completed_at) }}</span>
             </div>
             <div v-if="reviewStage && supervisorSummary(reviewStage)" style="margin-top: 8px; color: var(--text-secondary); line-height: 1.6; white-space: pre-wrap">{{ supervisorSummary(reviewStage) }}</div>
+            <div v-if="reviewRerunExecution" style="margin-top: 8px; padding: 8px 12px; border-radius: 8px; background: var(--bg-info); border: 1px solid var(--border-info); color: var(--text-info); line-height: 1.6; font-size: 13px">
+              <div>
+                <strong>{{ t('reviewRerunExecuted') }}：</strong>{{ reviewRerunStageText(reviewRerunExecution.executed_stage_nums || []) || '--' }}
+              </div>
+              <div v-if="reviewRerunExecution.requested_stage_nums?.length" style="margin-top: 4px">
+                <strong>{{ t('reviewRerunRequested') }}：</strong>{{ reviewRerunStageText(reviewRerunExecution.requested_stage_nums) }}
+              </div>
+            </div>
+            <div v-else-if="reviewStage?.findings?.request_rerun && reviewRequestedStageNums.length" style="margin-top: 8px; padding: 8px 12px; border-radius: 8px; background: var(--bg-warning); border: 1px solid var(--border-warning); color: var(--text-warning); line-height: 1.6; font-size: 13px">
+              <strong>{{ t('reviewRerunPending') }}：</strong>{{ reviewRerunStageText(reviewRequestedStageNums) }}
+            </div>
+            <div v-if="reviewStage?.findings?.additional_guidance" style="margin-top: 8px; color: var(--text-muted); line-height: 1.6; white-space: pre-wrap; font-size: 13px">
+              <strong>{{ t('reviewAdditionalGuidance') }}：</strong>{{ reviewStage.findings.additional_guidance }}
+            </div>
             <div v-if="!reviewStage" class="text-muted">{{ t('waitSubAgentComplete') }}</div>
           </el-timeline-item>
         </el-timeline>
       </el-card>
 
-      <!-- Stage 1 Coverage -->
+      <!-- 阶段一覆盖摘要 -->
       <el-card v-if="stageOneStage" style="margin-bottom: 20px">
         <template #header>
           <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap">
@@ -730,21 +786,26 @@ const vulnCountForStage = (stageNum) => {
           <el-descriptions-item :label="t('identifiedRouteCount')">{{ stageOneRouteCount }}</el-descriptions-item>
           <el-descriptions-item :label="t('staticRoutes')">{{ stageOneGapSummary.static_route_count || 0 }}</el-descriptions-item>
           <el-descriptions-item :label="t('missingRoutes')">{{ stageOneGapSummary.missing_route_count || 0 }}</el-descriptions-item>
-          <el-descriptions-item :label="t('codeCoverage')">
-            {{ formatPercent((stageOneCoverage.scanned_chunk_count || 0) / Math.max(stageOneCoverage.total_chunk_count || 1, 1)) }}
+          <el-descriptions-item :label="t('auditScopeCoverage')">
+            {{ formatPercent(stageOneCoverageRatio) }}
           </el-descriptions-item>
           <el-descriptions-item :label="t('coveredPathCount')">{{ stageOneCoverage.covered_paths?.length || 0 }}</el-descriptions-item>
           <el-descriptions-item :label="t('compactedChunks')">{{ stageOneCoverage.compacted_chunk_count || 0 }}</el-descriptions-item>
           <el-descriptions-item :label="t('signalWindowChunks')">{{ stageOneCoverage.signal_window_chunk_count || 0 }}</el-descriptions-item>
         </el-descriptions>
+        <div style="margin-top: 10px; color: var(--text-muted); font-size: 12px; line-height: 1.6">
+          {{ stageOneCoverageNote }}
+        </div>
       </el-card>
 
-      <!-- Vulnerabilities -->
+      <!-- 漏洞列表 -->
       <el-card>
         <template #header>
           <div style="display: flex; justify-content: space-between; align-items: center">
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
               <span class="card-title">{{ t('vulnerabilities') }} ({{ vulns.length }})</span>
+              <el-tag size="small" :type="verificationStateType('verified')">{{ verificationStateLabel('verified') }} {{ verificationStats.verified }}</el-tag>
+              <el-tag size="small" :type="verificationStateType('candidate')">{{ verificationStateLabel('candidate') }} {{ verificationStats.candidate }}</el-tag>
               <el-tag size="small" type="danger">{{ t('newlyFound') }} {{ diffStats.newCount }}</el-tag>
               <el-tag size="small" type="info">{{ t('existing') }} {{ diffStats.existingCount }}</el-tag>
               <el-tag size="small" type="danger">{{ severityLabel('Critical') }} {{ severityStats.Critical }}</el-tag>
@@ -756,6 +817,10 @@ const vulnCountForStage = (stageNum) => {
                 <el-option :label="severityLabel('High')" value="High" />
                 <el-option :label="severityLabel('Medium')" value="Medium" />
                 <el-option :label="severityLabel('Low')" value="Low" />
+              </el-select>
+              <el-select v-model="filter.verification_state" :placeholder="t('verificationState')" clearable size="small" style="width: 120px" @change="handleFilter">
+                <el-option :label="verificationStateLabel('verified')" value="verified" />
+                <el-option :label="verificationStateLabel('candidate')" value="candidate" />
               </el-select>
               <el-select v-model="filter.confirmed_status" :placeholder="t('status')" clearable size="small" style="width: 120px" @change="handleFilter">
                 <el-option :label="t('pending')" value="pending" />

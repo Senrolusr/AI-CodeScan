@@ -1,6 +1,7 @@
 import os
 import shutil
 import zipfile
+import logging
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete, select
@@ -9,6 +10,9 @@ from models import AuditStage, AuditTask, Project, Vulnerability
 from services.code_parser import clear_project_cache, load_project_cache, parse_project, warm_project_cache
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+BACKEND_ROOT = os.path.dirname(os.path.dirname(__file__))
+UPLOADS_DIR = os.path.join(BACKEND_ROOT, "uploads")
 
 
 def _build_cache_summary(project: Project) -> dict:
@@ -77,7 +81,7 @@ async def upload_project(
     if not file.filename:
         raise HTTPException(400, "未选择上传文件")
     if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(400, "仅���持 ZIP 文件")
+        raise HTTPException(400, "仅支持 ZIP 文件")
 
     project = Project(
         name=name,
@@ -88,11 +92,10 @@ async def upload_project(
     await db.commit()
     await db.refresh(project)
 
-    project_dir = os.path.join("uploads", str(project.id))
-    os.makedirs(project_dir, exist_ok=True)
-
+    project_dir = os.path.join(UPLOADS_DIR, str(project.id))
     zip_path = os.path.join(project_dir, "source.zip")
     try:
+        os.makedirs(project_dir, exist_ok=True)
         await _save_upload_file(file, zip_path)
         if os.path.getsize(zip_path) == 0:
             raise HTTPException(400, "上传的 ZIP 文件为空")
@@ -121,6 +124,7 @@ async def upload_project(
         await db.commit()
         raise
     except Exception as e:
+        logger.exception("Project upload failed for name=%s filename=%s", name, file.filename)
         shutil.rmtree(project_dir, ignore_errors=True)
         await db.delete(project)
         await db.commit()

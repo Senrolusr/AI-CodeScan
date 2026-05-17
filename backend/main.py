@@ -10,11 +10,17 @@ from database import init_db
 from routers import projects, llm_configs, audits, vulnerabilities, reports
 from services.audit_worker import audit_worker_loop, recover_incomplete_audits
 
+BACKEND_ROOT = os.path.dirname(__file__)
+DATA_DIR = os.path.join(BACKEND_ROOT, "data")
+UPLOADS_DIR = os.path.join(BACKEND_ROOT, "uploads")
+REPORTS_DIR = os.path.join(BACKEND_ROOT, "reports")
+os.makedirs(DATA_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler("data/audit.log", encoding="utf-8"),
+        logging.FileHandler(os.path.join(DATA_DIR, "audit.log"), encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
@@ -23,8 +29,8 @@ logging.basicConfig(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    os.makedirs("uploads", exist_ok=True)
-    os.makedirs("reports", exist_ok=True)
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
+    os.makedirs(REPORTS_DIR, exist_ok=True)
     stop_event = asyncio.Event()
     await recover_incomplete_audits()
     worker_task = asyncio.create_task(audit_worker_loop(stop_event))
@@ -52,10 +58,10 @@ app.include_router(vulnerabilities.router, prefix="/api/vulnerabilities", tags=[
 app.include_router(reports.router, prefix="/api/reports", tags=["Reports"])
 
 # Serve uploaded files and reports for download
-if os.path.exists("uploads"):
-    app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-if os.path.exists("reports"):
-    app.mount("/reports", StaticFiles(directory="reports"), name="reports")
+if os.path.exists(UPLOADS_DIR):
+    app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
+if os.path.exists(REPORTS_DIR):
+    app.mount("/reports", StaticFiles(directory=REPORTS_DIR), name="reports")
 
 
 @app.get("/api/stats")
@@ -70,10 +76,25 @@ async def get_stats():
         vuln_stats = (
             await session.execute(
                 select(
-                    func.count(Vulnerability.id),
                     func.sum(
                         case(
-                            (Vulnerability.severity.in_(["Critical", "High"]), 1),
+                            (Vulnerability.verification_state == "verified", 1),
+                            else_=0,
+                        )
+                    ),
+                    func.sum(
+                        case(
+                            (Vulnerability.verification_state == "candidate", 1),
+                            else_=0,
+                        )
+                    ),
+                    func.sum(
+                        case(
+                            (
+                                (Vulnerability.verification_state == "verified")
+                                & Vulnerability.severity.in_(["Critical", "High"]),
+                                1,
+                            ),
                             else_=0,
                         )
                     ),
@@ -81,11 +102,13 @@ async def get_stats():
             )
         ).one()
         vuln_count = vuln_stats[0] or 0
-        crit_count = vuln_stats[1] or 0
+        candidate_vuln_count = vuln_stats[1] or 0
+        crit_count = vuln_stats[2] or 0
 
         return {
             "project_count": project_count,
             "audit_count": audit_count,
             "vuln_count": vuln_count,
+            "candidate_vuln_count": candidate_vuln_count,
             "critical_count": crit_count,
         }

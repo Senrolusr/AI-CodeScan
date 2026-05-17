@@ -70,7 +70,7 @@ Return this JSON shape (stage_summary must be the first field and written in cle
       "line_end": 1,
       "code_snippet": "Relevant code snippet",
       "endpoint": "Related route or invocation entry point",
-      "poc_raw": "完整 raw HTTP 请求包。非硬编码类漏洞必须包含请求行、Host、必要 Header 和请求体（如需要）。",
+      "poc_raw": "按漏洞类型提供可复现 PoC：注入/RCE/文件操作类使用完整 raw HTTP 请求包；业务逻辑/竞态类可使用步骤化描述；配置/信息泄露类可使用命令行验证或配置 diff；硬编码类可写“无需 PoC，凭代码证据即可确认”。",
       "description": "中文根因与影响说明",
       "fix_suggestion": "中文修复建议"
     }
@@ -209,7 +209,7 @@ STAGE_PROMPTS = {
 - 检查密码校验、哈希策略、验证码校验、错误次数限制、会话更新与失效机制。
 - 检查 JWT 的签名、算法、过期、刷新、撤销和服务端验证逻辑。
 - 枚举所有依赖认证但校验缺失或校验可绕过的入口。
-- 认证链路完整性检查：对 token 生成、校验、过期、��新、销毁全链路逐环节审查，标注哪个环节存在缺陷。
+- 认证链路完整性检查：对 token 生成、校验、过期、刷新、销毁全链路逐环节审查，标注哪个环节存在缺陷。
 
 输出要求：
 - 每条漏洞必须说明认证状态、最小权限要求和影响范围。

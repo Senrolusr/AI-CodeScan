@@ -102,7 +102,7 @@ async def recover_incomplete_audits() -> None:
             await session.commit()
 
 
-async def _claim_next_task() -> tuple[int, list[int], int | None] | None:
+async def _claim_next_task() -> tuple[int, list[int]] | None:
     async with async_session() as session:
         result = await session.execute(select(AuditTask).where(AuditTask.status == "pending").order_by(AuditTask.created_at))
         for task in result.scalars().all():
@@ -118,16 +118,10 @@ async def _claim_next_task() -> tuple[int, list[int], int | None] | None:
                 if isinstance(stage_num, int) or str(stage_num).isdigit()
             ]
 
-            phase_num = None
-            if summary.get("multi_agent_phase_mode"):
-                phase_num = summary.get("current_phase", 1)
-            elif not stage_nums:
-                phase_num = 1
-
             summary[QUEUE_CLAIMED_AT_KEY] = datetime.now(timezone.utc).isoformat()
             task.summary = dict(summary)
             await session.commit()
-            return task.id, stage_nums, phase_num
+            return task.id, stage_nums
     return None
 
 
@@ -142,14 +136,10 @@ async def audit_worker_loop(stop_event: asyncio.Event) -> None:
                 pass
             continue
 
-        task_id, stage_nums, phase_num = claimed
+        task_id, _stage_nums = claimed
         try:
-            if phase_num is not None:
-                from services.supervisor import run_multi_agent_phase
-                await asyncio.wait_for(run_multi_agent_phase(task_id, phase_num), timeout=WORKER_TASK_TIMEOUT_SECONDS)
-            else:
-                from services.supervisor import run_multi_agent_phase
-                await asyncio.wait_for(run_multi_agent_phase(task_id, 1), timeout=WORKER_TASK_TIMEOUT_SECONDS)
+            from services.supervisor import run_multi_agent_audit
+            await asyncio.wait_for(run_multi_agent_audit(task_id), timeout=WORKER_TASK_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             logger.error("Audit worker timed out after %ss on task %s", WORKER_TASK_TIMEOUT_SECONDS, task_id)
         except Exception:

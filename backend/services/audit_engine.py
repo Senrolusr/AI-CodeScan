@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -22,12 +23,14 @@ logger = logging.getLogger(__name__)
 
 STAGE1_MAX_PASSES = 5
 STAGE1_BATCH_TARGET_LEN = 120000
-STAGE1_TOTAL_TARGET_LEN = STAGE1_MAX_PASSES * STAGE1_BATCH_TARGET_LEN
 STAGE1_MIN_PASSES = 3
 STAGE1_EARLY_STOP_COVERAGE = 0.82
 STAGE1_STRONG_STOP_COVERAGE = 0.94
 STAGE1_PASS1_CODE_MAX_LEN = 150000
 STAGE1_LATER_PASS_CODE_MAX_LEN = 90000
+STAGE1_SOFT_MAX_BATCHES = 12
+SECONDARY_STAGE_MAX_ROUNDS = 3
+SECONDARY_STAGE_CHUNK_LIMIT = 16
 STAGE_RETRY_POLICIES = {
     1: {"enabled": True, "max_vulnerabilities": 0, "code_limit": 22000, "prev_context_limit": 800, "route_limit": 20, "detail_enrichment_max_items": 0, "detail_enrichment_concurrency": 1},
     2: {"enabled": True, "max_vulnerabilities": 4, "code_limit": 18000, "prev_context_limit": 1200, "route_limit": 8, "detail_enrichment_max_items": 2, "detail_enrichment_concurrency": 1},
@@ -54,6 +57,9 @@ SEVERITY_ALIASES = {
     "info": "Info", "提示": "Info", "信息": "Info", "informational": "Info",
 }
 VALID_SEVERITIES = {"Critical", "High", "Medium", "Low", "Info"}
+VALID_VERIFICATION_STATES = {"verified", "candidate"}
+CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
+CONFIRMED_STATUS_RANK = {"confirmed": 4, "fixed": 3, "pending": 2, "false_positive": 1}
 
 
 def _normalize_severity(severity: str) -> str:
@@ -71,28 +77,104 @@ def _severity_match_values(severity: str) -> list[str]:
     return list(set([normalized] + aliases))
 
 
+def _normalize_confidence(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in CONFIDENCE_RANK:
+        return normalized
+    return "medium"
+
+
+def _normalize_verification_state(state: str | None) -> str:
+    value = str(state or "").strip().lower()
+    if value in VALID_VERIFICATION_STATES:
+        return value
+    return "candidate"
+
+
+def _is_verified_vulnerability(vuln) -> bool:
+    return _normalize_verification_state(getattr(vuln, "verification_state", None)) == "verified"
+
+
 async def _is_task_cancelled(session, task_id: int) -> bool:
     result = await session.execute(select(AuditTask.status).where(AuditTask.id == task_id))
     return result.scalar_one_or_none() == "cancelled"
 
 
-def _build_task_severity_stats(vulns: list[Vulnerability]) -> dict:
+def _build_task_severity_stats(
+    vulns: list[Vulnerability],
+    *,
+    verification_state: str | None = None,
+) -> dict:
     stats = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
     for vuln in vulns:
+        if verification_state and _normalize_verification_state(getattr(vuln, "verification_state", None)) != verification_state:
+            continue
         severity = getattr(vuln, "severity", None)
         if severity in stats:
             stats[severity] += 1
     return stats
 
 
-def _build_task_diff_stats(vulns: list[Vulnerability]) -> dict:
+def _build_task_diff_stats(
+    vulns: list[Vulnerability],
+    *,
+    verification_state: str | None = None,
+) -> dict:
     stats = {"new": 0, "existing": 0}
     for vuln in vulns:
+        if verification_state and _normalize_verification_state(getattr(vuln, "verification_state", None)) != verification_state:
+            continue
         diff_status = getattr(vuln, "diff_status", None) or "existing"
         if diff_status not in stats:
             diff_status = "existing"
         stats[diff_status] += 1
     return stats
+
+
+def _build_task_verification_stats(vulns: list[Vulnerability]) -> dict:
+    stats = {"verified": 0, "candidate": 0}
+    for vuln in vulns:
+        stats[_normalize_verification_state(getattr(vuln, "verification_state", None))] += 1
+    return stats
+
+
+def _build_stage_coverage_snapshot(compact_context: dict | None, selected_chunks: list[dict]) -> dict:
+    compact_context = compact_context if isinstance(compact_context, dict) else {}
+    focus_files = compact_context.get("focus_files", []) if isinstance(compact_context.get("focus_files"), list) else []
+    focus_routes = compact_context.get("focus_routes", []) if isinstance(compact_context.get("focus_routes"), list) else []
+    return {
+        "selected_chunk_count": len(selected_chunks),
+        "focus_files": focus_files[:40],
+        "focus_file_count": len(focus_files),
+        "focus_routes": [
+            {
+                "method": str(route.get("method", "UNKNOWN") or "UNKNOWN").upper(),
+                "path": str(route.get("path", "") or "").strip(),
+                "handler": str(route.get("handler", "") or "").strip(),
+                "file_path": str(route.get("file_path", "") or "").strip(),
+                "auth": str(route.get("auth", "") or "").strip(),
+            }
+            for route in focus_routes[:32]
+            if isinstance(route, dict) and str(route.get("path", "") or "").strip()
+        ],
+    }
+
+
+def _attach_stage_runtime_summary(
+    response: dict | list | None,
+    *,
+    coverage_snapshot: dict,
+) -> dict:
+    if isinstance(response, dict):
+        normalized = dict(response)
+    elif isinstance(response, list):
+        normalized = {"vulnerabilities": response}
+    else:
+        normalized = {"vulnerabilities": []}
+    normalized["_stage_coverage"] = coverage_snapshot
+    vulnerabilities = normalized.get("vulnerabilities", [])
+    normalized["_vulnerability_count"] = len(vulnerabilities) if isinstance(vulnerabilities, list) else 0
+    return normalized
 
 
 def _build_task_rescan_recommendations(vulns: list[Vulnerability], scan_stats: dict) -> list[str]:
@@ -156,9 +238,34 @@ async def _refresh_task_summary(
     vuln_result = await session.execute(select(Vulnerability).where(Vulnerability.task_id == task.id))
     vulns = list(vuln_result.scalars().all())
     effective_scan_stats = summary.get("scan_stats", {}) if isinstance(summary.get("scan_stats"), dict) else {}
-    summary["severity_stats"] = _build_task_severity_stats(vulns)
-    summary["diff_stats"] = _build_task_diff_stats(vulns)
-    summary["rescan_recommendations"] = _build_task_rescan_recommendations(vulns, effective_scan_stats)
+    summary["verification_stats"] = _build_task_verification_stats(vulns)
+    summary["severity_stats"] = _build_task_severity_stats(vulns, verification_state="verified")
+    summary["candidate_severity_stats"] = _build_task_severity_stats(vulns, verification_state="candidate")
+    summary["diff_stats"] = _build_task_diff_stats(vulns, verification_state="verified")
+    summary["candidate_diff_stats"] = _build_task_diff_stats(vulns, verification_state="candidate")
+    summary["rescan_recommendations"] = _build_task_rescan_recommendations(
+        [vuln for vuln in vulns if _is_verified_vulnerability(vuln)],
+        effective_scan_stats,
+    )
+    stage1_result = await session.execute(
+        select(AuditStage).where(AuditStage.task_id == task.id, AuditStage.stage_num == 1)
+    )
+    stage1 = stage1_result.scalar_one_or_none()
+    stage1_compressed = stage1.compressed_summary if stage1 and isinstance(stage1.compressed_summary, dict) else {}
+    stage1_coverage = stage1_compressed.get("coverage", {}) if isinstance(stage1_compressed.get("coverage"), dict) else {}
+    if stage1_coverage:
+        total_chunks = max(1, int(stage1_coverage.get("audit_scope_chunk_count") or stage1_coverage.get("total_chunk_count") or 1))
+        scanned_chunks = int(stage1_coverage.get("scanned_chunk_count") or 0)
+        summary["stage1_coverage"] = {
+            "label": str(stage1_coverage.get("audit_scope_label", "审计集覆盖率") or "审计集覆盖率"),
+            "ratio": round(scanned_chunks / total_chunks, 4),
+            "scope_type": str(stage1_coverage.get("audit_scope_type", "selected_high_value_chunks") or "selected_high_value_chunks"),
+            "scope_note": str(stage1_coverage.get("audit_scope_note", "") or ""),
+            "covered_file_count": len(stage1_coverage.get("covered_paths", []) or []),
+            "audit_scope_file_count": int(stage1_coverage.get("audit_scope_file_count") or 0),
+            "scanned_chunk_count": scanned_chunks,
+            "audit_scope_chunk_count": int(stage1_coverage.get("audit_scope_chunk_count") or stage1_coverage.get("total_chunk_count") or 0),
+        }
     task.summary = dict(summary)
 
 
@@ -219,13 +326,15 @@ async def _run_stage(session, task, stage, llm_config, project, code_chunks, sta
     response = stage_payload["response"]
     stage.prompt_used = stage_payload["prompt_used"]
     stage.llm_response = stage_payload["llm_response"]
+    repair_code_text = str(stage_payload.get("repair_code_text", "") or "")
+    repair_prev_context = str(stage_payload.get("repair_prev_context", "") or "")
     if isinstance(stage_payload.get("compressed_summary"), (dict, list)):
         stage.compressed_summary = stage_payload["compressed_summary"]
     if stage_payload.get("artifact_path"):
         stage.artifact_path = stage_payload["artifact_path"]
 
     vulns_created = 0
-    policy_stats = {"invalid_poc_vulnerabilities": 0, "invalid_poc_titles": []}
+    policy_stats = {"invalid_poc_vulnerabilities": 0, "invalid_poc_titles": [], "merged_duplicate_vulnerabilities": 0}
     if isinstance(response, dict):
         if stage.stage_num == 1 and "vulnerabilities" not in response:
             response["vulnerabilities"] = []
@@ -236,6 +345,22 @@ async def _run_stage(session, task, stage, llm_config, project, code_chunks, sta
             static_routes=static_routes,
             audit_memory=audit_memory,
         )
+        response = _backfill_vulnerability_poc_templates(
+            stage_num=stage.stage_num,
+            response=response,
+            static_routes=static_routes,
+            audit_memory=audit_memory,
+        )
+        response = await _repair_invalid_vulnerability_pocs(
+            llm_config=llm_config,
+            stage=stage,
+            project=project,
+            stage_prompt=get_stage_prompt(stage.stage_num),
+            response=response,
+            code_text=repair_code_text,
+            prev_context=repair_prev_context or _build_prev_context(audit_memory),
+            static_routes=static_routes,
+        )
         response, policy_stats = _enforce_vulnerability_output_policy(stage, response)
         stage.findings = response
         vulns_created = await _store_vulnerabilities(session, task, stage, response.get("vulnerabilities", []))
@@ -244,6 +369,22 @@ async def _run_stage(session, task, stage, llm_config, project, code_chunks, sta
             response={"vulnerabilities": response},
             static_routes=static_routes,
             audit_memory=audit_memory,
+        )
+        normalized_payload = _backfill_vulnerability_poc_templates(
+            stage_num=stage.stage_num,
+            response=normalized_payload,
+            static_routes=static_routes,
+            audit_memory=audit_memory,
+        )
+        normalized_payload = await _repair_invalid_vulnerability_pocs(
+            llm_config=llm_config,
+            stage=stage,
+            project=project,
+            stage_prompt=get_stage_prompt(stage.stage_num),
+            response=normalized_payload,
+            code_text=repair_code_text,
+            prev_context=repair_prev_context or _build_prev_context(audit_memory),
+            static_routes=static_routes,
         )
         normalized_response, policy_stats = _enforce_vulnerability_output_policy(stage, normalized_payload)
         response = normalized_response.get("vulnerabilities", [])
@@ -255,7 +396,7 @@ async def _run_stage(session, task, stage, llm_config, project, code_chunks, sta
     if isinstance(stage.findings, dict) and policy_stats["invalid_poc_vulnerabilities"]:
         stage.findings.setdefault(
             "_policy_note",
-            "已按 code_aduit.md 规则校验 POC；漏洞均已入库，但部分漏洞未提供合规的 raw HTTP POC。",
+            "已按 code_aduit.md 规则校验 POC；漏洞均已入库，但部分漏洞未提供与其类型匹配的合规 PoC。",
         )
         stage.findings["_policy_stats"] = policy_stats
 
@@ -286,12 +427,24 @@ async def _apply_stage_payload(stage, stage_payload: dict, session=None, task=No
                 static_routes=static_routes,
                 audit_memory=audit_memory,
             )
+            response = _backfill_vulnerability_poc_templates(
+                stage_num=stage.stage_num,
+                response=response,
+                static_routes=static_routes,
+                audit_memory=audit_memory,
+            )
         response, _ = _enforce_vulnerability_output_policy(stage, response)
         stage.findings = response
     elif isinstance(response, list):
         if static_routes is not None and audit_memory is not None:
             normalized_payload = _hydrate_vulnerability_endpoints(
                 response={"vulnerabilities": response},
+                static_routes=static_routes,
+                audit_memory=audit_memory,
+            )
+            normalized_payload = _backfill_vulnerability_poc_templates(
+                stage_num=stage.stage_num,
+                response=normalized_payload,
                 static_routes=static_routes,
                 audit_memory=audit_memory,
             )
@@ -572,6 +725,11 @@ async def _run_single_pass_stage(
         },
         ensure_ascii=False,
     )[:10000]
+    coverage_snapshot = _build_stage_coverage_snapshot(compact_context, prompt_selected_chunks)
+    compressed_summary = _attach_stage_runtime_summary(
+        selected_response,
+        coverage_snapshot=coverage_snapshot,
+    )
     _persist_single_stage_artifact(
         artifact_path=artifact_path,
         task_id=task.id,
@@ -580,7 +738,7 @@ async def _run_single_pass_stage(
         selected_chunks=prompt_selected_chunks,
         code_text=code_text,
         audit_memory=audit_memory,
-        response=selected_response if isinstance(selected_response, dict) else {"vulnerabilities": selected_response if isinstance(selected_response, list) else []},
+        response=compressed_summary,
         execution_meta={"retry": retry_meta, "stage5_followup": stage5_followup_meta, "second_pass": second_pass_meta},
     )
 
@@ -588,8 +746,10 @@ async def _run_single_pass_stage(
         "response": selected_response,
         "prompt_used": prompt_used,
         "llm_response": llm_response,
-        "compressed_summary": selected_response if isinstance(selected_response, dict) else {"vulnerabilities": selected_response if isinstance(selected_response, list) else []},
+        "compressed_summary": compressed_summary,
         "artifact_path": artifact_path,
+        "repair_code_text": code_text,
+        "repair_prev_context": effective_prev_context,
     }
 
 
@@ -610,6 +770,14 @@ async def _run_stage1_multi_pass(
     pre_discovery: dict | None = None,
 ):
     selected_chunks = _frontload_route_related_stage1_chunks(selected_chunks, static_routes)
+    total_selected_chunk_count = len(selected_chunks)
+    total_selected_file_count = len(
+        {
+            str(chunk.get("file_path", "") or "").strip().lower()
+            for chunk in selected_chunks
+            if str(chunk.get("file_path", "") or "").strip()
+        }
+    )
     chunk_batches = _split_chunks_for_stage1(selected_chunks, pre_discovery=pre_discovery)
     pass_outputs = []
     merged_response = {"stage_summary": "", "architecture_info": {}, "vulnerabilities": []}
@@ -620,15 +788,15 @@ async def _run_stage1_multi_pass(
     stage.prompt_used = json.dumps(
         {
             "system_prompt": SYSTEM_BASE,
-            "debug": {
-                "spec_label": get_spec_label(),
-                "stage_num": stage.stage_num,
-                "selected_chunk_count": len(selected_chunks),
-                "available_chunk_count": len(code_chunks),
-                "batch_count": len(chunk_batches),
-                "static_route_count": len(static_routes),
-                "prev_context_length": len(prev_context or ""),
-                "summary_mode": "compressed_summary",
+                "debug": {
+                    "spec_label": get_spec_label(),
+                    "stage_num": stage.stage_num,
+                    "selected_chunk_count": total_selected_chunk_count,
+                    "available_chunk_count": len(code_chunks),
+                    "batch_count": len(chunk_batches),
+                    "static_route_count": len(static_routes),
+                    "prev_context_length": len(prev_context or ""),
+                    "summary_mode": "compressed_summary",
             },
         },
         ensure_ascii=False,
@@ -722,7 +890,7 @@ async def _run_stage1_multi_pass(
             compressed_summary,
             summary_delta,
             chunk_batch,
-            len(code_chunks),
+            total_selected_chunk_count,
             static_routes=static_routes,
         )
         pass_outputs.append(
@@ -752,7 +920,8 @@ async def _run_stage1_multi_pass(
             compressed_summary,
             summary_delta,
             chunk_batch,
-            len(code_chunks),
+            total_selected_chunk_count,
+            total_selected_file_count=total_selected_file_count,
             compression_stats=code_compaction,
         )
         stage.compressed_summary = compressed_summary
@@ -826,7 +995,7 @@ async def _run_stage1_multi_pass(
             "debug": {
                 "spec_label": get_spec_label(),
                 "stage_num": stage.stage_num,
-                "selected_chunk_count": len(selected_chunks),
+                "selected_chunk_count": total_selected_chunk_count,
                 "available_chunk_count": len(code_chunks),
                 "batch_count": len(chunk_batches),
                 "static_route_count": len(static_routes),
@@ -857,10 +1026,29 @@ async def _run_stage1_multi_pass(
     )[:10000]
 
     # Gap analysis
-    gap_analysis = _run_stage1_gap_analysis(merged_response, static_routes, pre_discovery)
+    gap_analysis = _run_stage1_gap_analysis(merged_response, static_routes, pre_discovery, compressed_summary)
     if isinstance(merged_response, dict):
         merged_response.setdefault("architecture_info", {})
         merged_response["architecture_info"]["_gap_analysis"] = gap_analysis
+    compressed_summary = _attach_stage_runtime_summary(
+        compressed_summary,
+        coverage_snapshot={
+            "selected_chunk_count": len(selected_chunks),
+            "focus_files": [chunk.get("file_path", "") for chunk in selected_chunks[:40] if chunk.get("file_path")],
+            "focus_file_count": len({chunk.get("file_path", "") for chunk in selected_chunks if chunk.get("file_path")}),
+            "focus_routes": [
+                {
+                    "method": str(route.get("method", "UNKNOWN") or "UNKNOWN").upper(),
+                    "path": str(route.get("path", "") or "").strip(),
+                    "handler": str(route.get("handler", "") or "").strip(),
+                    "file_path": str(route.get("file_path", "") or "").strip(),
+                    "auth": str(route.get("auth", "") or "").strip(),
+                }
+                for route in (merged_response.get("architecture_info", {}).get("routes", []) or [])[:60]
+                if isinstance(route, dict) and str(route.get("path", "") or "").strip()
+            ],
+        },
+    )
 
     return {
         "response": merged_response,
@@ -868,7 +1056,23 @@ async def _run_stage1_multi_pass(
         "llm_response": llm_response,
         "compressed_summary": compressed_summary,
         "artifact_path": artifact_path,
+        "repair_code_text": merged_code_text,
+        "repair_prev_context": prev_context,
     }
+
+
+def _derive_verification_state(stage_num: int, vuln_data: dict, poc_validation: dict) -> str:
+    accepted = bool(poc_validation.get("accepted"))
+    confidence = str(vuln_data.get("confidence", "medium") or "medium").strip().lower()
+    if confidence not in {"high", "medium"}:
+        return "candidate"
+
+    requirement = _classify_poc_requirement(stage_num, vuln_data)
+    if requirement == "none":
+        return "verified"
+
+    # 除了纯代码证据类问题外，其余类型仍需满足各自的 PoC 规范，才计入已验证。
+    return "verified" if accepted else "candidate"
 
 
 async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
@@ -878,23 +1082,24 @@ async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
     result = await session.execute(select(Vulnerability).where(Vulnerability.task_id == task.id))
     existing = {}
     for vuln in result.scalars().all():
-        existing[
-            _vuln_key(
-                {
-                    "title": vuln.title,
-                    "vuln_type": vuln.vuln_type,
-                    "file_path": vuln.file_path,
-                    "line_start": vuln.line_start,
-                    "line_end": vuln.line_end,
-                    "endpoint": vuln.endpoint,
-                }
-            )
-        ] = vuln
+        existing[_vuln_key(
+            {
+                "title": vuln.title,
+                "vuln_type": vuln.vuln_type,
+                "file_path": vuln.file_path,
+                "line_start": vuln.line_start,
+                "line_end": vuln.line_end,
+                "code_snippet": vuln.code_snippet,
+                "endpoint": vuln.endpoint,
+                "description": vuln.description,
+            }
+        )] = vuln
 
     prior_dedupe_keys = await _load_prior_project_vulnerability_keys(session, task)
+    normalized_vulns = _merge_vulnerability_lists([], vulns_data if isinstance(vulns_data, list) else [])
 
     created = 0
-    for vuln_data in vulns_data:
+    for vuln_data in normalized_vulns:
         if not isinstance(vuln_data, dict):
             continue
         poc_raw = str(vuln_data.get("poc_raw", "") or "").strip()
@@ -911,20 +1116,59 @@ async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
         poc_validation = vuln_data.get("_poc_validation") if isinstance(vuln_data.get("_poc_validation"), dict) else {}
         poc_validation_status = "valid" if poc_validation.get("accepted") else "invalid"
         poc_validation_note = str(poc_validation.get("reason", "") or "").strip()
+        verification_state = _derive_verification_state(stage.stage_num, vuln_data, poc_validation)
         description = vuln_data.get("description", "")
         vuln_key = _vuln_key(vuln_data)
         dedupe_key = _stable_vuln_dedupe_key(vuln_data)
         diff_status = "existing" if dedupe_key in prior_dedupe_keys else "new"
         existing_vuln = existing.get(vuln_key)
         if existing_vuln:
-            existing_vuln.poc_validation_status = poc_validation_status
-            existing_vuln.poc_validation_note = poc_validation_note
+            merged_existing = _merge_duplicate_vulnerability(
+                {
+                    "title": existing_vuln.title,
+                    "severity": existing_vuln.severity,
+                    "vuln_type": existing_vuln.vuln_type,
+                    "file_path": existing_vuln.file_path,
+                    "line_start": existing_vuln.line_start,
+                    "line_end": existing_vuln.line_end,
+                    "code_snippet": existing_vuln.code_snippet,
+                    "endpoint": existing_vuln.endpoint,
+                    "poc_raw": existing_vuln.poc_raw,
+                    "poc_validation_status": existing_vuln.poc_validation_status,
+                    "poc_validation_note": existing_vuln.poc_validation_note,
+                    "description": existing_vuln.description,
+                    "fix_suggestion": existing_vuln.fix_suggestion,
+                    "verification_state": existing_vuln.verification_state,
+                    "confirmed_status": existing_vuln.confirmed_status,
+                    "confidence": existing_vuln.confidence,
+                },
+                {
+                    **vuln_data,
+                    "poc_raw": poc_raw,
+                    "poc_validation_status": poc_validation_status,
+                    "poc_validation_note": poc_validation_note,
+                    "verification_state": verification_state,
+                    "description": description,
+                },
+            )
+            existing_vuln.title = merged_existing.get("title", existing_vuln.title)
+            existing_vuln.severity = merged_existing.get("severity", existing_vuln.severity)
+            existing_vuln.vuln_type = merged_existing.get("vuln_type", existing_vuln.vuln_type)
+            existing_vuln.file_path = merged_existing.get("file_path", existing_vuln.file_path)
+            existing_vuln.line_start = merged_existing.get("line_start", existing_vuln.line_start)
+            existing_vuln.line_end = merged_existing.get("line_end", existing_vuln.line_end)
+            existing_vuln.code_snippet = merged_existing.get("code_snippet", existing_vuln.code_snippet)
+            existing_vuln.endpoint = merged_existing.get("endpoint", existing_vuln.endpoint)
+            existing_vuln.poc_raw = merged_existing.get("poc_raw", existing_vuln.poc_raw)
+            existing_vuln.poc_validation_status = merged_existing.get("poc_validation_status", poc_validation_status)
+            existing_vuln.poc_validation_note = merged_existing.get("poc_validation_note", poc_validation_note)
+            existing_vuln.description = merged_existing.get("description", existing_vuln.description)
+            existing_vuln.fix_suggestion = merged_existing.get("fix_suggestion", existing_vuln.fix_suggestion)
             existing_vuln.dedupe_key = dedupe_key
             existing_vuln.diff_status = diff_status
-            if poc_raw and (not existing_vuln.poc_raw or existing_vuln.poc_validation_status != "valid"):
-                existing_vuln.poc_raw = poc_raw
-            if description and ("POC校验备注" in description or not existing_vuln.description):
-                existing_vuln.description = description
+            existing_vuln.verification_state = merged_existing.get("verification_state", verification_state)
+            existing_vuln.confirmed_status = merged_existing.get("confirmed_status", existing_vuln.confirmed_status)
+            existing_vuln.confidence = merged_existing.get("confidence", existing_vuln.confidence)
             continue
         if vuln_data.get("_salvaged"):
             salvage_note = "系统备注：该漏洞由截断的模型响应中自动恢复，请人工复核原始响应。"
@@ -951,6 +1195,7 @@ async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
             dedupe_key=dedupe_key,
             diff_status=diff_status,
             confirmed_status="pending",
+            verification_state=verification_state,
             confidence=vuln_data.get("confidence", "medium"),
         )
         session.add(vuln)
@@ -1381,13 +1626,24 @@ def _coerce_incomplete_stage_response(
     return normalized, True
 
 
-def _needs_vulnerability_detail_enrichment(vuln: dict) -> bool:
+def _needs_vulnerability_detail_enrichment(stage_num: int, vuln: dict) -> bool:
     if not isinstance(vuln, dict):
         return False
-    required_fields = ["code_snippet", "poc_raw", "description", "fix_suggestion"]
+
+    requirement = _classify_poc_requirement(stage_num, vuln)
+    required_fields = ["code_snippet", "description", "fix_suggestion"]
+    if requirement != "none":
+        required_fields.append("poc_raw")
     for field in required_fields:
         if not str(vuln.get(field, "") or "").strip():
             return True
+
+    # 已有 POC 非空但不合规时，也要进入补全，否则 invalid 会直接落库。
+    validation = vuln.get("_poc_validation")
+    if not isinstance(validation, dict):
+        validation = _validate_vulnerability_poc(stage_num, vuln)
+    if not validation.get("accepted") and requirement != "none":
+        return True
     return bool(vuln.get("_salvaged"))
 
 
@@ -1413,6 +1669,9 @@ def _vulnerability_detail_priority(vuln: dict) -> int:
         score += 8
     if str(vuln.get("file_path", "") or "").strip():
         score += 5
+    validation = vuln.get("_poc_validation")
+    if isinstance(validation, dict) and not validation.get("accepted"):
+        score += 35
     return score
 
 
@@ -1430,6 +1689,23 @@ def _build_vulnerability_detail_prompt(
         route_text = _truncate_text("\n".join(_format_static_route_lines(static_routes[:20], total_count=len(static_routes))), 2400)
 
     vulnerability_seed = json.dumps(vulnerability, ensure_ascii=False, indent=2)
+    requirement = _classify_poc_requirement(stage.stage_num, vulnerability)
+    validation = vulnerability.get("_poc_validation")
+    validation_reason = ""
+    if isinstance(validation, dict) and validation.get("reason"):
+        validation_reason = str(validation.get("reason") or "").strip()
+
+    poc_requirement_text = {
+        "raw_http": "当前漏洞必须输出完整 raw HTTP 请求包，至少包含请求行、Host、必要 Header 和请求体（如需要），并与 endpoint 对齐。",
+        "stepwise": "当前漏洞允许使用步骤化 PoC，也允许给出完整 raw HTTP 请求包；如果使用步骤化描述，必须写清前置条件、攻击步骤和预期结果。",
+        "cli": "当前漏洞允许使用命令行验证、配置 diff、日志/环境变量检查或完整 raw HTTP 请求包，不要只写一句笼统判断。",
+        "none": "当前漏洞允许写“无需 PoC，凭代码证据即可确认”，但 description 必须明确代码证据与影响。",
+    }.get(requirement, "请根据漏洞类型提供可复现的 PoC，不要编造不存在的请求。")
+
+    validation_guidance = ""
+    if validation_reason:
+        validation_guidance = f"当前漏洞上一次 PoC 校验未通过，原因：{validation_reason}。补全时优先修正这个问题。"
+
     return "\n".join(
         [
             "补全单条漏洞详情。只补全当前这一个漏洞，不要新增其他漏洞。",
@@ -1437,12 +1713,70 @@ def _build_vulnerability_detail_prompt(
             "严格禁止修改以下字段：title、severity、vuln_type、file_path、line_start、line_end、endpoint。这些字段必须与输入完全一致，不得升级严重性或更改漏洞类型。",
             "只允许补强以下字段：code_snippet、poc_raw、description、fix_suggestion。",
             "如果代码证据不足以支持完整漏洞结论，保持原字段并将 description 写得更谨慎，但仍只基于代码证据。",
-            "poc_raw 格式要求：注入类/RCE 类/文件操作类必须是完整 raw HTTP 请求包；业务逻辑类允许步骤化描述；配置类允许命令行验证。若确实无法从代码推出完整内容，则保留原值，不要编造。",
+            poc_requirement_text,
+            validation_guidance or "若确实无法从代码推出完整内容，则保留原值，不要编造。",
             "",
             "[当前阶段要求]",
             stage_prompt,
             "",
             "[待补全漏洞]",
+            vulnerability_seed,
+            "",
+            "[前序上下文]",
+            _truncate_text(prev_context or "", 1800) if prev_context else "无",
+            "",
+            "[静态路由线索]",
+            route_text or "无",
+            "",
+            "[相关代码]",
+            _truncate_text(code_text or "", 12000),
+            "",
+            "返回单个 JSON 对象。",
+        ]
+    )
+
+
+def _build_vulnerability_poc_repair_prompt(
+    *,
+    stage,
+    stage_prompt: str,
+    vulnerability: dict,
+    code_text: str,
+    prev_context: str,
+    static_routes: list[dict],
+) -> str:
+    route_text = ""
+    if static_routes:
+        route_text = _truncate_text("\n".join(_format_static_route_lines(static_routes[:20], total_count=len(static_routes))), 2400)
+
+    vulnerability_seed = json.dumps(vulnerability, ensure_ascii=False, indent=2)
+    requirement = _classify_poc_requirement(stage.stage_num, vulnerability)
+    validation = vulnerability.get("_poc_validation")
+    validation_reason = ""
+    if isinstance(validation, dict) and validation.get("reason"):
+        validation_reason = str(validation.get("reason") or "").strip()
+
+    poc_requirement_text = {
+        "raw_http": "当前漏洞必须修正为完整 raw HTTP 请求包，至少包含请求行、Host、必要 Header 和请求体（如需要），并与 endpoint 对齐。",
+        "stepwise": "当前漏洞可使用步骤化 PoC 或完整 raw HTTP 请求包；如果保留步骤化描述，必须写清前置条件、攻击步骤和预期结果。",
+        "cli": "当前漏洞可使用命令行验证、配置 diff、日志/环境变量检查或完整 raw HTTP 请求包，必须能直接指导人工复现。",
+        "none": "当前漏洞无需补 PoC，保持代码证据说明即可。",
+    }.get(requirement, "请根据漏洞类型修正为可复现的 PoC，不要编造不存在的请求。")
+
+    return "\n".join(
+        [
+            "修复当前漏洞的 PoC 可复现性问题。只处理这一条漏洞，不要新增其他漏洞。",
+            "必须返回单个合法 JSON 对象，不要返回数组，不要输出 Markdown。",
+            "默认保持以下字段不变：title、severity、vuln_type、file_path、line_start、line_end。",
+            "允许修正以下字段：endpoint、code_snippet、poc_raw、description、fix_suggestion。",
+            "若 endpoint 缺失或与 PoC 不匹配，可以根据代码和静态路由线索修正 endpoint；若证据不足，则保留原值，不要编造。",
+            poc_requirement_text,
+            f"当前校验失败原因：{validation_reason or '未提供明确原因'}。请优先修复这个问题。",
+            "",
+            "[当前阶段要求]",
+            stage_prompt,
+            "",
+            "[待修复漏洞]",
             vulnerability_seed,
             "",
             "[前序上下文]",
@@ -1486,7 +1820,7 @@ async def _enrich_vulnerability_details(
     candidates = [
         (index, vuln)
         for index, vuln in enumerate(vulnerabilities)
-        if isinstance(vuln, dict) and _needs_vulnerability_detail_enrichment(vuln)
+        if isinstance(vuln, dict) and _needs_vulnerability_detail_enrichment(stage.stage_num, vuln)
     ]
     if not candidates:
         return response
@@ -1582,6 +1916,165 @@ async def _enrich_vulnerability_details(
     return normalized
 
 
+def _poc_repair_priority(stage_num: int, vuln: dict) -> int:
+    score = _vulnerability_detail_priority(vuln)
+    validation = vuln.get("_poc_validation")
+    if not isinstance(validation, dict):
+        validation = _validate_vulnerability_poc(stage_num, vuln)
+    if not validation.get("accepted"):
+        score += 60
+    if not str(vuln.get("endpoint", "") or "").strip():
+        score += 20
+    return score
+
+
+def _poc_quality_score(stage_num: int, vuln: dict, validation: dict | None = None) -> int:
+    if not isinstance(vuln, dict):
+        return 0
+    validation = validation if isinstance(validation, dict) else _validate_vulnerability_poc(stage_num, vuln)
+    requirement = _classify_poc_requirement(stage_num, vuln)
+    poc_raw = str(vuln.get("poc_raw", "") or "").strip()
+    endpoint = str(vuln.get("endpoint", "") or "").strip()
+    score = 0
+    if validation.get("accepted"):
+        score += 100
+    if endpoint:
+        score += 20
+    if poc_raw:
+        score += min(20, max(1, len(poc_raw) // 80))
+    if requirement == "raw_http":
+        packet = _parse_raw_http_request(poc_raw)
+        if packet.get("valid"):
+            score += 25
+    elif requirement == "stepwise":
+        if _looks_like_stepwise_poc(poc_raw) or _parse_raw_http_request(poc_raw).get("valid"):
+            score += 20
+    elif requirement == "cli":
+        if _looks_like_cli_or_config_poc(poc_raw) or _parse_raw_http_request(poc_raw).get("valid"):
+            score += 20
+    return score
+
+
+async def _repair_invalid_vulnerability_pocs(
+    *,
+    llm_config,
+    stage,
+    project,
+    stage_prompt: str,
+    response: dict | list,
+    code_text: str,
+    prev_context: str,
+    static_routes: list[dict],
+) -> dict | list:
+    if not isinstance(response, dict):
+        return response
+
+    vulnerabilities = response.get("vulnerabilities", [])
+    if not isinstance(vulnerabilities, list) or not vulnerabilities:
+        return response
+
+    policy = _get_stage_retry_policy(stage.stage_num)
+    max_items = min(2, max(0, int(policy.get("detail_enrichment_max_items", 4) or 0)))
+    if max_items <= 0:
+        return response
+
+    candidates: list[tuple[int, dict]] = []
+    for index, vuln in enumerate(vulnerabilities):
+        if not isinstance(vuln, dict):
+            continue
+        validation = vuln.get("_poc_validation")
+        if not isinstance(validation, dict):
+            validation = _validate_vulnerability_poc(stage.stage_num, vuln)
+            vuln["_poc_validation"] = validation
+        if validation.get("accepted"):
+            continue
+        if _classify_poc_requirement(stage.stage_num, vuln) == "none":
+            continue
+        candidates.append((index, vuln))
+
+    if not candidates:
+        return response
+
+    candidates.sort(key=lambda item: (-_poc_repair_priority(stage.stage_num, item[1]), item[0]))
+    candidate_indexes = {index for index, _ in candidates[:max_items]}
+    semaphore = asyncio.Semaphore(1)
+
+    async def repair_one(vuln: dict) -> dict:
+        original_validation = vuln.get("_poc_validation")
+        if not isinstance(original_validation, dict):
+            original_validation = _validate_vulnerability_poc(stage.stage_num, vuln)
+        prompt = _build_vulnerability_poc_repair_prompt(
+            stage=stage,
+            stage_prompt=stage_prompt,
+            vulnerability=vuln,
+            code_text=code_text,
+            prev_context=prev_context,
+            static_routes=static_routes,
+        )
+        async with semaphore:
+            repair_result = await call_llm_with_meta(llm_config, SYSTEM_BASE, prompt)
+        if not repair_result.get("success"):
+            return vuln
+
+        repair_response = _parse_structured_response(repair_result["content"], repair_result.get("meta"))
+        if not isinstance(repair_response, dict) or repair_response.get("parse_error"):
+            return vuln
+
+        repaired = dict(vuln)
+        for field in ["endpoint", "code_snippet", "poc_raw", "description", "fix_suggestion"]:
+            value = repair_response.get(field)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                if value.strip():
+                    repaired[field] = value
+            else:
+                repaired[field] = value
+        repaired.pop("_poc_template_generated", None)
+        repaired_validation = _validate_vulnerability_poc(stage.stage_num, repaired)
+        repaired["_poc_validation"] = repaired_validation
+
+        if _poc_quality_score(stage.stage_num, repaired, repaired_validation) <= _poc_quality_score(stage.stage_num, vuln, original_validation):
+            vuln["_poc_validation"] = original_validation
+            return vuln
+
+        repaired["_poc_repaired"] = True
+        return repaired
+
+    repair_tasks = {
+        index: asyncio.create_task(repair_one(vuln))
+        for index, vuln in candidates[:max_items]
+    }
+
+    repaired_vulns: list[dict] = []
+    changed = False
+    repaired_count = 0
+    for index, vuln in enumerate(vulnerabilities):
+        if not isinstance(vuln, dict):
+            continue
+        if index not in candidate_indexes:
+            repaired_vulns.append(vuln)
+            continue
+
+        repaired = await repair_tasks[index]
+        repaired_vulns.append(repaired)
+        if repaired is not vuln:
+            changed = True
+        if isinstance(repaired, dict) and repaired.get("_poc_repaired"):
+            repaired_count += 1
+
+    if not changed:
+        return response
+
+    normalized = dict(response)
+    normalized["vulnerabilities"] = repaired_vulns
+    normalized["_poc_repair_policy"] = {"max_items": max_items}
+    normalized["_poc_repair_count"] = repaired_count
+    if repaired_count:
+        normalized["_poc_repair_applied"] = True
+    return normalized
+
+
 def _should_run_stage5_followup_scan(response: dict | list, retry_meta: dict | None = None) -> bool:
     if not isinstance(response, dict):
         return False
@@ -1618,12 +2111,15 @@ def _select_secondary_stage_chunks(
     static_routes: list[dict],
     audit_memory: dict | None = None,
     source_sink_hints: list[dict] | None = None,
+    already_scanned_paths: set[str] | None = None,
+    chunk_limit: int = SECONDARY_STAGE_CHUNK_LIMIT,
 ) -> list[dict]:
     selected_paths = {
         str(chunk.get("file_path", "")).strip().lower()
         for chunk in selected_chunks
         if isinstance(chunk, dict) and str(chunk.get("file_path", "")).strip()
     }
+    selected_paths |= {str(path).strip().lower() for path in (already_scanned_paths or set()) if str(path).strip()}
     remaining = [
         chunk
         for chunk in code_chunks
@@ -1646,7 +2142,7 @@ def _select_secondary_stage_chunks(
         static_routes=static_routes,
         audit_memory=audit_memory,
         source_sink_hints=source_sink_hints,
-    )[:12]
+    )[: max(1, chunk_limit)]
     return selected
 
 
@@ -1721,133 +2217,174 @@ async def _run_secondary_stage_pass(
     if not isinstance(current_response, dict):
         return current_response, {"triggered": False, "reason": "current_response_not_dict"}
 
-    secondary_chunks = _select_secondary_stage_chunks(
-        stage_num=stage.stage_num,
-        code_chunks=code_chunks,
-        selected_chunks=selected_chunks,
-        static_routes=static_routes,
-        audit_memory=audit_memory,
-        source_sink_hints=source_sink_hints,
-    )
-    if not secondary_chunks:
-        return current_response, {"triggered": False, "reason": "no_secondary_chunks"}
+    merged_response = current_response
+    scanned_paths: set[str] = set()
+    round_meta: list[dict] = []
 
-    compact_context = _build_stage_focus_compact_context(
-        stage=stage,
-        project=project,
-        static_routes=static_routes,
-        selected_chunks=secondary_chunks,
-        audit_memory=audit_memory,
-        rule_hits=[],
-        source_sink_hints=source_sink_hints,
-    )
-    base_code_text = _format_non_stage1_chunks_for_prompt(secondary_chunks, stage.stage_num, audit_memory=audit_memory)
-    effective_prev_context = _build_secondary_pass_prev_context(prev_context, current_response)
-    if stage.stage_num in {2, 3, 4, 8}:
-        compact_context, base_code_text, effective_prev_context = _apply_exploit_stage_prompt_budget(
-            compact_context=compact_context,
-            code_text=base_code_text,
-            prev_context=effective_prev_context,
+    # 二次补扫改为有限多轮，逐轮覆盖剩余高价值代码，而不是只补一次固定小样本。
+    for round_index in range(1, SECONDARY_STAGE_MAX_ROUNDS + 1):
+        if round_index > 1 and not _should_run_secondary_stage_pass(stage.stage_num, merged_response):
+            break
+
+        secondary_chunks = _select_secondary_stage_chunks(
             stage_num=stage.stage_num,
-            aggressive=True,
+            code_chunks=code_chunks,
+            selected_chunks=selected_chunks,
+            static_routes=static_routes,
+            audit_memory=audit_memory,
+            source_sink_hints=source_sink_hints,
+            already_scanned_paths=scanned_paths,
         )
-    elif stage.stage_num == 5:
-        compact_context, base_code_text, effective_prev_context = _apply_stage5_prompt_budget(
+        if not secondary_chunks:
+            if round_index == 1:
+                return current_response, {"triggered": False, "reason": "no_secondary_chunks", "rounds": []}
+            break
+
+        compact_context = _build_stage_focus_compact_context(
+            stage=stage,
+            project=project,
+            static_routes=static_routes,
+            selected_chunks=secondary_chunks,
+            audit_memory=audit_memory,
+            rule_hits=[],
+            source_sink_hints=source_sink_hints,
+        )
+        base_code_text = _format_non_stage1_chunks_for_prompt(secondary_chunks, stage.stage_num, audit_memory=audit_memory)
+        effective_prev_context = _build_secondary_pass_prev_context(prev_context, merged_response)
+        if stage.stage_num in {2, 3, 4, 8}:
+            compact_context, base_code_text, effective_prev_context = _apply_exploit_stage_prompt_budget(
+                compact_context=compact_context,
+                code_text=base_code_text,
+                prev_context=effective_prev_context,
+                stage_num=stage.stage_num,
+                aggressive=True,
+            )
+        elif stage.stage_num == 5:
+            compact_context, base_code_text, effective_prev_context = _apply_stage5_prompt_budget(
+                compact_context=compact_context,
+                code_text=base_code_text,
+                prev_context=effective_prev_context,
+                aggressive=True,
+            )
+        elif stage.stage_num == 6:
+            compact_context, base_code_text, effective_prev_context = _apply_stage6_prompt_budget(
+                compact_context=compact_context,
+                code_text=base_code_text,
+                prev_context=effective_prev_context,
+                aggressive=True,
+            )
+        elif stage.stage_num == 7:
+            compact_context, base_code_text, effective_prev_context = _apply_lightweight_stage_prompt_budget(
+                compact_context=compact_context,
+                code_text=base_code_text,
+                prev_context=effective_prev_context,
+                stage_num=stage.stage_num,
+                aggressive=True,
+            )
+        else:
+            compact_context, base_code_text, effective_prev_context = _apply_stage9_prompt_budget(
+                compact_context=compact_context,
+                code_text=base_code_text,
+                prev_context=effective_prev_context,
+                aggressive=True,
+            )
+
+        compact_context["extra_guidance"] = "\n".join(
+            [part for part in [str(compact_context.get("extra_guidance", "") or "").strip(), _build_secondary_pass_guidance(merged_response)] if part]
+        )
+        user_prompt = _build_stage_user_prompt(
+            stage,
+            project,
+            stage_prompt,
+            base_code_text,
+            effective_prev_context,
+            static_routes,
             compact_context=compact_context,
+            audit_memory=audit_memory,
+        )
+        llm_result = await call_llm_with_meta(llm_config, SYSTEM_BASE, user_prompt)
+        current_round_meta = {
+            "round_index": round_index,
+            "selected_chunk_count": len(secondary_chunks),
+            "prompt_length": len(user_prompt),
+            "success": bool(llm_result.get("success")),
+            "selected_files": [
+                str(chunk.get("file_path", "") or "").strip()
+                for chunk in secondary_chunks[:24]
+                if str(chunk.get("file_path", "") or "").strip()
+            ],
+        }
+        if not llm_result.get("success"):
+            current_round_meta["error"] = llm_result.get("error", {}).get("message", "second pass failed")
+            round_meta.append(current_round_meta)
+            return merged_response if round_index > 1 else current_response, {
+                "triggered": round_index > 1,
+                "selected_chunk_count": sum(int(item.get("selected_chunk_count", 0) or 0) for item in round_meta),
+                "round_count": len(round_meta),
+                "rounds": round_meta,
+                "success": False,
+            }
+
+        response = _parse_structured_response(llm_result["content"], llm_result.get("meta"))
+        retry_policy = _get_stage_retry_policy(stage.stage_num)
+        _, selected_response, retry_meta = await _retry_incomplete_stage_response(
+            llm_config=llm_config,
+            stage=stage,
+            project=project,
+            stage_prompt=stage_prompt,
             code_text=base_code_text,
             prev_context=effective_prev_context,
-            aggressive=True,
-        )
-    elif stage.stage_num == 6:
-        compact_context, base_code_text, effective_prev_context = _apply_stage6_prompt_budget(
+            static_routes=static_routes,
             compact_context=compact_context,
-            code_text=base_code_text,
-            prev_context=effective_prev_context,
-            aggressive=True,
+            audit_memory=audit_memory,
+            initial_result=llm_result,
+            initial_response=response,
+            retry_policy=retry_policy,
         )
-    elif stage.stage_num == 7:
-        compact_context, base_code_text, effective_prev_context = _apply_lightweight_stage_prompt_budget(
-            compact_context=compact_context,
-            code_text=base_code_text,
-            prev_context=effective_prev_context,
+        selected_response, local_recovery_applied = _coerce_incomplete_stage_response(
             stage_num=stage.stage_num,
-            aggressive=True,
+            response=selected_response,
+            retry_policy=retry_policy,
         )
-    else:
-        compact_context, base_code_text, effective_prev_context = _apply_stage9_prompt_budget(
-            compact_context=compact_context,
+        if local_recovery_applied:
+            retry_meta["local_recovery_applied"] = True
+        selected_response = await _enrich_vulnerability_details(
+            llm_config=llm_config,
+            stage=stage,
+            project=project,
+            stage_prompt=stage_prompt,
+            response=selected_response,
             code_text=base_code_text,
             prev_context=effective_prev_context,
-            aggressive=True,
+            static_routes=static_routes,
         )
 
-    compact_context["extra_guidance"] = "\n".join(
-        [part for part in [str(compact_context.get("extra_guidance", "") or "").strip(), _build_secondary_pass_guidance(current_response)] if part]
-    )
-    user_prompt = _build_stage_user_prompt(
-        stage,
-        project,
-        stage_prompt,
-        base_code_text,
-        effective_prev_context,
-        static_routes,
-        compact_context=compact_context,
-        audit_memory=audit_memory,
-    )
-    llm_result = await call_llm_with_meta(llm_config, SYSTEM_BASE, user_prompt)
-    meta = {
+        previous_vuln_count = len(merged_response.get("vulnerabilities", []) if isinstance(merged_response.get("vulnerabilities"), list) else [])
+        merged_response = _merge_stage1_pass_response(merged_response, selected_response)
+        merged_response["_second_pass_applied"] = True
+        current_round_meta["retry"] = retry_meta
+        current_round_meta["new_vulnerability_count"] = max(
+            0,
+            len(merged_response.get("vulnerabilities", []) if isinstance(merged_response.get("vulnerabilities"), list) else []) - previous_vuln_count,
+        )
+        round_meta.append(current_round_meta)
+        scanned_paths.update(
+            str(chunk.get("file_path", "")).strip().lower()
+            for chunk in secondary_chunks
+            if str(chunk.get("file_path", "")).strip()
+        )
+
+    if not round_meta:
+        return current_response, {"triggered": False, "reason": "no_secondary_chunks", "rounds": []}
+
+    return merged_response, {
         "triggered": True,
-        "selected_chunk_count": len(secondary_chunks),
-        "prompt_length": len(user_prompt),
-        "success": bool(llm_result.get("success")),
+        "selected_chunk_count": sum(int(item.get("selected_chunk_count", 0) or 0) for item in round_meta),
+        "round_count": len(round_meta),
+        "rounds": round_meta,
+        "success": all(bool(item.get("success")) for item in round_meta),
+        "new_vulnerability_count": sum(int(item.get("new_vulnerability_count", 0) or 0) for item in round_meta),
     }
-    if not llm_result.get("success"):
-        meta["error"] = llm_result.get("error", {}).get("message", "second pass failed")
-        return current_response, meta
-
-    response = _parse_structured_response(llm_result["content"], llm_result.get("meta"))
-    retry_policy = _get_stage_retry_policy(stage.stage_num)
-    _, selected_response, retry_meta = await _retry_incomplete_stage_response(
-        llm_config=llm_config,
-        stage=stage,
-        project=project,
-        stage_prompt=stage_prompt,
-        code_text=base_code_text,
-        prev_context=effective_prev_context,
-        static_routes=static_routes,
-        compact_context=compact_context,
-        audit_memory=audit_memory,
-        initial_result=llm_result,
-        initial_response=response,
-        retry_policy=retry_policy,
-    )
-    selected_response, local_recovery_applied = _coerce_incomplete_stage_response(
-        stage_num=stage.stage_num,
-        response=selected_response,
-        retry_policy=retry_policy,
-    )
-    if local_recovery_applied:
-        retry_meta["local_recovery_applied"] = True
-    selected_response = await _enrich_vulnerability_details(
-        llm_config=llm_config,
-        stage=stage,
-        project=project,
-        stage_prompt=stage_prompt,
-        response=selected_response,
-        code_text=base_code_text,
-        prev_context=effective_prev_context,
-        static_routes=static_routes,
-    )
-
-    merged_response = _merge_stage1_pass_response(current_response, selected_response)
-    merged_response["_second_pass_applied"] = True
-    meta["retry"] = retry_meta
-    meta["new_vulnerability_count"] = max(
-        0,
-        len(merged_response.get("vulnerabilities", []) if isinstance(merged_response.get("vulnerabilities"), list) else [])
-        - len(current_response.get("vulnerabilities", []) if isinstance(current_response.get("vulnerabilities"), list) else [])
-    )
-    return merged_response, meta
 
 
 def _select_stage5_followup_chunks(
@@ -2054,20 +2591,25 @@ async def _run_stage5_followup_scan(
 
 def _enforce_vulnerability_output_policy(stage, response: dict) -> tuple[dict, dict]:
     if not isinstance(response, dict):
-        return {"vulnerabilities": []}, {"invalid_poc_vulnerabilities": 0, "invalid_poc_titles": []}
+        return {"vulnerabilities": []}, {"invalid_poc_vulnerabilities": 0, "invalid_poc_titles": [], "merged_duplicate_vulnerabilities": 0}
 
     vulnerabilities = response.get("vulnerabilities", [])
     if not isinstance(vulnerabilities, list):
-        return response, {"invalid_poc_vulnerabilities": 0, "invalid_poc_titles": []}
+        return response, {"invalid_poc_vulnerabilities": 0, "invalid_poc_titles": [], "merged_duplicate_vulnerabilities": 0}
 
     annotated: list[dict] = []
-    invalid_items: list[dict] = []
     for vuln in vulnerabilities:
         if not isinstance(vuln, dict):
             continue
         vuln["severity"] = _normalize_severity(vuln.get("severity", "Medium"))
         validation = _validate_vulnerability_poc(stage.stage_num, vuln)
         vuln["_poc_validation"] = validation
+        annotated.append(vuln)
+
+    deduped = _merge_vulnerability_lists([], annotated)
+    invalid_items: list[dict] = []
+    for vuln in deduped:
+        validation = vuln.get("_poc_validation") if isinstance(vuln.get("_poc_validation"), dict) else {}
         if not validation.get("accepted"):
             invalid_items.append(
                 {
@@ -2075,15 +2617,14 @@ def _enforce_vulnerability_output_policy(stage, response: dict) -> tuple[dict, d
                     "reason": validation.get("reason", "POC 不符合规范"),
                 }
             )
-        annotated.append(vuln)
-
     normalized = dict(response)
-    normalized["vulnerabilities"] = annotated
+    normalized["vulnerabilities"] = deduped
     if invalid_items:
         normalized["_invalid_poc_vulnerabilities"] = invalid_items[:20]
     return normalized, {
         "invalid_poc_vulnerabilities": len(invalid_items),
         "invalid_poc_titles": [item["title"] for item in invalid_items[:10]],
+        "merged_duplicate_vulnerabilities": max(0, len(annotated) - len(deduped)),
     }
 
 
@@ -2109,6 +2650,58 @@ def _hydrate_vulnerability_endpoints(
         endpoint = _resolve_vulnerability_endpoint(normalized, route_candidates)
         if endpoint:
             normalized["endpoint"] = endpoint
+        hydrated_vulns.append(normalized)
+
+    normalized_response = dict(response)
+    normalized_response["vulnerabilities"] = hydrated_vulns
+    return normalized_response
+
+
+def _backfill_vulnerability_poc_templates(
+    *,
+    stage_num: int,
+    response: dict,
+    static_routes: list[dict] | None = None,
+    audit_memory: dict | None = None,
+) -> dict:
+    if not isinstance(response, dict):
+        return {"vulnerabilities": []}
+
+    vulnerabilities = response.get("vulnerabilities", [])
+    if not isinstance(vulnerabilities, list) or not vulnerabilities:
+        return response
+
+    route_candidates = _collect_endpoint_route_candidates(response, static_routes, audit_memory)
+    hydrated_vulns = []
+    template_note = "系统已基于静态路由生成最小请求模板，仍需补全真实参数值、认证上下文和利用前提。"
+
+    for vuln in vulnerabilities:
+        if not isinstance(vuln, dict):
+            continue
+        normalized = dict(vuln)
+        requirement = _classify_poc_requirement(stage_num, normalized)
+        poc_raw = str(normalized.get("poc_raw", "") or "").strip()
+        parsed = _parse_raw_http_request(poc_raw)
+        needs_template = (
+            requirement == "raw_http"
+            and (
+                not poc_raw
+                or poc_raw.startswith("未提供可复现 POC")
+                or not parsed.get("valid")
+            )
+        )
+        if not needs_template:
+            hydrated_vulns.append(normalized)
+            continue
+
+        route_candidate = _find_route_candidate_for_vulnerability(normalized, route_candidates)
+        endpoint, template = _build_route_derived_raw_http_artifacts(normalized, route_candidate)
+        if template:
+            normalized["poc_raw"] = template
+            if endpoint:
+                normalized["endpoint"] = endpoint
+            normalized["_poc_template_generated"] = True
+            normalized["_poc_validation"] = {"accepted": False, "reason": template_note}
         hydrated_vulns.append(normalized)
 
     normalized_response = dict(response)
@@ -2152,9 +2745,139 @@ def _collect_endpoint_route_candidates(
                 "path": path,
                 "file_path": file_path,
                 "handler": handler,
+                "auth": str(route.get("auth", "Unknown") or "Unknown").strip() or "Unknown",
+                "params": route.get("params", [])[:12] if isinstance(route.get("params"), list) else [],
+                "notes": str(route.get("notes", "") or "").strip(),
             }
         )
     return candidates
+
+
+def _parse_endpoint_hint(endpoint_text: str) -> tuple[str, str]:
+    endpoint_text = str(endpoint_text or "").strip()
+    if not endpoint_text:
+        return "UNKNOWN", ""
+    match = re.match(r"^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|TRACE|CONNECT|ANY|UNKNOWN)\s+(\S+)$", endpoint_text, re.I)
+    if match:
+        return match.group(1).upper(), _normalize_http_path(match.group(2).strip())
+    return "UNKNOWN", _normalize_http_path(endpoint_text)
+
+
+def _find_route_candidate_for_vulnerability(vuln: dict, route_candidates: list[dict]) -> dict | None:
+    file_path = str(vuln.get("file_path", "") or "").strip().lower()
+    endpoint_method, endpoint_path = _parse_endpoint_hint(str(vuln.get("endpoint", "") or ""))
+    if endpoint_path:
+        matched = _select_best_route_candidate(
+            route_candidates,
+            file_path=file_path,
+            method=endpoint_method,
+            path=endpoint_path,
+        )
+        if matched:
+            return matched
+
+    packet = _parse_raw_http_request(str(vuln.get("poc_raw", "") or "").strip())
+    if packet.get("valid"):
+        matched = _select_best_route_candidate(
+            route_candidates,
+            file_path=file_path,
+            method=str(packet.get("method", "") or "").upper(),
+            path=str(packet.get("target", "") or "").strip(),
+        )
+        if matched:
+            return matched
+
+    return _select_best_route_candidate(
+        route_candidates,
+        file_path=file_path,
+        method="UNKNOWN",
+        path="",
+    )
+
+
+def _materialize_route_path(path: str) -> str:
+    text = _normalize_http_path(path)
+    if not text:
+        return ""
+    text = re.sub(r"\{[^}/]+\}", "1", text)
+    text = re.sub(r"<[^>/]+>", "1", text)
+    text = re.sub(r":[A-Za-z_][A-Za-z0-9_]*", "1", text)
+    return text
+
+
+def _sample_poc_value(name: str) -> str | int | bool:
+    lowered = str(name or "").strip().lower()
+    if any(token in lowered for token in ["id", "_id", "ids", "page", "limit", "offset", "count", "size"]):
+        return 1
+    if any(token in lowered for token in ["enabled", "active", "admin", "debug", "flag"]):
+        return True
+    if "email" in lowered:
+        return "audit@example.com"
+    if any(token in lowered for token in ["token", "jwt", "code", "key", "secret"]):
+        return "test-token"
+    return "test"
+
+
+def _split_route_params(params: list) -> tuple[list[str], list[str], list[str]]:
+    query_params: list[str] = []
+    body_params: list[str] = []
+    path_params: list[str] = []
+
+    for item in params if isinstance(params, list) else []:
+        name = str(item or "").strip()
+        if not name:
+            continue
+        lowered = name.lower()
+        if lowered.startswith("query."):
+            query_params.append(name.split(".", 1)[1])
+        elif lowered.startswith("body.") or lowered.startswith("json.") or lowered.startswith("form."):
+            body_params.append(name.split(".", 1)[1])
+        elif lowered.startswith("path.") or lowered.startswith("param.") or lowered.startswith("params."):
+            path_params.append(name.split(".", 1)[1])
+        else:
+            body_params.append(name)
+
+    return _merge_unique_items([], query_params), _merge_unique_items([], body_params), _merge_unique_items([], path_params)
+
+
+def _build_route_auth_headers(auth: str) -> list[str]:
+    auth_value = str(auth or "Unknown").strip()
+    if auth_value == "JWT":
+        return ["Authorization: Bearer <JWT_TOKEN>"]
+    if auth_value == "OAuth":
+        return ["Authorization: Bearer <OAUTH_TOKEN>"]
+    if auth_value == "Session":
+        return ["Cookie: session=<SESSION_ID>"]
+    return []
+
+
+def _build_route_derived_raw_http_artifacts(vuln: dict, route_candidate: dict | None) -> tuple[str, str]:
+    endpoint_method, endpoint_path = _parse_endpoint_hint(str(vuln.get("endpoint", "") or ""))
+    route_method = str((route_candidate or {}).get("method", "") or endpoint_method or "GET").upper()
+    route_path = str((route_candidate or {}).get("path", "") or endpoint_path or "").strip()
+    if not route_path:
+        return "", ""
+
+    params = (route_candidate or {}).get("params", []) if isinstance((route_candidate or {}).get("params"), list) else []
+    auth = str((route_candidate or {}).get("auth", "Unknown") or "Unknown").strip()
+    concrete_path = _materialize_route_path(route_path)
+    query_params, body_params, _ = _split_route_params(params)
+    query_string = "&".join(f"{name}={_sample_poc_value(name)}" for name in query_params[:8])
+    request_target = concrete_path if not query_string else f"{concrete_path}?{query_string}"
+
+    headers = ["Host: example.com"]
+    headers.extend(_build_route_auth_headers(auth))
+    body = ""
+
+    if route_method in {"POST", "PUT", "PATCH", "DELETE"}:
+        payload = {name: _sample_poc_value(name) for name in body_params[:8]}
+        headers.append("Content-Type: application/json")
+        body = json.dumps(payload or {"test": "value"}, ensure_ascii=False, indent=2)
+
+    request_lines = [f"{route_method or 'GET'} {request_target} HTTP/1.1", *headers, ""]
+    if body:
+        request_lines.append(body)
+    return f"{route_method} {concrete_path}".strip(), "\n".join(request_lines).strip()
 
 
 def _resolve_vulnerability_endpoint(vuln: dict, route_candidates: list[dict]) -> str:
@@ -2266,46 +2989,210 @@ def _select_best_route_candidate(
 
 
 def _validate_vulnerability_poc(stage_num: int, vuln: dict) -> dict:
-    if not _requires_strict_http_poc(stage_num, vuln):
-        return {"accepted": True, "reason": "hardcoded_exempt"}
-
+    requirement = _classify_poc_requirement(stage_num, vuln)
     endpoint = str(vuln.get("endpoint", "") or "").strip()
     poc_raw = str(vuln.get("poc_raw", "") or "").strip()
-    if not endpoint:
-        return {"accepted": False, "reason": "缺少完整路由 endpoint"}
+    if requirement == "none":
+        return {"accepted": True, "reason": "code_evidence_only"}
+    if vuln.get("_poc_template_generated"):
+        return {"accepted": False, "reason": "已根据静态路由生成请求模板，仍需补全真实参数和利用前提"}
+
     if not poc_raw:
         return {"accepted": False, "reason": "缺少 poc_raw"}
 
-    packet = _parse_raw_http_request(poc_raw)
-    if not packet["valid"]:
-        return {"accepted": False, "reason": packet["reason"]}
-    if not _endpoint_matches_packet(endpoint, packet):
-        return {"accepted": False, "reason": "endpoint 与 poc_raw 中的请求行不一致"}
-    return {"accepted": True, "reason": "valid_raw_http"}
+    if requirement == "raw_http":
+        if not endpoint:
+            return {"accepted": False, "reason": "缺少完整路由 endpoint"}
+        packet = _parse_raw_http_request(poc_raw)
+        if not packet["valid"]:
+            return {"accepted": False, "reason": packet["reason"]}
+        if not _endpoint_matches_packet(endpoint, packet):
+            return {"accepted": False, "reason": "endpoint 与 poc_raw 中的请求行不一致"}
+        return {"accepted": True, "reason": "valid_raw_http"}
+
+    if requirement == "stepwise":
+        if not endpoint:
+            return {"accepted": False, "reason": "缺少完整路由 endpoint"}
+        packet = _parse_raw_http_request(poc_raw)
+        if packet["valid"]:
+            if not _endpoint_matches_packet(endpoint, packet):
+                return {"accepted": False, "reason": "endpoint 与 poc_raw 中的请求行不一致"}
+            return {"accepted": True, "reason": "valid_raw_http"}
+        if _looks_like_stepwise_poc(poc_raw):
+            return {"accepted": True, "reason": "valid_stepwise_poc"}
+        return {"accepted": False, "reason": "缺少可执行的步骤化 PoC 或合法 raw HTTP 请求包"}
+
+    if requirement == "cli":
+        packet = _parse_raw_http_request(poc_raw)
+        if packet["valid"]:
+            if endpoint and not _endpoint_matches_packet(endpoint, packet):
+                return {"accepted": False, "reason": "endpoint 与 poc_raw 中的请求行不一致"}
+            return {"accepted": True, "reason": "valid_raw_http"}
+        if _looks_like_cli_or_config_poc(poc_raw):
+            return {"accepted": True, "reason": "valid_cli_or_config_poc"}
+        return {"accepted": False, "reason": "缺少可执行的命令行验证、配置 diff 或合法 raw HTTP 请求包"}
+
+    return {"accepted": True, "reason": "requirement_unclassified"}
 
 
 def _requires_strict_http_poc(stage_num: int, vuln: dict) -> bool:
-    if stage_num in {1, 7}:
-        return False
+    return _classify_poc_requirement(stage_num, vuln) == "raw_http"
+
+
+def _classify_poc_requirement(stage_num: int, vuln: dict) -> str:
+    # 先按漏洞语义判断 PoC 形态，阶段号只作为兜底，避免业务逻辑类被误判成必须 raw HTTP。
     haystack = " ".join(
         [
             str(vuln.get("title", "") or ""),
             str(vuln.get("vuln_type", "") or ""),
             str(vuln.get("description", "") or ""),
+            str(vuln.get("fix_suggestion", "") or ""),
+            str(vuln.get("endpoint", "") or ""),
             str(vuln.get("file_path", "") or ""),
+            str(vuln.get("poc_raw", "") or ""),
         ]
     ).lower()
-    hardcoded_markers = [
+
+    none_markers = [
         "硬编码",
         "hardcoded",
         "hard code",
-        "secret",
-        "密钥泄露",
-        "敏感信息泄露",
-        "配置泄露",
-        ".env",
+        "hard-coded",
+        "api key",
+        "access key",
+        "private key",
+        "secret key",
+        "hardcoded secret",
+        "ak/sk",
+        "弱密码哈希",
+        "无盐",
+        "无盐 md5",
+        "无盐md5",
+        "weak md5",
+        "weak sha1",
+        "密码哈希",
+        "哈希算法",
+        "无需 poc",
+        "无需poc",
+        "code evidence only",
     ]
-    return not any(marker in haystack for marker in hardcoded_markers)
+    cli_markers = [
+        "配置",
+        "config",
+        "信息泄露",
+        "debug",
+        "日志泄露",
+        "目录索引",
+        "directory listing",
+        ".env",
+        "env 泄露",
+        "stack trace",
+        "依赖",
+        "dependency",
+        "版本泄露",
+    ]
+    stepwise_markers = [
+        "业务逻辑",
+        "logic bypass",
+        "竞态",
+        "race",
+        "会话固定",
+        "session fixation",
+        "暴力破解",
+        "brute force",
+        "越权",
+        "idor",
+        "权限绕过",
+        "水平越权",
+        "垂直越权",
+        "支付绕过",
+        "下载绕过",
+        "流程绕过",
+        "状态机",
+        "多步",
+    ]
+    raw_http_markers = [
+        "sqli",
+        "nosqli",
+        "注入",
+        "rce",
+        "命令执行",
+        "command execution",
+        "ssrf",
+        "xss",
+        "文件上传",
+        "文件下载",
+        "路径穿越",
+        "目录遍历",
+        "任意文件",
+        "反序列化",
+        "模板注入",
+        "表达式注入",
+    ]
+
+    if any(marker in haystack for marker in none_markers):
+        return "none"
+    if any(marker in haystack for marker in cli_markers):
+        return "cli"
+    if any(marker in haystack for marker in stepwise_markers):
+        return "stepwise"
+    if any(marker in haystack for marker in raw_http_markers):
+        return "raw_http"
+
+    if stage_num in {2, 3, 4, 8}:
+        return "raw_http"
+    if stage_num in {5, 6, 9}:
+        return "stepwise"
+    if stage_num == 7:
+        return "cli"
+    return "none" if stage_num == 1 else "raw_http"
+
+
+def _looks_like_stepwise_poc(poc_raw: str) -> bool:
+    text = str(poc_raw or "").strip()
+    if not text:
+        return False
+    lines = [line.strip() for line in text.replace("\r\n", "\n").split("\n") if line.strip()]
+    if len(lines) < 2:
+        return False
+    step_pattern = re.compile(r"^(\d+[.)、]|步骤\s*[一二三四五六七八九十0-9]+[：:]?|step\s*\d+[：:]?)", re.I)
+    if any(step_pattern.match(line) for line in lines):
+        return True
+    lowered = text.lower()
+    step_markers = ["步骤", "复现", "攻击流程", "利用流程", "先 ", "然后", "再 ", "最后", "登录后"]
+    return sum(1 for marker in step_markers if marker in lowered) >= 2
+
+
+def _looks_like_cli_or_config_poc(poc_raw: str) -> bool:
+    text = str(poc_raw or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    cli_markers = [
+        "curl ",
+        "wget ",
+        "httpie ",
+        "grep ",
+        "findstr ",
+        "cat ",
+        "type ",
+        "php ",
+        "python ",
+        "node ",
+        "diff ",
+        "git diff",
+        "printenv",
+        "set ",
+        "export ",
+        ".env",
+        "配置",
+        "环境变量",
+        "日志",
+        "堆栈",
+    ]
+    if any(marker in lowered for marker in cli_markers):
+        return True
+    return any(token in text for token in ["=>", "BEGIN", "END", "---", "+++", "@@"])
 
 
 def _parse_raw_http_request(poc_raw: str) -> dict:
@@ -4048,15 +4935,20 @@ def _format_chunks_for_prompt(chunks: list[dict], stage_num: int, max_len: int |
 
 
 def _format_stage1_chunks_for_prompt(chunk_batch: list[dict], compressed_summary: dict, pass_index: int) -> tuple[str, dict]:
+    batch_max_len = max(
+        STAGE1_PASS1_CODE_MAX_LEN if pass_index <= 1 else STAGE1_LATER_PASS_CODE_MAX_LEN,
+        _estimate_chunks_prompt_len(chunk_batch) + 2048,
+    )
+    # 已经分配到本轮的 chunk 不应再被提示词格式化阶段二次截断。
     if pass_index <= 1:
-        return _format_chunks_for_prompt(chunk_batch, 1, max_len=STAGE1_PASS1_CODE_MAX_LEN), {
+        return _format_chunks_for_prompt(chunk_batch, 1, max_len=batch_max_len), {
             "compacted_chunk_count": 0,
             "compacted_paths": [],
         }
 
     parts = []
     total_len = 0
-    max_len = STAGE1_LATER_PASS_CODE_MAX_LEN
+    max_len = batch_max_len
     coverage = compressed_summary.get("coverage", {}) if isinstance(compressed_summary, dict) else {}
     covered_paths = set(coverage.get("covered_paths", []) if isinstance(coverage, dict) else [])
     seen_paths_in_pass: set[str] = set()
@@ -4360,6 +5252,49 @@ def _prioritize_stage1_chunks(chunks: list[dict]) -> list[dict]:
     return sorted(chunks, key=score, reverse=True)
 
 
+def _is_stage1_low_value_chunk(chunk: dict, must_keep_paths: set[str] | None = None) -> bool:
+    file_path = str(chunk.get("file_path", "") or "").strip().lower()
+    if not file_path:
+        return True
+
+    normalized_file_path = re.sub(r"#l\d+(?:-\d+)?$", "", file_path)
+    must_keep_paths = must_keep_paths or set()
+    if normalized_file_path in must_keep_paths:
+        return False
+
+    basename = normalized_file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    content = str(chunk.get("content", "")[:2000] or "").lower()
+
+    low_value_exts = (
+        ".md", ".txt", ".css", ".scss", ".sass", ".less", ".map",
+        ".svg", ".png", ".jpg", ".jpeg", ".gif", ".woff", ".woff2", ".ttf",
+    )
+    if basename.endswith(low_value_exts):
+        return True
+
+    low_value_names = {"readme.md", "license", "license.md", "changelog", "changelog.md", "changes.md"}
+    if basename in low_value_names:
+        return True
+
+    low_value_path_markers = [
+        "/ckeditor/", "/codemirror/", "/tinymce/", "/ueditor/",
+        "/styles/", "/style/", "/css/", "/fonts/", "/images/", "/img/",
+        "/static/", "/assets/", "/public/", "/docs/", "/doc/", "/manual/",
+        "/vendor/", "/dist/", "/build/",
+    ]
+    if any(marker in normalized_file_path for marker in low_value_path_markers):
+        return True
+
+    if basename.endswith(".min.js") or basename.endswith(".bundle.js"):
+        return True
+
+    # 阶段一只做入口与架构扫描，纯静态资源或第三方说明文档会稀释扫描预算。
+    if "copyright" in content and "license" in content and len(content) < 1200:
+        return True
+
+    return False
+
+
 def _is_stage1_entry_file(chunk: dict) -> bool:
     file_path = str(chunk.get("file_path", "")).lower()
     content = str(chunk.get("content", "")[:5000]).lower()
@@ -4402,6 +5337,14 @@ def _select_stage1_entry_chunks(chunks: list[dict]) -> list[dict]:
     return selected
 
 
+def _estimate_chunk_prompt_len(chunk: dict) -> int:
+    return len(str(chunk.get("content", "") or "")) + len(str(chunk.get("file_path", "") or "")) + 32
+
+
+def _estimate_chunks_prompt_len(chunks: list[dict]) -> int:
+    return sum(_estimate_chunk_prompt_len(chunk) for chunk in chunks)
+
+
 def _select_stage1_skeleton_chunks(chunks: list[dict], pre_discovery: dict | None = None) -> list[dict]:
     """Select Stage 1 skeleton chunks, enriched with pre-discovery signals."""
     rule_hit_scores: dict[str, int] = {}
@@ -4428,7 +5371,9 @@ def _select_stage1_skeleton_chunks(chunks: list[dict], pre_discovery: dict | Non
         must_cover_set = {fp.lower() for fp in (sf.get("must_cover_files") or [])}
         file_roles = {fp.lower(): role for fp, role in (ig.get("file_roles") or {}).items()}
 
-    prioritized = _prioritize_stage1_chunks(chunks)
+    filtered_chunks = [chunk for chunk in chunks if not _is_stage1_low_value_chunk(chunk, must_keep_paths=must_cover_set)]
+    candidate_chunks = filtered_chunks or chunks
+    prioritized = _prioritize_stage1_chunks(candidate_chunks)
     entry_first = _select_stage1_entry_chunks(prioritized)
 
     def _pre_discovery_boost(chunk: dict) -> int:
@@ -4449,28 +5394,31 @@ def _select_stage1_skeleton_chunks(chunks: list[dict], pre_discovery: dict | Non
     merged = entry_first + non_entry
 
     selected: list[dict] = []
-    total_len = 0
     seen_paths = set()
+    # 阶段一要尽量覆盖完整审计集，不能再被固定文件数或固定总字符数硬截断。
     for chunk in merged:
-        estimated_len = len(chunk.get("content", "")) + len(chunk.get("file_path", "")) + 32
         normalized_path = str(chunk.get("file_path", "")).lower()
         if normalized_path in seen_paths:
             continue
-        if selected and total_len + estimated_len > STAGE1_TOTAL_TARGET_LEN:
-            if len(selected) >= 120:
-                break
-            continue
         selected.append(chunk)
         seen_paths.add(normalized_path)
-        total_len += estimated_len
-        if len(selected) >= 260:
-            break
-    return selected or prioritized[:180]
+    return selected or prioritized
 
 
-def _split_chunks_for_stage1(chunks: list[dict], max_len: int = STAGE1_BATCH_TARGET_LEN, max_batches: int = STAGE1_MAX_PASSES, pre_discovery: dict | None = None) -> list[list[dict]]:
+def _split_chunks_for_stage1(
+    chunks: list[dict],
+    max_len: int = STAGE1_BATCH_TARGET_LEN,
+    max_batches: int | None = None,
+    pre_discovery: dict | None = None,
+) -> list[list[dict]]:
     if not chunks:
         return [[]]
+
+    if max_batches is None or max_batches <= 0:
+        # 阶段一批次数按审计集体量动态扩展，避免大项目被固定 5 轮截断。
+        estimated_total_len = _estimate_chunks_prompt_len(chunks)
+        max_batches = max(STAGE1_MAX_PASSES, math.ceil(estimated_total_len / max(max_len, 1)))
+    max_batches = max(1, max_batches)
 
     # Build import relationships for grouping related files together
     imports = {}
@@ -4512,17 +5460,45 @@ def _split_chunks_for_stage1(chunks: list[dict], max_len: int = STAGE1_BATCH_TAR
     batch_lens = [0 for _ in range(max_batches)]
 
     for group_indices in sorted_groups:
-        group_len = sum(len(chunks[i].get("content", "")) + len(chunks[i].get("file_path", "")) + 32 for i in group_indices)
-        # Find the lightest batch that can fit this group
+        # 保持导入关系相近的代码尽量落在同一轮，同时优先填充最轻的批次。
         best_idx = min(range(max_batches), key=lambda bi: batch_lens[bi])
         for idx in group_indices:
             chunk = chunks[idx]
-            estimated_len = len(chunk.get("content", "")) + len(chunk.get("file_path", "")) + 32
+            estimated_len = _estimate_chunk_prompt_len(chunk)
             batches[best_idx].append(chunk)
             batch_lens[best_idx] += estimated_len
 
     batches = [batch for batch in batches if batch]
+    batches = _merge_stage1_batches_for_soft_cap(batches, soft_cap=STAGE1_SOFT_MAX_BATCHES)
     return batches or [chunks[:1]]
+
+
+def _merge_stage1_batches_for_soft_cap(batches: list[list[dict]], soft_cap: int) -> list[list[dict]]:
+    if not isinstance(batches, list):
+        return batches
+
+    soft_cap = max(1, int(soft_cap or 1))
+    merged_batches = [list(batch) for batch in batches if batch]
+    if len(merged_batches) <= soft_cap:
+        return merged_batches
+
+    batch_lens = [
+        sum(_estimate_chunk_prompt_len(chunk) for chunk in batch)
+        for batch in merged_batches
+    ]
+
+    while len(merged_batches) > soft_cap:
+        smallest_idx = min(range(len(merged_batches)), key=lambda idx: (batch_lens[idx], len(merged_batches[idx])))
+        target_candidates = [idx for idx in range(len(merged_batches)) if idx != smallest_idx]
+        if not target_candidates:
+            break
+        target_idx = min(target_candidates, key=lambda idx: (batch_lens[idx], len(merged_batches[idx])))
+        merged_batches[target_idx].extend(merged_batches[smallest_idx])
+        batch_lens[target_idx] += batch_lens[smallest_idx]
+        del merged_batches[smallest_idx]
+        del batch_lens[smallest_idx]
+
+    return merged_batches
 
 
 def _frontload_route_related_stage1_chunks(chunks: list[dict], static_routes: list[dict]) -> list[dict]:
@@ -4591,10 +5567,10 @@ def _build_stage1_pass_context(prev_context: str, compressed_summary: dict, pass
     if prev_context:
         sections.append(_truncate_text(prev_context, 5000 if pass_index > 1 else 8000))
 
-    sections.append(f"【阶段一多轮扫描进度】当前为第 {pass_index}/{total_passes} 轮。")
-    sections.append("【当前压缩摘要】")
+    sections.append(f"[Stage 1 Multi-pass Progress] Current pass {pass_index}/{total_passes}.")
+    sections.append("[Current Compressed Summary]")
     sections.append(_truncate_text(json.dumps(compressed_summary, ensure_ascii=False), 5000 if pass_index > 1 else 8000))
-    sections.append("要求：基于当前压缩摘要继续补充新的架构/路由/数据流发现；不要重复输出已确认的大量旧信息。")
+    sections.append("Requirement: continue filling new architecture, route, and data-flow findings based on the compressed summary above. Do not repeat large amounts of already confirmed information.")
     return "\n".join(sections)
 
 
@@ -4613,6 +5589,11 @@ def _coerce_stage_summary(value) -> dict:
             "compacted_chunk_count": 0,
             "signal_window_chunk_count": 0,
             "compacted_paths": [],
+            "audit_scope_label": "审计集覆盖率",
+            "audit_scope_type": "selected_high_value_chunks",
+            "audit_scope_note": "仅统计纳入阶段一审计集的高价值代码块，不代表全仓源码 100% 覆盖。",
+            "audit_scope_file_count": 0,
+            "audit_scope_chunk_count": 0,
         },
     }
 
@@ -4689,12 +5670,16 @@ def _assess_stage1_pass_progress(
 ) -> dict:
     coverage = compressed_summary.get("coverage", {}) if isinstance(compressed_summary.get("coverage"), dict) else {}
     covered_paths = set(coverage.get("covered_paths", []) or [])
+    covered_chunk_keys = set(coverage.get("covered_chunks", []) or [])
     batch_paths = [chunk.get("file_path", "") for chunk in chunk_batch if chunk.get("file_path")]
+    batch_chunk_keys = [
+        str(chunk.get("file_path", "") or chunk.get("base_file_path", "") or "").strip()
+        for chunk in chunk_batch
+        if str(chunk.get("file_path", "") or chunk.get("base_file_path", "") or "").strip()
+    ]
     new_paths = [path for path in _merge_unique_items([], batch_paths) if path not in covered_paths]
-    projected_scanned_chunk_count = min(
-        total_chunk_count,
-        int(coverage.get("scanned_chunk_count", 0)) + len(chunk_batch),
-    )
+    # 阶段一覆盖率必须按“唯一 chunk”统计，不能把重复回看批次累加后截顶成 100%。
+    projected_scanned_chunk_count = min(total_chunk_count, len(covered_chunk_keys.union(batch_chunk_keys)))
     coverage_ratio = (projected_scanned_chunk_count / total_chunk_count) if total_chunk_count > 0 else 1.0
 
     architecture_info = summary_delta.get("architecture_info", {})
@@ -4756,6 +5741,9 @@ def _should_stop_stage1_early(pass_index: int, total_passes: int, pass_progress:
     covered_route_count = int(pass_progress.get("covered_route_count", 0) or 0)
     total_route_count = int(pass_progress.get("total_route_count", 0) or 0)
 
+    # 本轮优先保证阶段一审计集完整送入模型，未接近全量覆盖时不允许提前停止。
+    if coverage_ratio < 0.995:
+        return ""
     if total_route_file_count > 0 and covered_route_file_count < total_route_file_count:
         return ""
     if total_route_count > 0 and covered_route_count < total_route_count:
@@ -4859,6 +5847,7 @@ def _merge_compressed_summary(
     delta: dict,
     chunk_batch: list[dict],
     total_chunk_count: int,
+    total_selected_file_count: int | None = None,
     compression_stats: dict | None = None,
 ) -> dict:
     merged = _coerce_stage_summary(base)
@@ -4883,13 +5872,24 @@ def _merge_compressed_summary(
         coverage.get("covered_paths"),
         [chunk.get("file_path", "") for chunk in chunk_batch if chunk.get("file_path")],
     )
-    coverage["passes_completed"] = int(coverage.get("passes_completed", 0)) + 1
-    coverage["scanned_chunk_count"] = min(
-        total_chunk_count,
-        int(coverage.get("scanned_chunk_count", 0)) + len(chunk_batch),
+    covered_chunk_keys = _merge_unique_items(
+        coverage.get("covered_chunks"),
+        [
+            str(chunk.get("file_path", "") or chunk.get("base_file_path", "") or "").strip()
+            for chunk in chunk_batch
+            if str(chunk.get("file_path", "") or chunk.get("base_file_path", "") or "").strip()
+        ],
     )
+    coverage["passes_completed"] = int(coverage.get("passes_completed", 0)) + 1
+    coverage["scanned_chunk_count"] = min(total_chunk_count, len(covered_chunk_keys))
     coverage["total_chunk_count"] = total_chunk_count
     coverage["covered_paths"] = covered_paths[:500]
+    coverage["covered_chunks"] = covered_chunk_keys[:2000]
+    coverage["audit_scope_label"] = "审计集覆盖率"
+    coverage["audit_scope_type"] = "selected_high_value_chunks"
+    coverage["audit_scope_note"] = "仅统计纳入阶段一审计集的高价值代码块，不代表全仓源码 100% 覆盖。"
+    coverage["audit_scope_file_count"] = max(0, int(total_selected_file_count or len(covered_paths)))
+    coverage["audit_scope_chunk_count"] = total_chunk_count
     compression_stats = compression_stats or {}
     coverage["compacted_chunk_count"] = max(
         0,
@@ -4930,6 +5930,7 @@ def _persist_stage_pass_artifact(
         "stage_id": stage_id,
         "pass_count": len(pass_outputs),
         "early_stop": early_stop or {"triggered": False, "reason": "", "after_pass": 0},
+        "pass_summary": _summarize_stage1_pass_outputs(pass_outputs),
         "passes": pass_outputs,
         "compressed_summary": compressed_summary,
         "route_gap_summary": route_gap_summary,
@@ -4941,6 +5942,42 @@ def _persist_stage_pass_artifact(
     }
     with open(artifact_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _summarize_stage1_pass_outputs(pass_outputs: list[dict]) -> dict:
+    if not isinstance(pass_outputs, list) or not pass_outputs:
+        return {
+            "executed_pass_count": 0,
+            "total_prompt_length": 0,
+            "total_code_length": 0,
+            "max_coverage_ratio": 0.0,
+            "avg_signal_gain": 0.0,
+            "peak_signal_gain": 0,
+            "new_path_total": 0,
+            "compacted_chunk_total": 0,
+        }
+
+    coverage_values = [
+        float((item.get("progress") or {}).get("coverage_ratio", 0.0) or 0.0)
+        for item in pass_outputs
+        if isinstance(item, dict)
+    ]
+    signal_values = [
+        int((item.get("progress") or {}).get("signal_gain", 0) or 0)
+        for item in pass_outputs
+        if isinstance(item, dict)
+    ]
+    return {
+        "executed_pass_count": len(pass_outputs),
+        "last_pass_index": int(pass_outputs[-1].get("pass_index", len(pass_outputs)) or len(pass_outputs)),
+        "total_prompt_length": sum(int(item.get("user_prompt_length", 0) or 0) for item in pass_outputs if isinstance(item, dict)),
+        "total_code_length": sum(int(item.get("code_text_length", 0) or 0) for item in pass_outputs if isinstance(item, dict)),
+        "max_coverage_ratio": round(max(coverage_values) if coverage_values else 0.0, 4),
+        "avg_signal_gain": round((sum(signal_values) / len(signal_values)) if signal_values else 0.0, 2),
+        "peak_signal_gain": max(signal_values) if signal_values else 0,
+        "new_path_total": sum(int((item.get("progress") or {}).get("new_path_count", 0) or 0) for item in pass_outputs if isinstance(item, dict)),
+        "compacted_chunk_total": sum(int((item.get("microcompact") or {}).get("compacted_chunk_count", 0) or 0) for item in pass_outputs if isinstance(item, dict)),
+    }
 
 
 def _persist_single_stage_artifact(
@@ -5047,8 +6084,8 @@ def _summarize_architecture_info(architecture_info: dict | None) -> dict:
     return summary
 
 
-def _run_stage1_gap_analysis(merged_response: dict, static_routes: list[dict], pre_discovery: dict | None) -> dict:
-    """Post-scan gap analysis: check route coverage, must-cover files, architecture completeness."""
+def _run_stage1_gap_analysis(merged_response: dict, static_routes: list[dict], pre_discovery: dict | None, compressed_summary: dict | None = None) -> dict:
+    """Post-scan gap analysis for route coverage, must-cover files, and architecture completeness."""
     gaps = {"missing_routes": [], "missing_must_cover": [], "missing_fields": [], "overall_health": "ok"}
 
     if not isinstance(merged_response, dict):
@@ -5058,7 +6095,6 @@ def _run_stage1_gap_analysis(merged_response: dict, static_routes: list[dict], p
     if not isinstance(arch, dict):
         return gaps
 
-    # 1. Route gap: static routes not found by LLM
     llm_route_paths = set()
     for route in (arch.get("routes") or []):
         if isinstance(route, dict):
@@ -5072,18 +6108,19 @@ def _run_stage1_gap_analysis(merged_response: dict, static_routes: list[dict], p
         if key not in llm_route_paths and key[1]:
             gaps["missing_routes"].append({"method": key[0], "path": key[1], "file_path": route.get("file_path", "")})
 
-    # 2. Must-cover files not in coverage
     if pre_discovery:
         sf = pre_discovery.get("security_files") or {}
+        coverage = compressed_summary.get("coverage", {}) if isinstance(compressed_summary, dict) and isinstance(compressed_summary.get("coverage"), dict) else {}
+        covered_paths = {str(path).strip().lower() for path in (coverage.get("covered_paths") or []) if str(path).strip()}
         for fp in (sf.get("must_cover_files") or [])[:60]:
-            gaps["missing_must_cover"].append(fp)
+            normalized_fp = str(fp).strip()
+            if normalized_fp and normalized_fp.lower() not in covered_paths:
+                gaps["missing_must_cover"].append(normalized_fp)
 
-    # 3. Architecture completeness
     for field in ["tech_stack", "framework", "database", "auth_mechanism"]:
         if not str(arch.get(field, "")).strip():
             gaps["missing_fields"].append(field)
 
-    # 4. Overall health
     total_static = len(static_routes)
     missing_count = len(gaps["missing_routes"])
     if total_static > 0 and missing_count / total_static > 0.3:
@@ -5094,48 +6131,6 @@ def _run_stage1_gap_analysis(merged_response: dict, static_routes: list[dict], p
         gaps["overall_health"] = "poor_file_coverage"
 
     return gaps
-
-
-
-    if not isinstance(architecture_info, dict):
-        return {}
-
-    compact = {}
-    for key in ["tech_stack", "framework", "database", "auth_mechanism"]:
-        value = architecture_info.get(key)
-        if value:
-            compact[key] = str(value)[:200]
-
-    routes = architecture_info.get("routes")
-    if isinstance(routes, list) and routes:
-        normalized_routes = []
-        for route in routes[:24]:
-            if not isinstance(route, dict):
-                continue
-            path = str(route.get("path", "")).strip()
-            if not path:
-                continue
-            normalized_routes.append(
-                {
-                    "method": str(route.get("method", "UNKNOWN")).upper(),
-                    "path": path,
-                    "handler": str(route.get("handler", "Unknown"))[:160],
-                    "file_path": str(route.get("file_path", ""))[:260],
-                    "auth": str(route.get("auth", "Unknown"))[:40],
-                    "params": route.get("params", [])[:8] if isinstance(route.get("params"), list) else [],
-                    "notes": str(route.get("notes", ""))[:240],
-                }
-            )
-        if normalized_routes:
-            compact["routes"] = normalized_routes
-        compact["route_count"] = len(routes)
-
-    for key, limit in [("entry_points", 12), ("output_points", 12), ("modules", 12), ("data_flows", 12)]:
-        value = architecture_info.get(key)
-        if isinstance(value, list) and value:
-            compact[key] = value[:limit]
-
-    return compact
 
 
 def _merge_stage1_pass_response(base: dict, response: dict | list) -> dict:
@@ -5210,19 +6205,20 @@ def _merge_unique_items(existing, incoming):
 
 
 def _merge_vulnerability_lists(existing, incoming) -> list[dict]:
-    merged = []
-    seen = set()
+    merged_by_key: dict[tuple, dict] = {}
+    ordered_keys: list[tuple] = []
 
     for vuln in list(existing or []) + list(incoming or []):
         if not isinstance(vuln, dict):
             continue
         key = _vuln_key(vuln)
-        if key in seen:
+        if key not in merged_by_key:
+            merged_by_key[key] = dict(vuln)
+            ordered_keys.append(key)
             continue
-        seen.add(key)
-        merged.append(vuln)
+        merged_by_key[key] = _merge_duplicate_vulnerability(merged_by_key[key], vuln)
 
-    return merged
+    return [merged_by_key[key] for key in ordered_keys]
 
 
 def _build_stage_user_prompt(stage, project, stage_prompt: str, code_text: str, prev_context: str, static_routes: list[dict], compact_context: dict | None = None, audit_memory: dict | None = None) -> str:
@@ -5449,7 +6445,7 @@ def _apply_exploit_stage_prompt_budget(
     budget_guidance = (
         f"{stage_label} 请优先压缩输出，先保证完整 JSON 闭合。"
         "architecture_info 仅保留最关键入口、框架和约束信息；"
-        "vulnerabilities 优先保留 title、severity、vuln_type、file_path、endpoint、description 和最小 poc_raw。"
+        "vulnerabilities 优先保留 title、severity、vuln_type、file_path、endpoint、description 和可复现 PoC，压缩背景说明，不要压缩请求行、Host、必要 Header、请求体或关键复现步骤。"
     )
     compact_context["extra_guidance"] = "\n".join(part for part in [extra_guidance, budget_guidance] if part)
 
@@ -5482,7 +6478,7 @@ def _apply_stage5_prompt_budget(
     budget_guidance = (
         "阶段五请压缩认证与会话背景描述，先保证完整 JSON。"
         "architecture_info 只保留认证机制、令牌/会话线索和关键入口；"
-        "vulnerabilities 优先保留 title、severity、vuln_type、file_path、endpoint、description 和最小 poc_raw。"
+        "vulnerabilities 优先保留 title、severity、vuln_type、file_path、endpoint、description 和可复现 PoC，压缩背景说明，不要压缩关键请求行或核心复现步骤。"
         "首轮不要展开登录、注册、找回密码、刷新令牌、验证码的完整链路。"
     )
     compact_context["extra_guidance"] = "\n".join(part for part in [extra_guidance, budget_guidance] if part)
@@ -5543,7 +6539,7 @@ def _apply_stage9_prompt_budget(
     budget_guidance = (
         "阶段九首轮只保留最强业务逻辑漏洞索引，不要铺陈业务背景。"
         "architecture_info 仅保留最关键入口、核心约束和受影响对象。"
-        "vulnerabilities 优先保留 title、severity、vuln_type、file_path、endpoint、简短 description、最小 poc_raw。"
+        "vulnerabilities 优先保留 title、severity、vuln_type、file_path、endpoint、简短 description 和可复现 PoC，压缩背景说明，不要压缩关键复现步骤。"
     )
     compact_context["extra_guidance"] = "\n".join(part for part in [extra_guidance, budget_guidance] if part)
 
@@ -5716,27 +6712,247 @@ def _route_priority_score(route: dict) -> int:
 
 
 def _vuln_key(vuln_data: dict) -> tuple:
-    return (
-        str(vuln_data.get("title", "")).strip().lower(),
-        str(vuln_data.get("vuln_type", "")).strip().lower(),
-        str(vuln_data.get("file_path", "")).strip().lower(),
+    return _root_cause_vuln_key(vuln_data)
+
+
+def _root_cause_vuln_key(vuln_data: dict) -> tuple:
+    family = _normalize_vuln_family(vuln_data)
+    file_anchor = _normalize_file_anchor(str(vuln_data.get("file_path", "") or ""))
+    line_anchor = _normalize_line_anchor(
         vuln_data.get("line_start"),
         vuln_data.get("line_end"),
-        str(vuln_data.get("endpoint", "")).strip().lower(),
+        str(vuln_data.get("code_snippet", "") or ""),
+    )
+    endpoint_anchor = _normalize_endpoint_anchor(str(vuln_data.get("endpoint", "") or ""))
+    if line_anchor:
+        location_anchor = line_anchor
+    elif endpoint_anchor:
+        location_anchor = endpoint_anchor
+    else:
+        location_anchor = _normalize_code_anchor(
+            str(vuln_data.get("code_snippet", "") or "") or str(vuln_data.get("description", "") or "")
+        )
+    return (
+        family,
+        file_anchor,
+        location_anchor or "global",
     )
 
 
 def _stable_vuln_dedupe_key(vuln_data: dict) -> str:
-    parts = [
-        str(vuln_data.get("vuln_type", "")).strip().lower(),
-        str(vuln_data.get("file_path", "")).strip().lower(),
-        str(vuln_data.get("endpoint", "")).strip().lower(),
-        str(vuln_data.get("title", "")).strip().lower(),
-        str(vuln_data.get("line_start", "") or ""),
-        str(vuln_data.get("line_end", "") or ""),
-    ]
+    parts = [str(part) for part in _root_cause_vuln_key(vuln_data)]
     normalized = "|".join(parts)
     return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()[:32]
+
+
+def _normalize_vuln_family(vuln_data: dict) -> str:
+    haystack = " ".join(
+        [
+            str(vuln_data.get("title", "") or ""),
+            str(vuln_data.get("vuln_type", "") or ""),
+            str(vuln_data.get("description", "") or ""),
+            str(vuln_data.get("code_snippet", "") or ""),
+        ]
+    ).lower()
+
+    if "注入" in haystack:
+        if "sql" in haystack or any(marker in haystack for marker in ["select ", "update ", "insert ", "delete from", "where "]):
+            return "sql_injection"
+        if any(marker in haystack for marker in ["mongo", "bson", "nosql"]):
+            return "nosql_injection"
+        if any(marker in haystack for marker in ["exec", "shell", "command", "system("]):
+            return "command_injection"
+
+    family_markers = [
+        ("sql_injection", ["sql 注入", "sql注入", "sqli", "sql injection"]),
+        ("nosql_injection", ["nosql", "mongo injection", "nosql injection"]),
+        ("command_execution", ["rce", "命令执行", "command execution", "remote code execution"]),
+        ("command_injection", ["命令注入", "command injection"]),
+        ("xss", ["xss", "跨站脚本"]),
+        ("ssrf", ["ssrf", "服务端请求伪造"]),
+        ("file_upload", ["文件上传", "upload"]),
+        ("file_download", ["文件下载", "download"]),
+        ("path_traversal", ["路径穿越", "目录遍历", "path traversal", "directory traversal"]),
+        ("arbitrary_file_access", ["任意文件", "file read", "file write"]),
+        ("deserialization", ["反序列化", "deserialize"]),
+        ("template_injection", ["模板注入", "ssti", "template injection"]),
+        ("session_fixation", ["会话固定", "session fixation"]),
+        ("brute_force", ["暴力破解", "brute force"]),
+        ("weak_password_hash", ["弱密码哈希", "无盐 md5", "无盐md5", "weak md5", "weak sha1", "密码哈希"]),
+        ("hardcoded_secret", ["硬编码", "hardcoded", "secret key", "api key", "access key", "private key"]),
+        ("config_leak", ["配置泄露", "信息泄露", ".env", "目录索引", "directory listing", "stack trace"]),
+        ("authorization_bypass", ["越权", "idor", "权限绕过", "水平越权", "垂直越权"]),
+        ("business_logic_bypass", ["业务逻辑", "支付绕过", "下载绕过", "流程绕过", "logic bypass"]),
+        ("race_condition", ["竞态", "race"]),
+    ]
+    for family, markers in family_markers:
+        if any(marker in haystack for marker in markers):
+            return family
+
+    base = _normalize_keyword_text(str(vuln_data.get("vuln_type", "") or "") or str(vuln_data.get("title", "") or ""))
+    return base[:80] or "generic_vulnerability"
+
+
+def _normalize_keyword_text(text: str) -> str:
+    normalized = str(text or "").strip().lower().replace("\\", "/")
+    normalized = re.sub(r"https?://\S+", " ", normalized)
+    normalized = re.sub(r"[^0-9a-z\u4e00-\u9fff/._-]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _normalize_file_anchor(file_path: str) -> str:
+    normalized = _normalize_keyword_text(file_path)
+    if not normalized:
+        return ""
+    segments = [segment for segment in normalized.split("/") if segment]
+    if len(segments) > 4:
+        segments = segments[-4:]
+    return "/".join(segments)
+
+
+def _normalize_line_anchor(line_start, line_end, code_snippet: str) -> str:
+    if line_start is not None:
+        try:
+            start = int(line_start)
+            end = int(line_end) if line_end is not None else start
+            return f"line:{start}-{end}"
+        except (TypeError, ValueError):
+            pass
+    code_anchor = _normalize_code_anchor(code_snippet)
+    return f"code:{code_anchor}" if code_anchor else ""
+
+
+def _normalize_code_anchor(text: str) -> str:
+    normalized = _normalize_keyword_text(text)
+    if not normalized:
+        return ""
+    normalized = re.sub(r"\b\d+\b", "{n}", normalized)
+    normalized = re.sub(r"\b[0-9a-f]{8,}\b", "{hex}", normalized)
+    normalized = normalized[:160]
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _normalize_endpoint_anchor(endpoint: str) -> str:
+    text = str(endpoint or "").strip()
+    if not text:
+        return ""
+    match = re.match(r"^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|TRACE|CONNECT|ANY|UNKNOWN)\s+(\S+)$", text, re.I)
+    if match:
+        method = match.group(1).upper()
+        path = match.group(2).strip()
+    else:
+        method = "UNKNOWN"
+        path = text
+    path = path.split("?", 1)[0].strip().lower().replace("\\", "/")
+    path = re.sub(r"/\d+(?=/|$)", "/{id}", path)
+    path = re.sub(r"/[0-9a-f-]{8,}(?=/|$)", "/{id}", path)
+    path = re.sub(r"/+", "/", path).strip()
+    return f"{method} {path}".strip()
+
+
+def _vulnerability_merge_score(vuln: dict) -> int:
+    if not isinstance(vuln, dict):
+        return 0
+    score = _severity_rank(vuln.get("severity")) * 100
+    score += CONFIDENCE_RANK.get(_normalize_confidence(vuln.get("confidence")), 2) * 20
+    if _normalize_verification_state(vuln.get("verification_state")) == "verified":
+        score += 30
+    if str(vuln.get("poc_validation_status", "") or "").strip().lower() == "valid":
+        score += 20
+    if str(vuln.get("code_snippet", "") or "").strip():
+        score += 12
+    if str(vuln.get("poc_raw", "") or "").strip():
+        score += 10
+    if str(vuln.get("endpoint", "") or "").strip():
+        score += 6
+    if str(vuln.get("description", "") or "").strip():
+        score += min(12, len(str(vuln.get("description", "") or "").strip()) // 80)
+    return score
+
+
+def _merge_duplicate_vulnerability(primary: dict, incoming: dict) -> dict:
+    primary_copy = dict(primary or {})
+    incoming_copy = dict(incoming or {})
+    preferred = primary_copy if _vulnerability_merge_score(primary_copy) >= _vulnerability_merge_score(incoming_copy) else incoming_copy
+    secondary = incoming_copy if preferred is primary_copy else primary_copy
+    merged = dict(preferred)
+
+    merged["severity"] = _normalize_severity(
+        preferred.get("severity")
+        if _severity_rank(preferred.get("severity")) >= _severity_rank(secondary.get("severity"))
+        else secondary.get("severity")
+    )
+    merged["confidence"] = (
+        preferred.get("confidence")
+        if CONFIDENCE_RANK.get(_normalize_confidence(preferred.get("confidence")), 2)
+        >= CONFIDENCE_RANK.get(_normalize_confidence(secondary.get("confidence")), 2)
+        else secondary.get("confidence")
+    )
+
+    verification_states = [
+        _normalize_verification_state(primary_copy.get("verification_state")),
+        _normalize_verification_state(incoming_copy.get("verification_state")),
+    ]
+    merged["verification_state"] = "verified" if "verified" in verification_states else "candidate"
+
+    confirmed_candidates = [
+        str(primary_copy.get("confirmed_status", "") or "").strip().lower(),
+        str(incoming_copy.get("confirmed_status", "") or "").strip().lower(),
+    ]
+    merged["confirmed_status"] = max(confirmed_candidates, key=lambda item: CONFIRMED_STATUS_RANK.get(item, 0)) or "pending"
+
+    if str(primary_copy.get("poc_validation_status", "") or "").strip().lower() == "valid" or str(incoming_copy.get("poc_validation_status", "") or "").strip().lower() == "valid":
+        merged["poc_validation_status"] = "valid"
+    elif str(preferred.get("poc_validation_status", "") or "").strip():
+        merged["poc_validation_status"] = preferred.get("poc_validation_status")
+    elif str(secondary.get("poc_validation_status", "") or "").strip():
+        merged["poc_validation_status"] = secondary.get("poc_validation_status")
+
+    for field in ["title", "vuln_type", "file_path", "code_snippet", "endpoint", "poc_raw", "description", "fix_suggestion", "poc_validation_note"]:
+        preferred_value = str(preferred.get(field, "") or "").strip()
+        secondary_value = str(secondary.get(field, "") or "").strip()
+        if preferred_value:
+            merged[field] = preferred_value
+        elif secondary_value:
+            merged[field] = secondary_value
+
+    line_start = preferred.get("line_start")
+    line_end = preferred.get("line_end")
+    if line_start is None and secondary.get("line_start") is not None:
+        line_start = secondary.get("line_start")
+    if line_end is None and secondary.get("line_end") is not None:
+        line_end = secondary.get("line_end")
+    merged["line_start"] = line_start
+    merged["line_end"] = line_end
+
+    # 同根因的等价入口压成简短备注，避免前端出现多张几乎相同的卡片。
+    endpoints = [value for value in _merge_unique_items([], [preferred.get("endpoint"), secondary.get("endpoint")]) if str(value or "").strip()]
+    if endpoints:
+        merged["endpoint"] = str(endpoints[0]).strip()
+        if len(endpoints) > 1:
+            note = f"等价入口：{'；'.join(str(item).strip() for item in endpoints[1:4])}"
+            description = str(merged.get("description", "") or "").strip()
+            if note not in description:
+                merged["description"] = f"{description}\n\n{note}".strip() if description else note
+
+    if "_poc_validation" in preferred or "_poc_validation" in secondary:
+        primary_validation = preferred.get("_poc_validation") if isinstance(preferred.get("_poc_validation"), dict) else {}
+        secondary_validation = secondary.get("_poc_validation") if isinstance(secondary.get("_poc_validation"), dict) else {}
+        merged["_poc_validation"] = (
+            primary_validation
+            if primary_validation.get("accepted")
+            else secondary_validation
+            if secondary_validation.get("accepted")
+            else primary_validation or secondary_validation
+        )
+    if preferred.get("_detail_enriched") or secondary.get("_detail_enriched"):
+        merged["_detail_enriched"] = True
+    if preferred.get("_salvaged") or secondary.get("_salvaged"):
+        merged["_salvaged"] = True
+    return merged
 
 
 def _get_stage_topic_keywords(stage_num: int) -> list[str]:
@@ -5846,7 +7062,8 @@ def _build_stage_focus_compact_context(
     focus_file_limit = 32 if stage.stage_num == 6 else 40
     focus_files = _merge_unique_items([], [chunk.get("file_path", "") for chunk in selected_chunks if chunk.get("file_path")])[:focus_file_limit]
     topic_keywords = _get_stage_topic_keywords(stage.stage_num)
-    route_lines = _select_stage_focus_route_lines(stage.stage_num, static_routes, audit_memory, focus_files)
+    focus_routes = _select_stage_focus_routes(stage.stage_num, static_routes, audit_memory, focus_files)
+    route_lines = _format_static_route_lines(focus_routes, total_count=len(focus_routes))
     evidence_files = audit_memory.get("evidence_files", []) if isinstance(audit_memory.get("evidence_files"), list) else []
     route_inventory = audit_memory.get("route_inventory", []) if isinstance(audit_memory.get("route_inventory"), list) else []
     vulnerability_hints = audit_memory.get("vulnerability_hints", []) if isinstance(audit_memory.get("vulnerability_hints"), list) else []
@@ -5882,6 +7099,7 @@ def _build_stage_focus_compact_context(
         "route_intro": "以下仅保留与当前阶段专题高度相关的入口与路由证据，请结合源码核对，不要机械照抄。",
         "extra_guidance": "\n".join(guidance),
         "focus_files": focus_files,
+        "focus_routes": focus_routes,
         "rule_hit_lines": rule_hit_lines[:12] if stage.stage_num == 6 else rule_hit_lines,
         "source_sink_lines": source_sink_lines,
     }
@@ -5931,7 +7149,7 @@ def _format_stage_source_sink_lines(source_sink_hints: list[dict]) -> list[str]:
 def _compact_audit_memory_for_stage(stage_num: int, audit_memory: dict) -> dict:
     if not isinstance(audit_memory, dict):
         return {}
-    if stage_num in {2, 3, 4, 8}:
+    if stage_num in {2, 3, 4}:
         return {
             "completed_stage_count": audit_memory.get("completed_stage_count", 0),
             "stages": audit_memory.get("stages", [])[-4:] if isinstance(audit_memory.get("stages"), list) else [],
@@ -5950,16 +7168,6 @@ def _compact_audit_memory_for_stage(stage_num: int, audit_memory: dict) -> dict:
             "route_inventory": (audit_memory.get("route_inventory") or [])[:24] if isinstance(audit_memory.get("route_inventory"), list) else [],
             "modules": (audit_memory.get("modules") or [])[:16] if isinstance(audit_memory.get("modules"), list) else [],
             "vulnerability_hints": (audit_memory.get("vulnerability_hints") or [])[:6] if isinstance(audit_memory.get("vulnerability_hints"), list) else [],
-        }
-        return {
-            "completed_stage_count": audit_memory.get("completed_stage_count", 0),
-            "stages": audit_memory.get("stages", [])[-4:] if isinstance(audit_memory.get("stages"), list) else [],
-            "evidence_files": (audit_memory.get("evidence_files") or [])[:20],
-            "route_inventory": (audit_memory.get("route_inventory") or [])[:32] if isinstance(audit_memory.get("route_inventory"), list) else [],
-            "entry_points": (audit_memory.get("entry_points") or [])[:16] if isinstance(audit_memory.get("entry_points"), list) else [],
-            "modules": (audit_memory.get("modules") or [])[:16] if isinstance(audit_memory.get("modules"), list) else [],
-            "data_flows": (audit_memory.get("data_flows") or [])[:12] if isinstance(audit_memory.get("data_flows"), list) else [],
-            "vulnerability_hints": (audit_memory.get("vulnerability_hints") or [])[:8] if isinstance(audit_memory.get("vulnerability_hints"), list) else [],
         }
     if stage_num == 5:
         return {
@@ -6012,12 +7220,12 @@ def _compact_audit_memory_for_stage(stage_num: int, audit_memory: dict) -> dict:
     return compact
 
 
-def _select_stage_focus_route_lines(
+def _select_stage_focus_routes(
     stage_num: int,
     static_routes: list[dict],
     audit_memory: dict,
     focus_files: list[str],
-) -> list[str]:
+) -> list[dict]:
     if not static_routes:
         return []
 
@@ -6060,7 +7268,7 @@ def _select_stage_focus_route_lines(
     selected = [route for score, route in scored if score > 0][:24]
     if len(selected) < 12:
         selected.extend([route for _, route in scored[len(selected):12]])
-    return _format_static_route_lines(_merge_unique_items([], selected), total_count=len(selected))
+    return _merge_unique_items([], selected)
 
 
 def _summarize_stage_focus_files(tree: list, focus_files: list[str], evidence_files: list[str]) -> str:
@@ -6124,12 +7332,14 @@ def _build_prev_context(audit_memory: dict) -> str:
 def _build_audit_memory(stages: list[AuditStage], current_stage_num: int | None = None) -> dict:
     completed_stages = []
     route_inventory = []
+    audited_route_inventory = []
     modules = []
     data_flows = []
     entry_points = []
     output_points = []
     vulnerability_hints = []
     evidence_files = []
+    architecture_summary = {}
 
     for stage in sorted(stages, key=lambda item: item.stage_num):
         if current_stage_num is not None and stage.stage_num == current_stage_num:
@@ -6142,6 +7352,7 @@ def _build_audit_memory(stages: list[AuditStage], current_stage_num: int | None 
         architecture_info = findings.get("architecture_info") if isinstance(findings.get("architecture_info"), dict) else {}
         if not architecture_info and isinstance(compressed.get("architecture_info"), dict):
             architecture_info = compressed.get("architecture_info", {})
+        stage_coverage = compressed.get("_stage_coverage", {}) if isinstance(compressed.get("_stage_coverage"), dict) else {}
 
         stage_vulns = findings.get("vulnerabilities", [])
         if not isinstance(stage_vulns, list):
@@ -6161,6 +7372,7 @@ def _build_audit_memory(stages: list[AuditStage], current_stage_num: int | None 
             "high_severity_count": sum(
                 1 for vuln in stage_vulns if str(vuln.get("severity", "")).strip() in {"Critical", "High"}
             ),
+            "audited_route_count": len(stage_coverage.get("focus_routes", [])) if isinstance(stage_coverage.get("focus_routes"), list) else 0,
             "files": _merge_unique_items(
                 [],
                 [vuln.get("file_path", "") for vuln in stage_vulns if isinstance(vuln, dict) and vuln.get("file_path")]
@@ -6170,12 +7382,15 @@ def _build_audit_memory(stages: list[AuditStage], current_stage_num: int | None 
         }
 
         completed_stages.append(stage_record)
+        if not architecture_summary and architecture_info:
+            architecture_summary = _summarize_architecture_info(architecture_info)
         route_inventory = _merge_unique_items(route_inventory, architecture_info.get("routes"))
         if isinstance(route_inventory, list):
             route_inventory = sorted(
                 [item for item in route_inventory if isinstance(item, dict)],
                 key=lambda item: (-_route_priority_score(item), item.get("path", ""), item.get("method", ""), item.get("handler", "")),
             )
+        audited_route_inventory = _merge_unique_items(audited_route_inventory, stage_coverage.get("focus_routes"))
         modules = _merge_unique_items(modules, architecture_info.get("modules"))
         data_flows = _merge_unique_items(data_flows, architecture_info.get("data_flows"))
         entry_points = _merge_unique_items(entry_points, architecture_info.get("entry_points"))
@@ -6189,7 +7404,9 @@ def _build_audit_memory(stages: list[AuditStage], current_stage_num: int | None 
     return {
         "completed_stage_count": len(completed_stages),
         "stages": completed_stages[-8:],
+        "architecture_info": architecture_summary,
         "route_inventory": route_inventory[:200],
+        "audited_route_inventory": audited_route_inventory[:200],
         "modules": modules[:80],
         "data_flows": data_flows[:80],
         "entry_points": entry_points[:80],

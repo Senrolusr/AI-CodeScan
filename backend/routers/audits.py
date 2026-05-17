@@ -4,13 +4,13 @@ import shutil
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import case, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import AuditStage, AuditTask, LlmConfig, Project, Vulnerability
 from prompts.stage_prompts import get_stage_name
-from schemas import AuditCreate, AuditStageOut, AuditTaskOut, RunPhaseRequest, VulnerabilityOut
+from schemas import AuditCreate, AuditStageOut, AuditTaskOut, VulnerabilityOut
 from services.audit_engine import _severity_match_values
 from services.audit_worker import clear_task_queue_state, mark_task_queued
 
@@ -133,39 +133,9 @@ async def create_audit(
     await db.refresh(task)
 
     await _create_stage_records(db, task.id)
+    mark_task_queued(task, list(range(1, 10)))
     await db.commit()
 
-    return task
-
-
-@router.post("/{task_id}/run-phase", response_model=AuditTaskOut)
-async def run_audit_phase(
-    task_id: int,
-    data: RunPhaseRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    task, stages = await _get_task_with_stages(db, task_id)
-
-    if task.status not in {"paused", "pending"}:
-        raise HTTPException(400, "只有暂停或待处理的审计可以执行下一阶段")
-    if data.phase < 1 or data.phase > 4:
-        raise HTTPException(400, "Phase 编号必须在 1-4 之间")
-
-    summary = task.summary if isinstance(task.summary, dict) else {}
-    current_phase = summary.get("current_phase", 1)
-
-    if data.phase != current_phase:
-        raise HTTPException(400, f"请按顺序执行：当前应执行 Phase {current_phase}")
-
-    summary["multi_agent_phase_mode"] = True
-    summary["current_phase"] = data.phase
-    task.summary = summary
-
-    all_stage_nums = [s.stage_num for s in stages]
-    mark_task_queued(task, all_stage_nums)
-    await db.commit()
-
-    await db.refresh(task)
     return task
 
 
@@ -233,7 +203,11 @@ async def retry_audit(
 
     summary = task.summary if isinstance(task.summary, dict) else {}
     summary["selected_stage_nums"] = rerun_stage_nums
+    summary["current_phase"] = 1
+    summary["multi_agent_phase_mode"] = True
     summary.pop("audit_memory", None)
+    summary.pop("agent_plan", None)
+    summary.pop("review_outcome", None)
     task.summary = summary
     mark_task_queued(task, rerun_stage_nums)
     await _reset_stage_state(db, task.id, rerun_stage_nums)
@@ -243,43 +217,139 @@ async def retry_audit(
     return task
 
 
+def _build_stage_debug_payload(stage: AuditStage) -> dict | None:
+    try:
+        prompt_data = json.loads(stage.prompt_used) if stage.prompt_used else {}
+    except Exception:
+        prompt_data = {}
+    try:
+        response_data = json.loads(stage.llm_response) if stage.llm_response else {}
+    except Exception:
+        response_data = {}
+
+    debug = prompt_data.get("debug") if isinstance(prompt_data, dict) else None
+    if not debug and not (isinstance(response_data, dict) and response_data.get("error")):
+        return None
+    return {
+        "prompt_length": len(stage.prompt_used or ""),
+        "selected_chunk_count": (debug or {}).get("selected_chunk_count"),
+        "code_text_length": (debug or {}).get("code_text_length"),
+        "user_prompt_length": (debug or {}).get("user_prompt_length"),
+        "static_route_count": (debug or {}).get("static_route_count"),
+        "prev_context_length": (debug or {}).get("prev_context_length"),
+        "planned_batch_count": (debug or {}).get("planned_batch_count") or (debug or {}).get("batch_count"),
+        "executed_batch_count": (debug or {}).get("executed_batch_count"),
+        "early_stop": (debug or {}).get("early_stop"),
+        "error": response_data.get("error") if isinstance(response_data, dict) else None,
+    }
+
+
+def _build_stage_findings_preview(stage: AuditStage) -> list | dict:
+    findings = stage.findings if isinstance(stage.findings, dict) else {}
+    compressed = stage.compressed_summary if isinstance(stage.compressed_summary, dict) else {}
+    vulnerabilities = findings.get("vulnerabilities", [])
+    vulnerability_count = len(vulnerabilities) if isinstance(vulnerabilities, list) else 0
+
+    preview = {
+        "stage_summary": compressed.get("stage_summary") or findings.get("stage_summary") or "",
+        "_vulnerability_count": vulnerability_count,
+    }
+    for key in ["parse_error", "raw_response", "_policy_note", "_policy_stats", "_salvaged", "skipped", "skip_reason"]:
+        if key in findings:
+            preview[key] = findings.get(key)
+
+    if stage.stage_num == -1:
+        for key in ["analysis_summary", "selected_agents", "skipped_agents"]:
+            if key in findings:
+                preview[key] = findings.get(key)
+
+    if stage.stage_num == -2:
+        for key in ["review_summary", "findings_assessment", "request_rerun", "rerun_agents", "additional_guidance", "rerun_execution", "review_closure"]:
+            if key in findings:
+                preview[key] = findings.get(key)
+
+    if stage.stage_num == 1:
+        arch = findings.get("architecture_info") if isinstance(findings.get("architecture_info"), dict) else {}
+        if not arch and isinstance(compressed.get("architecture_info"), dict):
+            arch = compressed.get("architecture_info", {})
+        if isinstance(arch, dict) and arch:
+            routes = arch.get("routes", []) if isinstance(arch.get("routes"), list) else []
+            preview["architecture_info"] = {
+                "tech_stack": arch.get("tech_stack", ""),
+                "framework": arch.get("framework", ""),
+                "database": arch.get("database", ""),
+                "auth_mechanism": arch.get("auth_mechanism", ""),
+                "routes": routes[:12],
+                "_route_count": len(routes),
+                "middleware_chain": arch.get("middleware_chain", []),
+                "database_models": arch.get("database_models", []),
+                "security_boundaries": arch.get("security_boundaries"),
+                "external_integrations": arch.get("external_integrations", []),
+                "_gap_analysis": arch.get("_gap_analysis"),
+                "entry_points": arch.get("entry_points", []),
+                "output_points": arch.get("output_points", []),
+                "modules": arch.get("modules", []),
+                "data_flows": arch.get("data_flows", []),
+            }
+
+    debug_payload = _build_stage_debug_payload(stage)
+    if debug_payload:
+        preview["_debug"] = debug_payload
+    return preview
+
+
+def _serialize_stage(stage: AuditStage, *, include_payloads: bool) -> dict:
+    if 1 <= stage.stage_num <= 9:
+        stage_name = get_stage_name(stage.stage_num)
+    else:
+        stage_name = stage.stage_name
+
+    findings = stage.findings if include_payloads else _build_stage_findings_preview(stage)
+    if include_payloads:
+        debug_payload = _build_stage_debug_payload(stage)
+        if debug_payload:
+            findings = findings if isinstance(findings, dict) else {"data": findings}
+            findings.setdefault("_debug", debug_payload)
+
+    return {
+        "id": stage.id,
+        "task_id": stage.task_id,
+        "stage_num": stage.stage_num,
+        "stage_name": stage_name,
+        "agent_role": stage.agent_role,
+        "status": stage.status,
+        "prompt_used": stage.prompt_used if include_payloads else "",
+        "findings": findings,
+        "llm_response": stage.llm_response if include_payloads else "",
+        "compressed_summary": stage.compressed_summary,
+        "artifact_path": stage.artifact_path,
+        "started_at": stage.started_at,
+        "completed_at": stage.completed_at,
+    }
+
+
 @router.get("/{task_id}/stages", response_model=list[AuditStageOut])
-async def get_audit_stages(task_id: int, db: AsyncSession = Depends(get_db)):
+async def get_audit_stages(
+    task_id: int,
+    include_payloads: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
         select(AuditStage).where(AuditStage.task_id == task_id).order_by(AuditStage.stage_num)
     )
     stages = result.scalars().all()
-    for stage in stages:
-        if 1 <= stage.stage_num <= 9:
-            stage.stage_name = get_stage_name(stage.stage_num)
-        try:
-            prompt_data = json.loads(stage.prompt_used) if stage.prompt_used else {}
-        except Exception:
-            prompt_data = {}
-        try:
-            response_data = json.loads(stage.llm_response) if stage.llm_response else {}
-        except Exception:
-            response_data = {}
+    return [_serialize_stage(stage, include_payloads=include_payloads) for stage in stages]
 
-        debug = prompt_data.get("debug") if isinstance(prompt_data, dict) else None
-        if debug or (isinstance(response_data, dict) and response_data.get("error")):
-            stage.findings = stage.findings if isinstance(stage.findings, dict) else {"data": stage.findings}
-            stage.findings.setdefault(
-                "_debug",
-                {
-                    "prompt_length": len(stage.prompt_used or ""),
-                    "selected_chunk_count": (debug or {}).get("selected_chunk_count"),
-                    "code_text_length": (debug or {}).get("code_text_length"),
-                    "user_prompt_length": (debug or {}).get("user_prompt_length"),
-                    "static_route_count": (debug or {}).get("static_route_count"),
-                    "prev_context_length": (debug or {}).get("prev_context_length"),
-                    "planned_batch_count": (debug or {}).get("planned_batch_count") or (debug or {}).get("batch_count"),
-                    "executed_batch_count": (debug or {}).get("executed_batch_count"),
-                    "early_stop": (debug or {}).get("early_stop"),
-                    "error": response_data.get("error") if isinstance(response_data, dict) else None,
-                },
-            )
-    return stages
+
+@router.get("/{task_id}/stages/{stage_num}", response_model=AuditStageOut)
+async def get_audit_stage_detail(task_id: int, stage_num: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(AuditStage).where(AuditStage.task_id == task_id, AuditStage.stage_num == stage_num)
+    )
+    stage = result.scalar_one_or_none()
+    if not stage:
+        raise HTTPException(404, "审计阶段不存在")
+    return _serialize_stage(stage, include_payloads=True)
 
 
 @router.get("/{task_id}/stages/{stage_num}/artifact")
@@ -320,6 +390,7 @@ async def get_audit_vulns(
     task_id: int,
     severity: str = None,
     confirmed_status: str = None,
+    verification_state: str = None,
     db: AsyncSession = Depends(get_db),
 ):
     query = select(Vulnerability).where(Vulnerability.task_id == task_id)
@@ -327,7 +398,14 @@ async def get_audit_vulns(
         query = query.where(Vulnerability.severity.in_(_severity_match_values(severity)))
     if confirmed_status:
         query = query.where(Vulnerability.confirmed_status == confirmed_status)
-    result = await db.execute(query.order_by(Vulnerability.id))
+    if verification_state:
+        query = query.where(Vulnerability.verification_state == verification_state)
+    result = await db.execute(
+        query.order_by(
+            case((Vulnerability.verification_state == "verified", 0), else_=1),
+            Vulnerability.id,
+        )
+    )
     return result.scalars().all()
 
 
