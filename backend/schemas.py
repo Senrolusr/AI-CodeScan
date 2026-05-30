@@ -98,11 +98,6 @@ class AuditStageOut(BaseModel):
     completed_at: Optional[datetime]
 
 
-# ===== Vulnerability =====
-class VulnStatusUpdate(BaseModel):
-    confirmed_status: str  # pending/confirmed/false_positive/fixed
-
-
 class VulnerabilityOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -123,9 +118,6 @@ class VulnerabilityOut(BaseModel):
     description: str
     fix_suggestion: str
     dedupe_key: str
-    diff_status: str
-    confirmed_status: str
-    verification_state: str = "candidate"
     confidence: str = "medium"
 
 

@@ -9,17 +9,13 @@ const TEXT = {
     zh: '优先复核新增的严重和高危问题，先处理可直接形成利用链的入口点。',
     en: 'Review newly found critical and high-risk issues first, especially entry points that can directly form an exploit chain.',
   },
-  newIssues: {
-    zh: '本轮存在新增问题，建议下次复扫时优先对比新增问题是否已经修复，而不是从全部历史问题重新开始。',
-    en: 'New issues were found in this round. In the next rescan, compare those new issues first instead of restarting from the full historical set.',
-  },
   compactedFiles: {
     zh: '本轮存在大文件补偿切片，建议对相关大文件做人工抽查，避免关键信息落在切片边界之外。',
     en: 'Large-file compensation slices were used in this round. Manually spot-check those files to avoid missing critical context at chunk boundaries.',
   },
   truncatedFiles: {
-    zh: '存在被截断文件或总代码截断，建议针对核心入口文件单独精扫，降低上下文截断带来的漏报风险。',
-    en: 'Some files or total code context were truncated. Run targeted scans on core entry files to reduce the risk of misses caused by context limits.',
+    zh: '存在审计文件数、代码块或总代码截断，建议针对核心入口文件单独精扫，降低上下文截断带来的漏报风险。',
+    en: 'Audit files, code chunks, or total code context were truncated. Run targeted scans on core entry files to reduce the risk of misses caused by context limits.',
   },
   denseRuleHits: {
     zh: '规则命中数明显高于入库漏洞数，建议把规则命中最集中的目录作为下一轮定向审计范围。',
@@ -68,31 +64,22 @@ export function buildSeverityStats(vulns = []) {
   return stats
 }
 
-export function buildDiffStats(vulns = []) {
-  let newCount = 0
-  let existingCount = 0
-  for (const vuln of vulns || []) {
-    if (vuln?.diff_status === 'existing') existingCount += 1
-    else newCount += 1
-  }
-  return { newCount, existingCount }
-}
-
 export function buildTaskRescanRecommendations({ vulns = [], scanStats = {}, locale = 'zh' } = {}) {
   const recommendations = []
   const severityStats = buildSeverityStats(vulns)
-  const diffStats = buildDiffStats(vulns)
 
   if (severityStats.Critical || severityStats.High) {
     recommendations.push(resolveText(locale, 'criticalOrHigh'))
   }
-  if (diffStats.newCount) {
-    recommendations.push(resolveText(locale, 'newIssues'))
-  }
   if (scanStats.oversized_files_compacted) {
     recommendations.push(resolveText(locale, 'compactedFiles'))
   }
-  if (scanStats.truncated_files || scanStats.truncated_by_total_chars) {
+  if (
+    scanStats.truncated_files
+    || scanStats.truncated_by_audit_file_count
+    || scanStats.truncated_by_code_chunks
+    || scanStats.truncated_by_total_chars
+  ) {
     recommendations.push(resolveText(locale, 'truncatedFiles'))
   }
   if ((scanStats.rule_hit_count || 0) >= Math.max((vulns?.length || 0) * 2, 20)) {
@@ -111,7 +98,12 @@ export function buildProjectCacheRecommendations({ cacheSummary = {}, cacheScanS
   if (!cacheSummary.available) {
     recommendations.push(resolveText(locale, 'noCache'))
   }
-  if (cacheScanStats.partial_audit || cacheScanStats.truncated_by_total_chars) {
+  if (
+    cacheScanStats.partial_audit
+    || cacheScanStats.truncated_by_audit_file_count
+    || cacheScanStats.truncated_by_code_chunks
+    || cacheScanStats.truncated_by_total_chars
+  ) {
     recommendations.push(resolveText(locale, 'partialCache'))
   }
   if (cacheScanStats.oversized_files_compacted) {

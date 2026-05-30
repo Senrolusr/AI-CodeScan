@@ -24,6 +24,7 @@ from services.llm_client import call_llm_with_meta
 from services.audit_engine import (
     _accumulate_token_usage,
     _apply_stage_payload,
+    _coerce_stage_findings,
     _build_audit_memory,
     _build_prev_context,
     _get_stage_retry_policy,
@@ -74,7 +75,7 @@ def _build_rerun_execution(stages: list[AuditStage], requested_stage_nums: list[
             continue
         executed_stage_nums.append(stage_num)
         vuln_count = 0
-        findings = stage.findings if isinstance(stage.findings, dict) else {}
+        findings = _coerce_stage_findings(stage.findings)
         vulnerabilities = findings.get("vulnerabilities", [])
         if isinstance(vulnerabilities, list):
             vuln_count = len(vulnerabilities)
@@ -244,7 +245,7 @@ async def _reset_agent_stages_for_rerun(session, task_id: int, stages: list[Audi
         if stage.stage_num not in stage_nums:
             continue
         stage.status = "pending"
-        stage.findings = []
+        stage.findings = {"vulnerabilities": []}
         stage.prompt_used = ""
         stage.llm_response = ""
         stage.compressed_summary = {}
@@ -714,7 +715,7 @@ def _build_uncovered_route_summary(audit_memory: dict, stages) -> str:
                 covered_route_keys.add(route_key)
 
     for stage in stages:
-        findings = stage.findings if isinstance(stage.findings, dict) else {}
+        findings = _coerce_stage_findings(stage.findings)
         vulns = findings.get("vulnerabilities", [])
         if not isinstance(vulns, list):
             continue
@@ -759,9 +760,8 @@ def _build_review_context(audit_memory: dict, agent_plan: dict, stages) -> dict:
     severity_dist = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
 
     for stage in stages:
-        if not isinstance(stage.findings, dict):
-            continue
-        vulns = stage.findings.get("vulnerabilities", [])
+        findings = _coerce_stage_findings(stage.findings)
+        vulns = findings.get("vulnerabilities", [])
         if not isinstance(vulns, list):
             continue
         count = len(vulns)

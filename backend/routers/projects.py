@@ -4,9 +4,10 @@ import zipfile
 import logging
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from database import get_db
-from models import AuditStage, AuditTask, Project, Vulnerability
+from models import AuditTask, Project
+from services.audit_cleanup import delete_audit_task_records
 from services.code_parser import clear_project_cache, load_project_cache, parse_project, warm_project_cache
 
 router = APIRouter()
@@ -252,15 +253,7 @@ async def delete_project(project_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(400, f"项目存在运行中的审计任务，无法删除：{running_task_ids}")
 
     for task in audit_tasks:
-        await db.execute(delete(Vulnerability).where(Vulnerability.task_id == task.id))
-        await db.execute(delete(AuditStage).where(AuditStage.task_id == task.id))
-        report_dir = os.path.join("reports", str(task.id))
-        if os.path.isdir(report_dir):
-            shutil.rmtree(report_dir, ignore_errors=True)
-        artifact_dir = os.path.join("data", "stage_artifacts", str(task.id))
-        if os.path.isdir(artifact_dir):
-            shutil.rmtree(artifact_dir, ignore_errors=True)
-        await db.delete(task)
+        await delete_audit_task_records(db, task)
 
     if project.upload_path and os.path.exists(project.upload_path):
         shutil.rmtree(project.upload_path, ignore_errors=True)

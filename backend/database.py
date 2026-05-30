@@ -63,14 +63,6 @@ async def _run_migrations(conn):
         await conn.execute(
             text("ALTER TABLE vulnerabilities ADD COLUMN dedupe_key VARCHAR(128) DEFAULT ''")
         )
-    if "diff_status" not in vuln_column_names:
-        await conn.execute(
-            text("ALTER TABLE vulnerabilities ADD COLUMN diff_status VARCHAR(50) DEFAULT 'new'")
-        )
-    if "verification_state" not in vuln_column_names:
-        await conn.execute(
-            text("ALTER TABLE vulnerabilities ADD COLUMN verification_state VARCHAR(20) DEFAULT 'candidate'")
-        )
     if "confidence" not in vuln_column_names:
         await conn.execute(
             text("ALTER TABLE vulnerabilities ADD COLUMN confidence VARCHAR(20) DEFAULT 'medium'")

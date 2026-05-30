@@ -15,9 +15,6 @@ def _status_label(status: str) -> str:
         "completed": "已完成",
         "failed": "失败",
         "cancelled": "已取消",
-        "confirmed": "已确认",
-        "false_positive": "误报",
-        "fixed": "已修复",
     }.get(status, status or "-")
 
 
@@ -88,6 +85,8 @@ def _get_scan_stats(task) -> dict:
     return {
         **scan_stats,
         "total_files": int(scan_stats.get("total_files", scan_stats.get("source_files_detected", 0)) or 0),
+        "indexed_files": int(scan_stats.get("indexed_files", scan_stats.get("source_files_indexed", scan_stats.get("source_files_detected", 0))) or 0),
+        "selected_files": int(scan_stats.get("selected_files", scan_stats.get("files_selected_for_audit", scan_stats.get("files_considered_for_chunks", 0))) or 0),
         "included_files": int(scan_stats.get("included_files", scan_stats.get("files_considered_for_chunks", 0)) or 0),
         "total_chunks": int(scan_stats.get("total_chunks", scan_stats.get("chunk_count", 0)) or 0),
     }

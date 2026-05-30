@@ -139,7 +139,6 @@ const zhMessages = {
   retryFailed: '重试失败',
   vulnerabilityNotFound: '漏洞不存在',
   backToAudit: '返回审计',
-  updateStatus: '更新状态',
   details: '详情',
   code: '代码',
   poc: 'POC',
@@ -152,12 +151,7 @@ const zhMessages = {
   pocInvalid: 'POC 不完整',
   pocUnknown: 'POC 待校验',
   notAvailable: '无',
-  statusUpdated: '状态已更新',
-  statusUpdateFailed: '状态更新失败',
   pending: '待处理',
-  confirmed: '已确认',
-  falsePositive: '误报',
-  fixed: '已修复',
   running: '运行中',
   completed: '已完成',
   failed: '失败',
@@ -236,9 +230,7 @@ const zhMessages = {
   stageOutputPreview: '阶段输出预览',
   noData: '无',
   stageStarted: '已启动阶段：{stages}',
-  diffStatus: '差异状态',
   existing: '历史已存在',
-  newlyFound: '新增',
   dedupeKey: '去重键',
   rebuildCache: '重建缓存',
   cacheSummary: '缓存摘要',
@@ -283,6 +275,8 @@ const zhMessages = {
   connectionCategoryEmptyResponse: '接口成功但返回为空',
   scanOverview: '扫描概览',
   sourceFilesDetected: '检测源码数',
+  sourceFilesIndexed: '索引源码数',
+  auditFilesSelected: '审计入选文件',
   chunkCandidateFiles: '分块候选文件',
   effectiveContentFiles: '有效内容文件',
   chunkCount: '分块数',
@@ -296,6 +290,8 @@ const zhMessages = {
   fullAudit: '完整审计',
   scanTruncatedNotice: '本次扫描触发了体量控制，结果可能不是全量覆盖。',
   oversizedFilesSkippedNotice: '已跳过 {count} 个超大文件。',
+  auditFilesTruncatedNotice: '审计文件预算已触发：入选 {selected} 个，跳过 {skipped} 个低优先级文件。',
+  codeChunksTruncatedNotice: '代码块数量已达到当前上限，后续低优先级内容未进入审计缓存。',
   totalCharsTruncatedNotice: '已达到总字符上限，部分代码内容未进入模型上下文。',
   ruleHitPreview: '规则命中预览',
   clickToExpand: '点击展开查看详情',
@@ -360,7 +356,6 @@ const zhMessages = {
   missingMustCover: '未覆盖安全文件',
   securityBoundaries: '安全关键文件',
   confidence: '置信度',
-  verificationState: '验证态',
   confidenceHigh: '高',
   confidenceMedium: '中',
   confidenceLow: '低',
@@ -503,7 +498,6 @@ const enMessages = {
   retryFailed: 'Retry failed',
   vulnerabilityNotFound: 'Vulnerability not found',
   backToAudit: 'Back to Audit',
-  updateStatus: 'Update Status',
   details: 'Details',
   code: 'Code',
   poc: 'POC',
@@ -516,12 +510,7 @@ const enMessages = {
   pocInvalid: 'POC Invalid',
   pocUnknown: 'POC Pending',
   notAvailable: 'N/A',
-  statusUpdated: 'Status updated',
-  statusUpdateFailed: 'Failed to update status',
   pending: 'Pending',
-  confirmed: 'Confirmed',
-  falsePositive: 'False Positive',
-  fixed: 'Fixed',
   running: 'Running',
   completed: 'Completed',
   failed: 'Failed',
@@ -600,9 +589,7 @@ const enMessages = {
   stageOutputPreview: 'Stage Output Preview',
   noData: 'N/A',
   stageStarted: 'Started stages: {stages}',
-  diffStatus: 'Diff Status',
   existing: 'Existing',
-  newlyFound: 'New',
   dedupeKey: 'Dedupe Key',
   rebuildCache: 'Rebuild Cache',
   cacheSummary: 'Cache Summary',
@@ -647,6 +634,8 @@ const enMessages = {
   connectionCategoryEmptyResponse: 'API succeeded but returned empty content',
   scanOverview: 'Scan Overview',
   sourceFilesDetected: 'Source Files Detected',
+  sourceFilesIndexed: 'Source Files Indexed',
+  auditFilesSelected: 'Audit Files Selected',
   chunkCandidateFiles: 'Chunk Candidate Files',
   effectiveContentFiles: 'Files With Content',
   chunkCount: 'Chunk Count',
@@ -660,6 +649,8 @@ const enMessages = {
   fullAudit: 'Full Audit',
   scanTruncatedNotice: 'This scan hit size-control limits, so coverage may be incomplete.',
   oversizedFilesSkippedNotice: '{count} oversized files were skipped.',
+  auditFilesTruncatedNotice: 'The audit file budget was reached: {selected} selected, {skipped} lower-priority files skipped.',
+  codeChunksTruncatedNotice: 'The code chunk limit was reached, so later lower-priority content was not cached for audit.',
   totalCharsTruncatedNotice: 'The total character limit was reached, and some code was not sent to the model context.',
   ruleHitPreview: 'Rule Hit Preview',
   clickToExpand: 'Click to expand',
@@ -724,7 +715,6 @@ const enMessages = {
   missingMustCover: 'Uncovered Security Files',
   securityBoundaries: 'Security Critical Files',
   confidence: 'Confidence',
-  verificationState: 'Verification State',
   confidenceHigh: 'High',
   confidenceMedium: 'Medium',
   confidenceLow: 'Low',
@@ -779,9 +769,6 @@ export function useI18n() {
       cancelled: 'cancelled',
       skipped: 'skipped',
       paused: 'paused',
-      confirmed: 'confirmed',
-      false_positive: 'falsePositive',
-      fixed: 'fixed',
     }
     return t(mapping[status] || status || 'unknown')
   }
@@ -809,26 +796,10 @@ export function useI18n() {
     { pending: 'info', running: 'warning', completed: 'success', failed: 'danger', cancelled: 'info', skipped: 'info', paused: 'warning' }[status] || 'info'
   )
 
-  const diffStatusLabel = (value) => {
-    if (value === 'existing') return t('existing')
-    return t('newlyFound')
-  }
-
   const boolLabel = (value) => t(value ? 'yes' : 'no')
 
   const pocTagType = (status) => (
     { valid: 'success', invalid: 'danger', unknown: 'info' }[status] || 'info'
-  )
-
-  const verificationStateLabel = (value) => {
-    if (locale.value === 'en') {
-      return value === 'verified' ? 'Verified' : 'Candidate'
-    }
-    return value === 'verified' ? '已验证' : '候选'
-  }
-
-  const verificationStateType = (value) => (
-    value === 'verified' ? 'success' : 'warning'
   )
 
   const formatPercent = (value) => `${Math.round((Number(value || 0) || 0) * 100)}%`
@@ -880,11 +851,8 @@ export function useI18n() {
     severityColor,
     statusType,
     normalizeSeverity,
-    diffStatusLabel,
     boolLabel,
     pocTagType,
-    verificationStateLabel,
-    verificationStateType,
     formatPercent,
     formatDateTime,
     formatDate,

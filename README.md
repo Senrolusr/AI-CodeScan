@@ -91,7 +91,6 @@ codescan/
 │   └── vite.config.js
 ├── start-platform.ps1
 ├── start-platform.bat
-├── code_aduit.md
 └── README.md
 ```
 
@@ -160,6 +159,23 @@ npm run dev -- --host 127.0.0.1 --port 3000
 - 前端：`http://127.0.0.1:3000`
 - 后端：`http://127.0.0.1:8000`
 - API 文档：`http://127.0.0.1:8000/docs`
+
+## 仓库清理状态
+
+仓库只保留源码、依赖清单和必要占位文件，不提交本地依赖、构建产物、数据库、日志、上传源码或导出报告。首次运行或拉取到新环境后需要重新安装依赖。
+
+已忽略的运行时目录和文件包括：
+
+- `frontend/node_modules/`
+- `frontend/dist/`
+- `backend/data/audit.db`
+- `backend/data/audit.log`
+- `backend/data/project_cache/`
+- `backend/data/stage_artifacts/`
+- `backend/uploads/`
+- `backend/reports/`
+
+如需清空本地运行数据，可删除以上目录或文件；应用启动时会自动创建必要目录和 SQLite 数据库。
 
 ## 使用流程
 
@@ -230,7 +246,7 @@ npm run dev -- --host 127.0.0.1 --port 3000
 
 ## 关键配置
 
-配置位于 [backend/services/config.py](/D:/codescan/backend/services/config.py)。
+配置位于 `backend/services/config.py`。
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
@@ -238,7 +254,9 @@ npm run dev -- --host 127.0.0.1 --port 3000
 | `WORKER_TASK_TIMEOUT_SECONDS` | 3600 | 单次审计任务超时时间 |
 | `WORKER_POLL_INTERVAL_SECONDS` | 2.0 | Worker 轮询间隔 |
 | `MAX_FILE_SIZE` | 500KB | 单个源码文件大小上限 |
-| `MAX_FILES` | 500 | 单项目最多扫描文件数 |
+| `MAX_TREE_FILES` | 10,000 | 单项目最多索引源码/配置文件数 |
+| `MAX_AUDIT_SOURCE_FILES` | 1,200 | 进入审计切片的高优先级文件上限 |
+| `MAX_CODE_CHUNKS` | 2,000 | 缓存给阶段选择器使用的代码块上限 |
 | `TOTAL_CHARS_LIMIT` | 2,000,000 | 总字符预算 |
 
 ## PDF 导出依赖
@@ -266,6 +284,7 @@ Windows:
 
 - Windows 下如果 `npm` 执行策略受限，请使用 `npm.cmd`
 - 默认数据库为 SQLite，位于 `backend/data/audit.db`
+- LLM 配置、项目记录、审计任务和漏洞状态存储在本地 SQLite 数据库中；清理 `backend/data/audit.db` 会重置这些配置数据
 - 大项目上传后会先做预扫描和缓存构建，首次分析可能需要几十秒
 - 多 Agent 模式默认最多 3 个子 Agent 并发调用 LLM，请确保模型服务端允许足够并发
 - 审计 Worker 内置超时保护，超大项目建议分批审计

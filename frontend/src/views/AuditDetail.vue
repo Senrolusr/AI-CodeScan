@@ -17,7 +17,8 @@ import {
 import StageProgress from '../components/StageProgress.vue'
 import VulnCard from '../components/VulnCard.vue'
 import { useI18n } from '../i18n'
-import { buildDiffStats, buildSeverityStats, buildTaskRescanRecommendations } from '../utils/auditRecommendations'
+import { buildSeverityStats, buildTaskRescanRecommendations } from '../utils/auditRecommendations'
+import { isAuditRetryBlocked } from '../utils/auditTaskState'
 import { usePolling } from '../composables/usePolling'
 
 const props = defineProps({ id: [String, Number] })
@@ -28,8 +29,6 @@ const {
   statusLabel,
   severityLabel,
   statusType,
-  verificationStateLabel,
-  verificationStateType,
   formatPercent,
   formatDateTime,
   formatTimeOnly,
@@ -42,7 +41,7 @@ const reports = ref([])
 const loading = ref(true)
 const exporting = ref(false)
 const actionLoading = ref(false)
-const filter = ref({ severity: '', confirmed_status: '', verification_state: '' })
+const filter = ref({ severity: '' })
 const stageOneArtifact = ref(null)
 const stageOneArtifactLoading = ref(false)
 const expandedRuleHits = ref([])
@@ -114,12 +113,17 @@ const scanStats = computed(() => {
     ? value
     : {
         source_files_detected: 0,
+        source_files_indexed: 0,
         oversized_files_skipped: 0,
         oversized_files_compacted: 0,
+        files_selected_for_audit: 0,
+        files_skipped_by_audit_file_budget: 0,
         files_considered_for_chunks: 0,
         files_with_content: 0,
         chunk_count: 0,
         rule_hit_count: 0,
+        truncated_by_audit_file_count: false,
+        truncated_by_code_chunks: false,
         truncated_by_total_chars: false,
         route_count: 0,
         route_source_files: 0,
@@ -130,16 +134,6 @@ const ruleHitsPreview = computed(() => Array.isArray(task.value?.summary?.rule_h
 const tokenStats = computed(() => {
   const ts = task.value?.summary?.token_stats
   return ts && typeof ts === 'object' && ts.llm_call_count > 0 ? ts : null
-})
-const diffStats = computed(() => {
-  const summaryValue = task.value?.summary?.diff_stats
-  if (summaryValue && typeof summaryValue === 'object') {
-    return {
-      newCount: Number(summaryValue.new || 0),
-      existingCount: Number(summaryValue.existing || 0),
-    }
-  }
-  return buildDiffStats(vulns.value || [])
 })
 const severityStats = computed(() => {
   const summaryValue = task.value?.summary?.severity_stats
@@ -153,23 +147,6 @@ const severityStats = computed(() => {
     }
   }
   return buildSeverityStats(vulns.value || [])
-})
-const verificationStats = computed(() => {
-  const summaryValue = task.value?.summary?.verification_stats
-  if (summaryValue && typeof summaryValue === 'object') {
-    return {
-      verified: Number(summaryValue.verified || 0),
-      candidate: Number(summaryValue.candidate || 0),
-    }
-  }
-  return (vulns.value || []).reduce(
-    (acc, vuln) => {
-      const key = vuln?.verification_state === 'verified' ? 'verified' : 'candidate'
-      acc[key] += 1
-      return acc
-    },
-    { verified: 0, candidate: 0 },
-  )
 })
 const rescanRecommendations = computed(() => {
   const summaryValue = task.value?.summary?.rescan_recommendations
@@ -311,6 +288,7 @@ const handleCancel = async () => {
 }
 
 const handleRetry = async () => {
+  if (isAuditRetryBlocked(task.value)) return
   actionLoading.value = true
   try {
     await retryAudit(props.id)
@@ -474,7 +452,7 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
         </div>
         <div style="display: flex; gap: 8px; flex-wrap: wrap">
           <el-button v-if="task.status === 'pending' || task.status === 'running' || task.status === 'paused'" type="warning" plain :loading="actionLoading" @click="handleCancel">{{ t('cancel') }}</el-button>
-          <el-button v-if="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'" :loading="actionLoading" @click="handleRetry">{{ t('retry') }}</el-button>
+          <el-button v-if="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'" :disabled="isAuditRetryBlocked(task)" :loading="actionLoading" @click="handleRetry">{{ t('retry') }}</el-button>
           <el-button @click="handleExport('md')" :loading="exporting">{{ t('exportMd') }}</el-button>
           <el-button type="primary" @click="handleExport('pdf')" :loading="exporting">{{ t('exportPdf') }}</el-button>
         </div>
@@ -529,6 +507,8 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
         <template #header><span class="card-title">{{ t('scanOverview') }}</span></template>
         <el-descriptions :column="4" border size="small">
           <el-descriptions-item :label="t('sourceFilesDetected')">{{ scanStats.source_files_detected || 0 }}</el-descriptions-item>
+          <el-descriptions-item :label="t('sourceFilesIndexed')">{{ scanStats.source_files_indexed || scanStats.source_files_detected || 0 }}</el-descriptions-item>
+          <el-descriptions-item :label="t('auditFilesSelected')">{{ scanStats.files_selected_for_audit || scanStats.files_considered_for_chunks || 0 }}</el-descriptions-item>
           <el-descriptions-item :label="t('chunkCandidateFiles')">{{ scanStats.files_considered_for_chunks || 0 }}</el-descriptions-item>
           <el-descriptions-item :label="t('effectiveContentFiles')">{{ scanStats.files_with_content || 0 }}</el-descriptions-item>
           <el-descriptions-item :label="t('chunkCount')">{{ scanStats.chunk_count || 0 }}</el-descriptions-item>
@@ -543,11 +523,13 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
           </el-descriptions-item>
         </el-descriptions>
         <div
-          v-if="scanStats.partial_audit || scanStats.truncated_by_total_chars"
+          v-if="scanStats.partial_audit || scanStats.truncated_by_audit_file_count || scanStats.truncated_by_code_chunks || scanStats.truncated_by_total_chars"
           class="warning-notice"
         >
           <div>{{ t('scanTruncatedNotice') }}</div>
           <div v-if="scanStats.oversized_files_skipped">{{ t('oversizedFilesSkippedNotice', { count: scanStats.oversized_files_skipped }) }}</div>
+          <div v-if="scanStats.truncated_by_audit_file_count">{{ t('auditFilesTruncatedNotice', { selected: scanStats.files_selected_for_audit || 0, skipped: scanStats.files_skipped_by_audit_file_budget || 0 }) }}</div>
+          <div v-if="scanStats.truncated_by_code_chunks">{{ t('codeChunksTruncatedNotice') }}</div>
           <div v-if="scanStats.truncated_by_total_chars">{{ t('totalCharsTruncatedNotice') }}</div>
         </div>
       </el-card>
@@ -804,10 +786,6 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
           <div style="display: flex; justify-content: space-between; align-items: center">
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
               <span class="card-title">{{ t('vulnerabilities') }} ({{ vulns.length }})</span>
-              <el-tag size="small" :type="verificationStateType('verified')">{{ verificationStateLabel('verified') }} {{ verificationStats.verified }}</el-tag>
-              <el-tag size="small" :type="verificationStateType('candidate')">{{ verificationStateLabel('candidate') }} {{ verificationStats.candidate }}</el-tag>
-              <el-tag size="small" type="danger">{{ t('newlyFound') }} {{ diffStats.newCount }}</el-tag>
-              <el-tag size="small" type="info">{{ t('existing') }} {{ diffStats.existingCount }}</el-tag>
               <el-tag size="small" type="danger">{{ severityLabel('Critical') }} {{ severityStats.Critical }}</el-tag>
               <el-tag size="small" type="warning">{{ severityLabel('High') }} {{ severityStats.High }}</el-tag>
             </div>
@@ -817,16 +795,6 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
                 <el-option :label="severityLabel('High')" value="High" />
                 <el-option :label="severityLabel('Medium')" value="Medium" />
                 <el-option :label="severityLabel('Low')" value="Low" />
-              </el-select>
-              <el-select v-model="filter.verification_state" :placeholder="t('verificationState')" clearable size="small" style="width: 120px" @change="handleFilter">
-                <el-option :label="verificationStateLabel('verified')" value="verified" />
-                <el-option :label="verificationStateLabel('candidate')" value="candidate" />
-              </el-select>
-              <el-select v-model="filter.confirmed_status" :placeholder="t('status')" clearable size="small" style="width: 120px" @change="handleFilter">
-                <el-option :label="t('pending')" value="pending" />
-                <el-option :label="t('confirmed')" value="confirmed" />
-                <el-option :label="t('falsePositive')" value="false_positive" />
-                <el-option :label="t('fixed')" value="fixed" />
               </el-select>
             </div>
           </div>

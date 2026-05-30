@@ -1,22 +1,57 @@
 import json
 import os
-import shutil
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import case, delete, select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import AuditStage, AuditTask, LlmConfig, Project, Vulnerability
 from prompts.stage_prompts import get_stage_name
 from schemas import AuditCreate, AuditStageOut, AuditTaskOut, VulnerabilityOut
-from services.audit_engine import _severity_match_values
+from services.audit_engine import _coerce_stage_findings, _severity_match_values
 from services.audit_worker import clear_task_queue_state, mark_task_queued
+from services.audit_cleanup import (
+    delete_audit_task_records,
+    remove_audit_artifact_file,
+    resolve_audit_artifact_path,
+)
 
 router = APIRouter()
 
 VALID_STAGE_NUMS = set(range(1, 10))
+REMOVED_LIFECYCLE_SUMMARY_KEYS = {
+    "verification_stats",
+    "candidate_severity_stats",
+    "diff_stats",
+    "candidate_diff_stats",
+}
+
+
+def _strip_lifecycle_summary(summary):
+    if not isinstance(summary, dict):
+        return summary
+    sanitized = dict(summary)
+    for key in REMOVED_LIFECYCLE_SUMMARY_KEYS:
+        sanitized.pop(key, None)
+    return sanitized
+
+
+def _serialize_task(task: AuditTask) -> dict:
+    return {
+        "id": task.id,
+        "project_id": task.project_id,
+        "llm_config_id": task.llm_config_id,
+        "status": task.status,
+        "current_stage": task.current_stage,
+        "total_stages": task.total_stages,
+        "audit_mode": task.audit_mode,
+        "summary": _strip_lifecycle_summary(task.summary),
+        "error_message": task.error_message,
+        "created_at": task.created_at,
+        "completed_at": task.completed_at,
+    }
 
 
 async def _create_stage_records(db: AsyncSession, task_id: int):
@@ -47,18 +82,10 @@ async def _reset_stage_state(db: AsyncSession, task_id: int, stage_nums: list[in
 
     for stage in stages:
         if stage.artifact_path:
-            artifact_path = stage.artifact_path
-            if not os.path.isabs(artifact_path):
-                artifact_path = os.path.join(os.getcwd(), artifact_path)
-            artifact_path = os.path.abspath(artifact_path)
-            if os.path.isfile(artifact_path):
-                try:
-                    os.remove(artifact_path)
-                except OSError:
-                    pass
+            remove_audit_artifact_file(stage.artifact_path)
 
         stage.status = "pending"
-        stage.findings = []
+        stage.findings = {"vulnerabilities": []}
         stage.prompt_used = ""
         stage.llm_response = ""
         stage.compressed_summary = {}
@@ -72,19 +99,6 @@ async def _reset_stage_state(db: AsyncSession, task_id: int, stage_nums: list[in
             Vulnerability.stage_id.in_([stage.id for stage in stages]),
         )
     )
-
-
-async def _delete_audit_records(db: AsyncSession, task: AuditTask):
-    await db.execute(delete(Vulnerability).where(Vulnerability.task_id == task.id))
-    await db.execute(delete(AuditStage).where(AuditStage.task_id == task.id))
-    await db.delete(task)
-
-    report_dir = os.path.join("reports", str(task.id))
-    if os.path.isdir(report_dir):
-        shutil.rmtree(report_dir, ignore_errors=True)
-    artifact_dir = os.path.join("data", "stage_artifacts", str(task.id))
-    if os.path.isdir(artifact_dir):
-        shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
 async def _get_task_with_stages(db: AsyncSession, task_id: int) -> tuple[AuditTask, list[AuditStage]]:
@@ -136,7 +150,7 @@ async def create_audit(
     mark_task_queued(task, list(range(1, 10)))
     await db.commit()
 
-    return task
+    return _serialize_task(task)
 
 
 @router.get("", response_model=list[AuditTaskOut])
@@ -151,7 +165,7 @@ async def list_audits(
     if limit:
         query = query.limit(min(limit, 100))
     result = await db.execute(query)
-    return result.scalars().all()
+    return [_serialize_task(task) for task in result.scalars().all()]
 
 
 @router.get("/{task_id}", response_model=AuditTaskOut)
@@ -160,7 +174,7 @@ async def get_audit(task_id: int, db: AsyncSession = Depends(get_db)):
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(404, "审计任务不存在")
-    return task
+    return _serialize_task(task)
 
 
 @router.post("/{task_id}/cancel", response_model=AuditTaskOut)
@@ -185,7 +199,7 @@ async def cancel_audit(task_id: int, db: AsyncSession = Depends(get_db)):
 
     await db.commit()
     await db.refresh(task)
-    return task
+    return _serialize_task(task)
 
 
 @router.post("/{task_id}/retry", response_model=AuditTaskOut)
@@ -194,8 +208,8 @@ async def retry_audit(
     db: AsyncSession = Depends(get_db),
 ):
     task, stages = await _get_task_with_stages(db, task_id)
-    if task.status == "running":
-        raise HTTPException(400, "运行中的审计不能重试")
+    if task.status not in {"completed", "failed", "cancelled"}:
+        raise HTTPException(400, "只有已完成、失败或已取消的审计可以重试")
 
     rerun_stage_nums = [stage.stage_num for stage in stages if stage.status in {"failed", "completed", "cancelled"}]
     if not rerun_stage_nums:
@@ -214,7 +228,7 @@ async def retry_audit(
     await db.commit()
 
     await db.refresh(task)
-    return task
+    return _serialize_task(task)
 
 
 def _build_stage_debug_payload(stage: AuditStage) -> dict | None:
@@ -245,7 +259,7 @@ def _build_stage_debug_payload(stage: AuditStage) -> dict | None:
 
 
 def _build_stage_findings_preview(stage: AuditStage) -> list | dict:
-    findings = stage.findings if isinstance(stage.findings, dict) else {}
+    findings = _coerce_stage_findings(stage.findings)
     compressed = stage.compressed_summary if isinstance(stage.compressed_summary, dict) else {}
     vulnerabilities = findings.get("vulnerabilities", [])
     vulnerability_count = len(vulnerabilities) if isinstance(vulnerabilities, list) else 0
@@ -304,11 +318,10 @@ def _serialize_stage(stage: AuditStage, *, include_payloads: bool) -> dict:
     else:
         stage_name = stage.stage_name
 
-    findings = stage.findings if include_payloads else _build_stage_findings_preview(stage)
+    findings = _coerce_stage_findings(stage.findings) if include_payloads else _build_stage_findings_preview(stage)
     if include_payloads:
         debug_payload = _build_stage_debug_payload(stage)
         if debug_payload:
-            findings = findings if isinstance(findings, dict) else {"data": findings}
             findings.setdefault("_debug", debug_payload)
 
     return {
@@ -363,10 +376,7 @@ async def get_audit_stage_artifact(task_id: int, stage_num: int, db: AsyncSessio
     if not stage.artifact_path:
         raise HTTPException(404, "阶段产物不存在")
 
-    artifact_path = stage.artifact_path
-    if not os.path.isabs(artifact_path):
-        artifact_path = os.path.join(os.getcwd(), artifact_path)
-    artifact_path = os.path.abspath(artifact_path)
+    artifact_path = resolve_audit_artifact_path(stage.artifact_path)
 
     if not os.path.isfile(artifact_path):
         raise HTTPException(404, "阶段产物文件不存在")
@@ -389,23 +399,12 @@ async def get_audit_stage_artifact(task_id: int, stage_num: int, db: AsyncSessio
 async def get_audit_vulns(
     task_id: int,
     severity: str = None,
-    confirmed_status: str = None,
-    verification_state: str = None,
     db: AsyncSession = Depends(get_db),
 ):
     query = select(Vulnerability).where(Vulnerability.task_id == task_id)
     if severity:
         query = query.where(Vulnerability.severity.in_(_severity_match_values(severity)))
-    if confirmed_status:
-        query = query.where(Vulnerability.confirmed_status == confirmed_status)
-    if verification_state:
-        query = query.where(Vulnerability.verification_state == verification_state)
-    result = await db.execute(
-        query.order_by(
-            case((Vulnerability.verification_state == "verified", 0), else_=1),
-            Vulnerability.id,
-        )
-    )
+    result = await db.execute(query.order_by(Vulnerability.id))
     return result.scalars().all()
 
 
@@ -418,7 +417,7 @@ async def delete_audit(task_id: int, db: AsyncSession = Depends(get_db)):
     if task.status in {"pending", "running"}:
         raise HTTPException(400, "运行中的审计不能删除，请先取消")
 
-    await _delete_audit_records(db, task)
+    await delete_audit_task_records(db, task)
     await db.commit()
 
     return {"message": "审计已删除"}

@@ -68,47 +68,21 @@ if os.path.exists(REPORTS_DIR):
 async def get_stats():
     from database import async_session
     from models import Project, AuditTask, Vulnerability
-    from sqlalchemy import select, func, case
+    from sqlalchemy import select, func
 
     async with async_session() as session:
         project_count = (await session.execute(select(func.count(Project.id)))).scalar() or 0
         audit_count = (await session.execute(select(func.count(AuditTask.id)))).scalar() or 0
-        vuln_stats = (
+        vuln_count = (await session.execute(select(func.count(Vulnerability.id)))).scalar() or 0
+        crit_count = (
             await session.execute(
-                select(
-                    func.sum(
-                        case(
-                            (Vulnerability.verification_state == "verified", 1),
-                            else_=0,
-                        )
-                    ),
-                    func.sum(
-                        case(
-                            (Vulnerability.verification_state == "candidate", 1),
-                            else_=0,
-                        )
-                    ),
-                    func.sum(
-                        case(
-                            (
-                                (Vulnerability.verification_state == "verified")
-                                & Vulnerability.severity.in_(["Critical", "High"]),
-                                1,
-                            ),
-                            else_=0,
-                        )
-                    ),
-                )
+                select(func.count(Vulnerability.id)).where(Vulnerability.severity.in_(["Critical", "High"]))
             )
-        ).one()
-        vuln_count = vuln_stats[0] or 0
-        candidate_vuln_count = vuln_stats[1] or 0
-        crit_count = vuln_stats[2] or 0
+        ).scalar() or 0
 
         return {
             "project_count": project_count,
             "audit_count": audit_count,
             "vuln_count": vuln_count,
-            "candidate_vuln_count": candidate_vuln_count,
             "critical_count": crit_count,
         }

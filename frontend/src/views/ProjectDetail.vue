@@ -1,10 +1,9 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import {
   createAudit,
-  deleteAudit,
   getAudits,
   getLlmConfigs,
   getProject,
@@ -14,6 +13,8 @@ import {
 import FileTree from '../components/FileTree.vue'
 import { useI18n } from '../i18n'
 import { buildProjectCacheRecommendations } from '../utils/auditRecommendations'
+import { useAuditDeletion } from '../composables/useAuditDeletion'
+import { isAuditDeleteBlocked } from '../utils/auditTaskState'
 
 const props = defineProps({ id: [String, Number] })
 const router = useRouter()
@@ -44,9 +45,14 @@ const cacheScanStats = computed(() => {
   return value && typeof value === 'object'
     ? value
     : {
+        source_files_indexed: 0,
+        files_selected_for_audit: 0,
+        files_skipped_by_audit_file_budget: 0,
         chunk_count: 0,
         route_count: 0,
         rule_hit_count: 0,
+        truncated_by_audit_file_count: false,
+        truncated_by_code_chunks: false,
         truncated_by_total_chars: false,
         partial_audit: false,
         oversized_files_compacted: 0,
@@ -77,27 +83,7 @@ const loadProject = async () => {
 
 onMounted(loadProject)
 
-const removeAudit = async (audit) => {
-  if (audit.status === 'pending' || audit.status === 'running') {
-    ElMessage.warning(t('deleteAuditRunningBlocked'))
-    return
-  }
-
-  try {
-    await ElMessageBox.confirm(
-      t('deleteAuditConfirm', { id: audit.id }),
-      t('confirm'),
-      { type: 'warning' },
-    )
-    await deleteAudit(audit.id)
-    ElMessage.success(t('deleted'))
-    await loadProject()
-  } catch (e) {
-    if (e !== 'cancel') {
-      ElMessage.error(e.friendlyMessage || t('deleteFailed'))
-    }
-  }
-}
+const { removeAudit } = useAuditDeletion(loadProject)
 
 const openFile = async (path) => {
   currentFile.value = path
@@ -196,6 +182,12 @@ const handleRebuildCache = async () => {
           <el-descriptions-item :label="t('codeChunks')">
             {{ cacheScanStats.chunk_count || 0 }}
           </el-descriptions-item>
+          <el-descriptions-item :label="t('sourceFilesIndexed')">
+            {{ cacheScanStats.source_files_indexed || cacheScanStats.source_files_detected || 0 }}
+          </el-descriptions-item>
+          <el-descriptions-item :label="t('auditFilesSelected')">
+            {{ cacheScanStats.files_selected_for_audit || cacheScanStats.files_considered_for_chunks || 0 }}
+          </el-descriptions-item>
           <el-descriptions-item :label="t('staticRoutes')">
             {{ cacheScanStats.route_count || 0 }}
           </el-descriptions-item>
@@ -207,11 +199,13 @@ const handleRebuildCache = async () => {
           </el-descriptions-item>
         </el-descriptions>
         <div
-          v-if="cacheScanStats.partial_audit || cacheScanStats.truncated_by_total_chars"
+          v-if="cacheScanStats.partial_audit || cacheScanStats.truncated_by_audit_file_count || cacheScanStats.truncated_by_code_chunks || cacheScanStats.truncated_by_total_chars"
           class="warning-notice"
         >
           <div>{{ t('cachePartialNotice') }}</div>
           <div v-if="cacheScanStats.oversized_files_compacted">{{ t('cacheCompactedNotice', { count: cacheScanStats.oversized_files_compacted }) }}</div>
+          <div v-if="cacheScanStats.truncated_by_audit_file_count">{{ t('auditFilesTruncatedNotice', { selected: cacheScanStats.files_selected_for_audit || 0, skipped: cacheScanStats.files_skipped_by_audit_file_budget || 0 }) }}</div>
+          <div v-if="cacheScanStats.truncated_by_code_chunks">{{ t('codeChunksTruncatedNotice') }}</div>
           <div v-if="cacheScanStats.truncated_by_total_chars">{{ t('cacheTruncatedNotice') }}</div>
         </div>
       </el-card>
@@ -258,7 +252,7 @@ const handleRebuildCache = async () => {
                 size="small"
                 text
                 type="danger"
-                :disabled="row.status === 'pending' || row.status === 'running'"
+                :disabled="isAuditDeleteBlocked(row)"
                 @click="removeAudit(row)"
               >
                 {{ t('delete') }}

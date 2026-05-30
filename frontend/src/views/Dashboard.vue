@@ -2,8 +2,10 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { getStats, getAudits, getVulns, deleteAudit, deleteVuln } from '../api'
+import { getStats, getAudits, getVulns, deleteVuln } from '../api'
 import { useI18n } from '../i18n'
+import { useAuditDeletion } from '../composables/useAuditDeletion'
+import { isAuditDeleteBlocked } from '../utils/auditTaskState'
 
 const router = useRouter()
 const stats = ref({ project_count: 0, audit_count: 0, vuln_count: 0, critical_count: 0 })
@@ -31,27 +33,7 @@ const loadDashboard = async () => {
 
 onMounted(loadDashboard)
 
-const removeAudit = async (audit) => {
-  if (audit.status === 'pending' || audit.status === 'running') {
-    ElMessage.warning(t('deleteAuditRunningBlocked'))
-    return
-  }
-
-  try {
-    await ElMessageBox.confirm(
-      t('deleteAuditConfirm', { id: audit.id }),
-      t('confirm'),
-      { type: 'warning' },
-    )
-    await deleteAudit(audit.id)
-    ElMessage.success(t('deleted'))
-    await loadDashboard()
-  } catch (e) {
-    if (e !== 'cancel') {
-      ElMessage.error(e.friendlyMessage || t('deleteFailed'))
-    }
-  }
-}
+const { removeAudit } = useAuditDeletion(loadDashboard)
 
 const removeVuln = async (vuln) => {
   try {
@@ -121,7 +103,7 @@ const removeVuln = async (vuln) => {
                   size="small"
                   text
                   type="danger"
-                  :disabled="row.status === 'pending' || row.status === 'running'"
+                  :disabled="isAuditDeleteBlocked(row)"
                   @click="removeAudit(row)"
                 >
                   {{ t('delete') }}
@@ -146,11 +128,6 @@ const removeVuln = async (vuln) => {
                 <el-tag :color="severityColor(row.severity)" effect="dark" size="small" style="border: none">
                   {{ severityLabel(row.severity) }}
                 </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column prop="confirmed_status" :label="t('status')" width="100">
-              <template #default="{ row }">
-                <el-tag size="small">{{ statusLabel(row.confirmed_status) }}</el-tag>
               </template>
             </el-table-column>
             <el-table-column :label="t('action')" width="130">

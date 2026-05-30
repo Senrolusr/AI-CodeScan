@@ -2,32 +2,22 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { getVuln, updateVulnStatus } from '../api'
+import { getVuln } from '../api'
 import { useI18n } from '../i18n'
+import { localizeVulnerabilityLabel } from '../utils/vulnerabilityLabels'
 
 const props = defineProps({ id: [String, Number] })
 const router = useRouter()
 const {
+  locale,
   t,
-  statusLabel,
   severityLabel,
   severityColor,
-  diffStatusLabel,
   pocTagType,
-  verificationStateLabel,
-  verificationStateType,
 } = useI18n()
 
 const vuln = ref(null)
 const loading = ref(true)
-const statusUpdating = ref(false)
-
-const statusOptions = [
-  { labelKey: 'pending', value: 'pending' },
-  { labelKey: 'confirmed', value: 'confirmed' },
-  { labelKey: 'falsePositive', value: 'false_positive' },
-  { labelKey: 'fixed', value: 'fixed' },
-]
 
 onMounted(async () => {
   try {
@@ -39,19 +29,6 @@ onMounted(async () => {
     loading.value = false
   }
 })
-
-const changeStatus = async (status) => {
-  statusUpdating.value = true
-  try {
-    await updateVulnStatus(vuln.value.id, status)
-    vuln.value.confirmed_status = status
-    ElMessage.success(t('statusUpdated'))
-  } catch {
-    ElMessage.error(t('statusUpdateFailed'))
-  } finally {
-    statusUpdating.value = false
-  }
-}
 </script>
 
 <template>
@@ -65,16 +42,7 @@ const changeStatus = async (status) => {
           <h2 style="margin: 8px 0">{{ vuln.title }}</h2>
           <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
             <el-tag :color="severityColor(vuln.severity)" effect="dark" style="border: none">{{ severityLabel(vuln.severity) }}</el-tag>
-            <el-tag>{{ vuln.vuln_type }}</el-tag>
-            <el-tag :type="vuln.confirmed_status === 'confirmed' ? 'success' : vuln.confirmed_status === 'false_positive' ? 'info' : 'warning'">
-              {{ statusLabel(vuln.confirmed_status) }}
-            </el-tag>
-            <el-tag :type="vuln.diff_status === 'existing' ? 'info' : 'danger'">
-              {{ diffStatusLabel(vuln.diff_status) }}
-            </el-tag>
-            <el-tag :type="verificationStateType(vuln.verification_state)">
-              {{ verificationStateLabel(vuln.verification_state) }}
-            </el-tag>
+            <el-tag>{{ localizeVulnerabilityLabel(vuln.vuln_type, locale) }}</el-tag>
             <el-tag :type="pocTagType(vuln.poc_validation_status)">
               {{ vuln.poc_validation_status === 'valid' ? t('pocValid') : vuln.poc_validation_status === 'invalid' ? t('pocInvalid') : t('pocUnknown') }}
             </el-tag>
@@ -87,18 +55,6 @@ const changeStatus = async (status) => {
             </el-tag>
           </div>
         </div>
-        <el-dropdown @command="changeStatus">
-          <el-button type="primary" :loading="statusUpdating">
-            {{ t('updateStatus') }} <el-icon class="el-icon--right"><ArrowDown /></el-icon>
-          </el-button>
-          <template #dropdown>
-            <el-dropdown-menu>
-              <el-dropdown-item v-for="s in statusOptions" :key="s.value" :command="s.value">
-                {{ t(s.labelKey) }}
-              </el-dropdown-item>
-            </el-dropdown-menu>
-          </template>
-        </el-dropdown>
       </div>
 
       <el-row :gutter="20">
@@ -155,7 +111,7 @@ const changeStatus = async (status) => {
             <template #header><span style="font-weight: bold">{{ t('details') }}</span></template>
             <el-descriptions :column="1" size="small" border>
               <el-descriptions-item label="ID">#{{ vuln.id }}</el-descriptions-item>
-              <el-descriptions-item :label="t('type')">{{ vuln.vuln_type }}</el-descriptions-item>
+              <el-descriptions-item :label="t('type')">{{ localizeVulnerabilityLabel(vuln.vuln_type, locale) }}</el-descriptions-item>
               <el-descriptions-item :label="t('severity')">
                 <el-tag :color="severityColor(vuln.severity)" effect="dark" size="small" style="border: none">{{ severityLabel(vuln.severity) }}</el-tag>
               </el-descriptions-item>
@@ -167,14 +123,6 @@ const changeStatus = async (status) => {
                 <code v-if="vuln.endpoint">{{ vuln.endpoint }}</code>
                 <span v-else class="text-muted">{{ t('notAvailable') }}</span>
               </el-descriptions-item>
-              <el-descriptions-item :label="t('diffStatus')">
-                {{ diffStatusLabel(vuln.diff_status) }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('verificationState')">
-                <el-tag size="small" :type="verificationStateType(vuln.verification_state)">
-                  {{ verificationStateLabel(vuln.verification_state) }}
-                </el-tag>
-              </el-descriptions-item>
               <el-descriptions-item :label="t('confidence')">
                 <el-tag
                   size="small"
@@ -183,7 +131,6 @@ const changeStatus = async (status) => {
                   {{ vuln.confidence === 'high' ? t('confidenceHigh') : vuln.confidence === 'medium' ? t('confidenceMedium') : t('confidenceLow') }}
                 </el-tag>
               </el-descriptions-item>
-              <el-descriptions-item :label="t('status')">{{ statusLabel(vuln.confirmed_status) }}</el-descriptions-item>
             </el-descriptions>
           </el-card>
         </el-col>

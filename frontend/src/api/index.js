@@ -46,7 +46,6 @@ export const deleteAudit = (id) => api.delete(`/audits/${id}`)
 // Vulnerabilities
 export const getVulns = (params) => api.get('/vulnerabilities', { params })
 export const getVuln = (id) => api.get(`/vulnerabilities/${id}`)
-export const updateVulnStatus = (id, status) => api.patch(`/vulnerabilities/${id}`, { confirmed_status: status })
 export const deleteVuln = (id) => api.delete(`/vulnerabilities/${id}`)
 
 // Reports

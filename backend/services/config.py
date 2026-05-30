@@ -2,9 +2,11 @@
 
 # ── code_parser limits ──
 MAX_FILE_SIZE = 500 * 1024        # 500KB per source file
-MAX_FILES = 500                    # max files to scan per project
+MAX_TREE_FILES = 10_000           # max source/config files to index in the project tree
+MAX_AUDIT_SOURCE_FILES = 1_200    # max prioritized files to read into audit chunks
+MAX_CODE_CHUNKS = 2_000           # max chunks cached for staged audit selection
 TOTAL_CHARS_LIMIT = 2_000_000     # total character budget
-CACHE_SCHEMA_VERSION = 7
+CACHE_SCHEMA_VERSION = 8
 OVERSIZED_HEAD_CHARS = 1400
 OVERSIZED_TAIL_CHARS = 1000
 OVERSIZED_MAX_WINDOWS = 6

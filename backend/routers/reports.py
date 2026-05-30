@@ -8,6 +8,7 @@ from sqlalchemy import select
 from database import get_db
 from models import AuditTask, Vulnerability, AuditStage, Project
 from schemas import ReportExport
+from services.audit_cleanup import get_audit_report_dir
 from services.report_generator import generate_markdown, generate_pdf
 
 router = APIRouter()
@@ -31,7 +32,7 @@ async def export_report(data: ReportExport, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Vulnerability).where(Vulnerability.task_id == data.task_id))
     vulns = result.scalars().all()
 
-    report_dir = os.path.join("reports", str(data.task_id))
+    report_dir = get_audit_report_dir(data.task_id)
     os.makedirs(report_dir, exist_ok=True)
 
     if data.format == "md":
@@ -43,7 +44,7 @@ async def export_report(data: ReportExport, db: AsyncSession = Depends(get_db)):
 
     filename = os.path.basename(filepath)
     return {
-        "filepath": filepath,
+        "filepath": f"reports/{data.task_id}/{filename}",
         "filename": filename,
         "download_url": f"/api/reports/download/{data.task_id}/{filename}",
     }
@@ -51,7 +52,11 @@ async def export_report(data: ReportExport, db: AsyncSession = Depends(get_db)):
 
 @router.get("/download/{task_id}/{filename}")
 async def download_report(task_id: int, filename: str):
-    filepath = os.path.join("reports", str(task_id), filename)
+    safe_name = os.path.basename(filename)
+    if safe_name != filename:
+        raise HTTPException(400, "非法文件名")
+
+    filepath = os.path.join(get_audit_report_dir(task_id), safe_name)
     if not os.path.exists(filepath):
         raise HTTPException(404, "报告文件不存在")
 
@@ -61,13 +66,15 @@ async def download_report(task_id: int, filename: str):
 
 @router.get("/list/{task_id}")
 async def list_reports(task_id: int):
-    report_dir = os.path.join("reports", str(task_id))
+    report_dir = get_audit_report_dir(task_id)
     if not os.path.exists(report_dir):
         return []
 
     files = []
     for file_name in os.listdir(report_dir):
         filepath = os.path.join(report_dir, file_name)
+        if not os.path.isfile(filepath):
+            continue
         files.append(
             {
                 "filename": file_name,
@@ -84,7 +91,7 @@ async def delete_report(task_id: int, filename: str):
     if safe_name != filename:
         raise HTTPException(400, "非法文件名")
 
-    filepath = os.path.join("reports", str(task_id), safe_name)
+    filepath = os.path.join(get_audit_report_dir(task_id), safe_name)
     if not os.path.exists(filepath):
         raise HTTPException(404, "报告文件不存在")
 

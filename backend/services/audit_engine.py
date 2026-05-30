@@ -17,7 +17,9 @@ from database import async_session
 from models import AuditTask, AuditStage, Vulnerability, LlmConfig, Project
 from prompts.stage_prompts import SYSTEM_BASE, get_spec_label, get_stage_name, get_stage_prompt
 from services.code_parser import get_or_build_project_cache
+from services.audit_cleanup import get_stage_artifact_dir, resolve_audit_artifact_path
 from services.llm_client import call_llm_with_meta
+from vulnerability_normalization import normalize_vulnerability_fields
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,14 @@ def _is_auto_second_pass_enabled(task: AuditTask) -> bool:
     return bool(summary.get("auto_second_pass", True))
 
 
+def _coerce_stage_findings(findings):
+    if isinstance(findings, dict):
+        return findings
+    if isinstance(findings, list):
+        return {"vulnerabilities": findings}
+    return {}
+
+
 SEVERITY_ALIASES = {
     "critical": "Critical", "严重": "Critical",
     "high": "High", "高危": "High", "高": "High",
@@ -57,9 +67,7 @@ SEVERITY_ALIASES = {
     "info": "Info", "提示": "Info", "信息": "Info", "informational": "Info",
 }
 VALID_SEVERITIES = {"Critical", "High", "Medium", "Low", "Info"}
-VALID_VERIFICATION_STATES = {"verified", "candidate"}
 CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
-CONFIRMED_STATUS_RANK = {"confirmed": 4, "fixed": 3, "pending": 2, "false_positive": 1}
 
 
 def _normalize_severity(severity: str) -> str:
@@ -84,57 +92,17 @@ def _normalize_confidence(value: str | None) -> str:
     return "medium"
 
 
-def _normalize_verification_state(state: str | None) -> str:
-    value = str(state or "").strip().lower()
-    if value in VALID_VERIFICATION_STATES:
-        return value
-    return "candidate"
-
-
-def _is_verified_vulnerability(vuln) -> bool:
-    return _normalize_verification_state(getattr(vuln, "verification_state", None)) == "verified"
-
-
 async def _is_task_cancelled(session, task_id: int) -> bool:
     result = await session.execute(select(AuditTask.status).where(AuditTask.id == task_id))
     return result.scalar_one_or_none() == "cancelled"
 
 
-def _build_task_severity_stats(
-    vulns: list[Vulnerability],
-    *,
-    verification_state: str | None = None,
-) -> dict:
+def _build_task_severity_stats(vulns: list[Vulnerability]) -> dict:
     stats = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
     for vuln in vulns:
-        if verification_state and _normalize_verification_state(getattr(vuln, "verification_state", None)) != verification_state:
-            continue
         severity = getattr(vuln, "severity", None)
         if severity in stats:
             stats[severity] += 1
-    return stats
-
-
-def _build_task_diff_stats(
-    vulns: list[Vulnerability],
-    *,
-    verification_state: str | None = None,
-) -> dict:
-    stats = {"new": 0, "existing": 0}
-    for vuln in vulns:
-        if verification_state and _normalize_verification_state(getattr(vuln, "verification_state", None)) != verification_state:
-            continue
-        diff_status = getattr(vuln, "diff_status", None) or "existing"
-        if diff_status not in stats:
-            diff_status = "existing"
-        stats[diff_status] += 1
-    return stats
-
-
-def _build_task_verification_stats(vulns: list[Vulnerability]) -> dict:
-    stats = {"verified": 0, "candidate": 0}
-    for vuln in vulns:
-        stats[_normalize_verification_state(getattr(vuln, "verification_state", None))] += 1
     return stats
 
 
@@ -180,19 +148,20 @@ def _attach_stage_runtime_summary(
 def _build_task_rescan_recommendations(vulns: list[Vulnerability], scan_stats: dict) -> list[str]:
     recommendations: list[str] = []
     severity_stats = _build_task_severity_stats(vulns)
-    diff_stats = _build_task_diff_stats(vulns)
 
     if severity_stats.get("Critical", 0) or severity_stats.get("High", 0):
         recommendations.append("优先复核新增的严重和高危问题，先处理可直接形成利用链的入口点。")
 
-    if diff_stats.get("new", 0):
-        recommendations.append("本轮存在新增问题，建议下次复扫时优先对比新增问题是否已经修复，而不是从全部历史问题重新开始。")
-
     if scan_stats.get("oversized_files_compacted", 0):
         recommendations.append("本轮存在大文件补偿切片，建议对相关大文件做人工抽查，避免关键信息落在切片边界之外。")
 
-    if scan_stats.get("truncated_files", 0) or scan_stats.get("truncated_by_total_chars"):
-        recommendations.append("存在被截断文件或总代码截断，建议针对核心入口文件单独精扫，降低上下文截断带来的漏报风险。")
+    if (
+        scan_stats.get("truncated_files", 0)
+        or scan_stats.get("truncated_by_audit_file_count")
+        or scan_stats.get("truncated_by_code_chunks")
+        or scan_stats.get("truncated_by_total_chars")
+    ):
+        recommendations.append("存在审计文件数、代码块或总代码截断，建议针对核心入口文件单独精扫，降低上下文截断带来的漏报风险。")
 
     if int(scan_stats.get("rule_hit_count", 0) or 0) >= max(len(vulns) * 2, 20):
         recommendations.append("规则命中数明显高于入库漏洞数，建议把规则命中最集中的目录作为下一轮定向审计范围。")
@@ -238,15 +207,15 @@ async def _refresh_task_summary(
     vuln_result = await session.execute(select(Vulnerability).where(Vulnerability.task_id == task.id))
     vulns = list(vuln_result.scalars().all())
     effective_scan_stats = summary.get("scan_stats", {}) if isinstance(summary.get("scan_stats"), dict) else {}
-    summary["verification_stats"] = _build_task_verification_stats(vulns)
-    summary["severity_stats"] = _build_task_severity_stats(vulns, verification_state="verified")
-    summary["candidate_severity_stats"] = _build_task_severity_stats(vulns, verification_state="candidate")
-    summary["diff_stats"] = _build_task_diff_stats(vulns, verification_state="verified")
-    summary["candidate_diff_stats"] = _build_task_diff_stats(vulns, verification_state="candidate")
-    summary["rescan_recommendations"] = _build_task_rescan_recommendations(
-        [vuln for vuln in vulns if _is_verified_vulnerability(vuln)],
-        effective_scan_stats,
-    )
+    for stale_key in [
+        "verification_stats",
+        "candidate_severity_stats",
+        "diff_stats",
+        "candidate_diff_stats",
+    ]:
+        summary.pop(stale_key, None)
+    summary["severity_stats"] = _build_task_severity_stats(vulns)
+    summary["rescan_recommendations"] = _build_task_rescan_recommendations(vulns, effective_scan_stats)
     stage1_result = await session.execute(
         select(AuditStage).where(AuditStage.task_id == task.id, AuditStage.stage_num == 1)
     )
@@ -387,16 +356,16 @@ async def _run_stage(session, task, stage, llm_config, project, code_chunks, sta
             static_routes=static_routes,
         )
         normalized_response, policy_stats = _enforce_vulnerability_output_policy(stage, normalized_payload)
-        response = normalized_response.get("vulnerabilities", [])
+        response = normalized_response
         stage.findings = response
-        vulns_created = await _store_vulnerabilities(session, task, stage, response)
+        vulns_created = await _store_vulnerabilities(session, task, stage, response.get("vulnerabilities", []))
     else:
         stage.findings = {"raw_response": str(response)[:5000], "vulnerabilities": []}
 
     if isinstance(stage.findings, dict) and policy_stats["invalid_poc_vulnerabilities"]:
         stage.findings.setdefault(
             "_policy_note",
-            "已按 code_aduit.md 规则校验 POC；漏洞均已入库，但部分漏洞未提供与其类型匹配的合规 PoC。",
+            "已按 code_audit.md 规则校验 POC；漏洞均已入库，但部分漏洞未提供与其类型匹配的合规 PoC。",
         )
         stage.findings["_policy_stats"] = policy_stats
 
@@ -436,9 +405,10 @@ async def _apply_stage_payload(stage, stage_payload: dict, session=None, task=No
         response, _ = _enforce_vulnerability_output_policy(stage, response)
         stage.findings = response
     elif isinstance(response, list):
+        normalized_payload = {"vulnerabilities": response}
         if static_routes is not None and audit_memory is not None:
             normalized_payload = _hydrate_vulnerability_endpoints(
-                response={"vulnerabilities": response},
+                response=normalized_payload,
                 static_routes=static_routes,
                 audit_memory=audit_memory,
             )
@@ -448,8 +418,8 @@ async def _apply_stage_payload(stage, stage_payload: dict, session=None, task=No
                 static_routes=static_routes,
                 audit_memory=audit_memory,
             )
-            normalized_response, _ = _enforce_vulnerability_output_policy(stage, normalized_payload)
-            response = normalized_response.get("vulnerabilities", [])
+        normalized_response, _ = _enforce_vulnerability_output_policy(stage, normalized_payload)
+        response = normalized_response
         stage.findings = response
     else:
         stage.findings = {"raw_response": str(response)[:5000], "vulnerabilities": []}
@@ -1061,20 +1031,6 @@ async def _run_stage1_multi_pass(
     }
 
 
-def _derive_verification_state(stage_num: int, vuln_data: dict, poc_validation: dict) -> str:
-    accepted = bool(poc_validation.get("accepted"))
-    confidence = str(vuln_data.get("confidence", "medium") or "medium").strip().lower()
-    if confidence not in {"high", "medium"}:
-        return "candidate"
-
-    requirement = _classify_poc_requirement(stage_num, vuln_data)
-    if requirement == "none":
-        return "verified"
-
-    # 除了纯代码证据类问题外，其余类型仍需满足各自的 PoC 规范，才计入已验证。
-    return "verified" if accepted else "candidate"
-
-
 async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
     if stage.stage_num >= 10:
         return 0
@@ -1095,13 +1051,14 @@ async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
             }
         )] = vuln
 
-    prior_dedupe_keys = await _load_prior_project_vulnerability_keys(session, task)
     normalized_vulns = _merge_vulnerability_lists([], vulns_data if isinstance(vulns_data, list) else [])
 
     created = 0
     for vuln_data in normalized_vulns:
         if not isinstance(vuln_data, dict):
             continue
+        vuln_data = normalize_vulnerability_fields(vuln_data)
+        vuln_data["severity"] = _normalize_severity(vuln_data.get("severity", "Medium"))
         poc_raw = str(vuln_data.get("poc_raw", "") or "").strip()
         if not poc_raw:
             endpoint = str(vuln_data.get("endpoint", "") or "").strip()
@@ -1116,11 +1073,9 @@ async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
         poc_validation = vuln_data.get("_poc_validation") if isinstance(vuln_data.get("_poc_validation"), dict) else {}
         poc_validation_status = "valid" if poc_validation.get("accepted") else "invalid"
         poc_validation_note = str(poc_validation.get("reason", "") or "").strip()
-        verification_state = _derive_verification_state(stage.stage_num, vuln_data, poc_validation)
         description = vuln_data.get("description", "")
         vuln_key = _vuln_key(vuln_data)
         dedupe_key = _stable_vuln_dedupe_key(vuln_data)
-        diff_status = "existing" if dedupe_key in prior_dedupe_keys else "new"
         existing_vuln = existing.get(vuln_key)
         if existing_vuln:
             merged_existing = _merge_duplicate_vulnerability(
@@ -1138,8 +1093,6 @@ async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
                     "poc_validation_note": existing_vuln.poc_validation_note,
                     "description": existing_vuln.description,
                     "fix_suggestion": existing_vuln.fix_suggestion,
-                    "verification_state": existing_vuln.verification_state,
-                    "confirmed_status": existing_vuln.confirmed_status,
                     "confidence": existing_vuln.confidence,
                 },
                 {
@@ -1147,7 +1100,6 @@ async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
                     "poc_raw": poc_raw,
                     "poc_validation_status": poc_validation_status,
                     "poc_validation_note": poc_validation_note,
-                    "verification_state": verification_state,
                     "description": description,
                 },
             )
@@ -1165,9 +1117,6 @@ async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
             existing_vuln.description = merged_existing.get("description", existing_vuln.description)
             existing_vuln.fix_suggestion = merged_existing.get("fix_suggestion", existing_vuln.fix_suggestion)
             existing_vuln.dedupe_key = dedupe_key
-            existing_vuln.diff_status = diff_status
-            existing_vuln.verification_state = merged_existing.get("verification_state", verification_state)
-            existing_vuln.confirmed_status = merged_existing.get("confirmed_status", existing_vuln.confirmed_status)
             existing_vuln.confidence = merged_existing.get("confidence", existing_vuln.confidence)
             continue
         if vuln_data.get("_salvaged"):
@@ -1193,28 +1142,12 @@ async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
             description=description,
             fix_suggestion=vuln_data.get("fix_suggestion", ""),
             dedupe_key=dedupe_key,
-            diff_status=diff_status,
-            confirmed_status="pending",
-            verification_state=verification_state,
             confidence=vuln_data.get("confidence", "medium"),
         )
         session.add(vuln)
         existing[vuln_key] = vuln
         created += 1
     return created
-
-
-async def _load_prior_project_vulnerability_keys(session, task) -> set[str]:
-    result = await session.execute(
-        select(Vulnerability.dedupe_key)
-        .join(AuditTask, AuditTask.id == Vulnerability.task_id)
-        .where(
-            AuditTask.project_id == task.project_id,
-            Vulnerability.task_id != task.id,
-            Vulnerability.dedupe_key != "",
-        )
-    )
-    return {str(value).strip() for value in result.scalars().all() if str(value).strip()}
 
 
 def _response_meta_indicates_truncation(meta: dict | None) -> bool:
@@ -2601,6 +2534,7 @@ def _enforce_vulnerability_output_policy(stage, response: dict) -> tuple[dict, d
     for vuln in vulnerabilities:
         if not isinstance(vuln, dict):
             continue
+        vuln = normalize_vulnerability_fields(vuln)
         vuln["severity"] = _normalize_severity(vuln.get("severity", "Medium"))
         validation = _validate_vulnerability_poc(stage.stage_num, vuln)
         vuln["_poc_validation"] = validation
@@ -5909,9 +5843,8 @@ def _merge_compressed_summary(
 
 
 def _build_stage_artifact_path(task_id: int, stage_num: int) -> str:
-    artifact_dir = os.path.join("data", "stage_artifacts", str(task_id))
-    os.makedirs(artifact_dir, exist_ok=True)
-    return os.path.join(artifact_dir, f"stage_{stage_num}_passes.json")
+    os.makedirs(get_stage_artifact_dir(task_id), exist_ok=True)
+    return os.path.join("data", "stage_artifacts", str(task_id), f"stage_{stage_num}_passes.json")
 
 
 def _persist_stage_pass_artifact(
@@ -5940,7 +5873,7 @@ def _persist_stage_pass_artifact(
             "vulnerability_count": len(merged_response.get("vulnerabilities", [])) if isinstance(merged_response.get("vulnerabilities"), list) else 0,
         },
     }
-    with open(artifact_path, "w", encoding="utf-8") as f:
+    with open(resolve_audit_artifact_path(artifact_path), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
@@ -6021,7 +5954,7 @@ def _persist_single_stage_artifact(
         },
         "execution_meta": execution_meta or {},
     }
-    with open(artifact_path, "w", encoding="utf-8") as f:
+    with open(resolve_audit_artifact_path(artifact_path), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
@@ -6858,8 +6791,6 @@ def _vulnerability_merge_score(vuln: dict) -> int:
         return 0
     score = _severity_rank(vuln.get("severity")) * 100
     score += CONFIDENCE_RANK.get(_normalize_confidence(vuln.get("confidence")), 2) * 20
-    if _normalize_verification_state(vuln.get("verification_state")) == "verified":
-        score += 30
     if str(vuln.get("poc_validation_status", "") or "").strip().lower() == "valid":
         score += 20
     if str(vuln.get("code_snippet", "") or "").strip():
@@ -6891,18 +6822,6 @@ def _merge_duplicate_vulnerability(primary: dict, incoming: dict) -> dict:
         >= CONFIDENCE_RANK.get(_normalize_confidence(secondary.get("confidence")), 2)
         else secondary.get("confidence")
     )
-
-    verification_states = [
-        _normalize_verification_state(primary_copy.get("verification_state")),
-        _normalize_verification_state(incoming_copy.get("verification_state")),
-    ]
-    merged["verification_state"] = "verified" if "verified" in verification_states else "candidate"
-
-    confirmed_candidates = [
-        str(primary_copy.get("confirmed_status", "") or "").strip().lower(),
-        str(incoming_copy.get("confirmed_status", "") or "").strip().lower(),
-    ]
-    merged["confirmed_status"] = max(confirmed_candidates, key=lambda item: CONFIRMED_STATUS_RANK.get(item, 0)) or "pending"
 
     if str(primary_copy.get("poc_validation_status", "") or "").strip().lower() == "valid" or str(incoming_copy.get("poc_validation_status", "") or "").strip().lower() == "valid":
         merged["poc_validation_status"] = "valid"
@@ -7347,7 +7266,7 @@ def _build_audit_memory(stages: list[AuditStage], current_stage_num: int | None 
         if stage.status != "completed":
             continue
 
-        findings = stage.findings if isinstance(stage.findings, dict) else {}
+        findings = _coerce_stage_findings(stage.findings)
         compressed = stage.compressed_summary if isinstance(stage.compressed_summary, dict) else {}
         architecture_info = findings.get("architecture_info") if isinstance(findings.get("architecture_info"), dict) else {}
         if not architecture_info and isinstance(compressed.get("architecture_info"), dict):

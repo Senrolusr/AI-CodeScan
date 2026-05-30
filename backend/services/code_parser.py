@@ -4,7 +4,7 @@ import re
 import hashlib
 
 from services.config import (
-    MAX_FILE_SIZE, MAX_FILES, TOTAL_CHARS_LIMIT,
+    MAX_FILE_SIZE, MAX_TREE_FILES, MAX_AUDIT_SOURCE_FILES, MAX_CODE_CHUNKS, TOTAL_CHARS_LIMIT,
     CACHE_SCHEMA_VERSION, OVERSIZED_HEAD_CHARS, OVERSIZED_TAIL_CHARS,
     OVERSIZED_MAX_WINDOWS, OVERSIZED_WINDOW_RADIUS,
 )
@@ -909,7 +909,9 @@ def _build_analysis_strategy_fingerprint() -> str:
     payload = {
         "cache_schema_version": CACHE_SCHEMA_VERSION,
         "max_file_size": MAX_FILE_SIZE,
-        "max_files": MAX_FILES,
+        "max_tree_files": MAX_TREE_FILES,
+        "max_audit_source_files": MAX_AUDIT_SOURCE_FILES,
+        "max_code_chunks": MAX_CODE_CHUNKS,
         "total_chars_limit": TOTAL_CHARS_LIMIT,
         "oversized_head_chars": OVERSIZED_HEAD_CHARS,
         "oversized_tail_chars": OVERSIZED_TAIL_CHARS,
@@ -1610,11 +1612,18 @@ def warm_project_cache(project_id: int, project_dir: str, file_tree: list) -> di
     oversized_files = sum(1 for file_node in source_files if file_node.get("size", 0) > MAX_FILE_SIZE)
     scan_stats = {
         "source_files_detected": len(source_files),
+        "source_files_indexed": len(source_files),
         "oversized_files_skipped": oversized_files,
+        "audit_candidate_files": chunk_stats.get("audit_candidate_files", len(source_files)),
+        "files_selected_for_audit": chunk_stats.get("files_selected_for_audit", chunk_stats.get("files_considered", 0)),
+        "files_skipped_by_audit_file_budget": chunk_stats.get("files_skipped_by_audit_file_budget", 0),
         "files_considered_for_chunks": chunk_stats.get("files_considered", 0),
         "files_with_content": chunk_stats.get("files_with_content", 0),
+        "selected_high_signal_files": chunk_stats.get("selected_high_signal_files", 0),
         "chunk_count": chunk_stats.get("chunk_count", len(code_chunks)),
         "total_chars_loaded": chunk_stats.get("total_chars_loaded", 0),
+        "truncated_by_audit_file_count": bool(chunk_stats.get("truncated_by_audit_file_count")),
+        "truncated_by_code_chunks": bool(chunk_stats.get("truncated_by_code_chunks")),
         "truncated_by_total_chars": bool(chunk_stats.get("truncated_by_total_chars")),
         "oversized_files_compacted": chunk_stats.get("oversized_files_compacted", 0),
         "rule_hit_count": len(rule_hits),
@@ -1622,7 +1631,10 @@ def warm_project_cache(project_id: int, project_dir: str, file_tree: list) -> di
         "route_count": len(static_routes),
         "route_source_files": route_stats.get("files_scanned", 0),
         "partial_audit": bool(
-            chunk_stats.get("truncated_by_total_chars") or chunk_stats.get("oversized_files_compacted")
+            chunk_stats.get("truncated_by_audit_file_count")
+            or chunk_stats.get("truncated_by_code_chunks")
+            or chunk_stats.get("truncated_by_total_chars")
+            or chunk_stats.get("oversized_files_compacted")
         ),
     }
     cache_payload = {
@@ -1739,6 +1751,10 @@ def _build_tree(base_path: str, current_path: str, depth: int = 0, state: dict |
         return []
 
     for entry in entries:
+        if state["file_count"] >= MAX_TREE_FILES:
+            state["truncated_by_tree_files"] = True
+            break
+
         full_path = os.path.join(current_path, entry)
         rel_path = os.path.relpath(full_path, base_path).replace("\\", "/")
 
@@ -1754,7 +1770,8 @@ def _build_tree(base_path: str, current_path: str, depth: int = 0, state: dict |
                     "children": children,
                 })
         else:
-            if state["file_count"] >= MAX_FILES:
+            if state["file_count"] >= MAX_TREE_FILES:
+                state["truncated_by_tree_files"] = True
                 break
             ext = os.path.splitext(entry)[1].lower()
             if ext not in CODE_EXTENSIONS:
@@ -1866,21 +1883,128 @@ def _flatten_files(tree: list) -> list:
     return files
 
 
+def _select_audit_source_files(files: list[dict]) -> tuple[list[dict], dict]:
+    """Prioritize files for LLM-bound chunking without shrinking the project tree."""
+    scored: list[tuple[int, int, str, dict]] = []
+    for index, file_node in enumerate(files):
+        scored.append((_score_audit_source_file(file_node), index, str(file_node.get("path", "")), file_node))
+
+    scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+    selected = [file_node for _, _, _, file_node in scored[:MAX_AUDIT_SOURCE_FILES]]
+    selected_scores = [score for score, _, _, _ in scored[:MAX_AUDIT_SOURCE_FILES]]
+    return selected, {
+        "audit_candidate_files": len(files),
+        "files_selected_for_audit": len(selected),
+        "files_skipped_by_audit_file_budget": max(0, len(files) - len(selected)),
+        "truncated_by_audit_file_count": len(files) > len(selected),
+        "selected_high_signal_files": sum(1 for score in selected_scores if score >= 10),
+    }
+
+
+def _score_audit_source_file(file_node: dict) -> int:
+    path = str(file_node.get("path", "") or "").replace("\\", "/")
+    lowered = path.lower()
+    ext = str(file_node.get("extension", "") or "").lower()
+    size = int(file_node.get("size", 0) or 0)
+
+    score = 0
+    if _is_rule_noise_path(lowered):
+        score -= 30
+
+    extension_scores = {
+        ".py": 10, ".java": 10, ".php": 10, ".go": 10, ".rb": 10, ".cs": 10,
+        ".js": 9, ".ts": 9, ".jsx": 8, ".tsx": 8, ".vue": 8,
+        ".xml": 7, ".yaml": 7, ".yml": 7, ".json": 6, ".toml": 6, ".ini": 6,
+        ".cfg": 6, ".env": 7, ".sql": 7,
+        ".html": 5, ".htm": 5, ".css": 2, ".md": 1, ".txt": 1,
+    }
+    score += extension_scores.get(ext, 0)
+
+    high_signal_terms = [
+        "controller", "controllers", "action", "actions", "route", "router", "routes",
+        "api", "endpoint", "handler", "view", "views",
+        "auth", "login", "logout", "session", "cookie", "jwt", "token", "captcha",
+        "security", "permission", "authorize", "authorization", "role", "roles", "acl",
+        "middleware", "interceptor", "filter", "guard", "policy",
+        "upload", "download", "file", "template", "attachment", "storage",
+        "dao", "repository", "mapper", "model", "entity", "service", "manager",
+        "admin", "member", "user", "account", "tenant", "owner",
+        "config", "settings", "struts", "spring", "hibernate", "applicationcontext",
+        "pom.xml", "package.json", "requirements.txt", "composer.json", "gemfile",
+    ]
+    medium_signal_terms = [
+        "create", "update", "delete", "save", "edit", "search", "query", "execute",
+        "order", "payment", "amount", "price", "workflow", "approve", "reject",
+        "cache", "serializer", "deserialize", "crypto", "password", "secret",
+    ]
+    score += sum(4 for term in high_signal_terms if term in lowered)
+    score += sum(2 for term in medium_signal_terms if term in lowered)
+
+    if size > MAX_FILE_SIZE:
+        score += 3
+    elif size <= 4096:
+        score += 1
+
+    return score
+
+
+def _apply_chunk_budgets(new_chunks: list[dict], total_chars: int, current_chunk_count: int) -> tuple[list[dict], int, bool, bool]:
+    """Bound newly generated chunks before they are cached for LLM stages."""
+    remaining_chunk_budget = MAX_CODE_CHUNKS - current_chunk_count
+    if remaining_chunk_budget <= 0:
+        return [], total_chars, False, True
+
+    truncated_by_code_chunks = len(new_chunks) > remaining_chunk_budget
+    bounded_chunks: list[dict] = []
+    for chunk in new_chunks[:remaining_chunk_budget]:
+        content = str(chunk.get("content", "") or "")
+        remaining_chars = TOTAL_CHARS_LIMIT - total_chars
+        if remaining_chars <= 0:
+            return bounded_chunks, total_chars, True, truncated_by_code_chunks
+        if len(content) > remaining_chars:
+            if remaining_chars > 0:
+                bounded_chunks.append(
+                    _build_chunk(
+                        str(chunk.get("file_path") or ""),
+                        content[:remaining_chars],
+                        base_file_path=str(chunk.get("base_file_path") or chunk.get("file_path") or ""),
+                        chunk_type=str(chunk.get("chunk_type") or "partial"),
+                    )
+                )
+                total_chars += remaining_chars
+            return bounded_chunks, total_chars, True, truncated_by_code_chunks
+
+        bounded_chunks.append(chunk)
+        total_chars += len(content)
+
+    return bounded_chunks, total_chars, False, truncated_by_code_chunks
+
+
 def get_code_chunks(project_dir: str, file_tree: list, max_chunk_size: int = 3000, include_stats: bool = False) -> list[dict] | tuple[list[dict], dict]:
     """Read code files and split into chunks for LLM processing."""
     files = _flatten_files(file_tree)
+    selected_files, selection_stats = _select_audit_source_files(files)
     chunks = []
     total_chars = 0
     stats = {
+        **selection_stats,
         "files_considered": 0,
         "files_with_content": 0,
         "chunk_count": 0,
         "total_chars_loaded": 0,
         "truncated_by_total_chars": False,
+        "truncated_by_code_chunks": False,
         "oversized_files_compacted": 0,
     }
 
-    for f in files:
+    for f in selected_files:
+        if len(chunks) >= MAX_CODE_CHUNKS:
+            stats["truncated_by_code_chunks"] = True
+            break
+        if total_chars >= TOTAL_CHARS_LIMIT:
+            stats["truncated_by_total_chars"] = True
+            break
+
         full_path = os.path.join(project_dir, f["path"])
         stats["files_considered"] += 1
 
@@ -1894,22 +2018,26 @@ def get_code_chunks(project_dir: str, file_tree: list, max_chunk_size: int = 300
         stats["files_with_content"] += 1
 
         if f.get("size", 0) > MAX_FILE_SIZE:
-            sub_chunks = _build_oversized_file_chunks(f["path"], content)
-            if sub_chunks:
-                chunks.extend(sub_chunks)
+            new_chunks = _build_oversized_file_chunks(f["path"], content)
+            if new_chunks:
                 stats["oversized_files_compacted"] += 1
-            total_chars += sum(len(chunk.get("content", "")) for chunk in sub_chunks)
         elif len(content) > max_chunk_size:
-            sub_chunks = _split_file(f["path"], content, max_chunk_size)
-            chunks.extend(sub_chunks)
-            total_chars += len(content)
+            new_chunks = _split_file(f["path"], content, max_chunk_size)
         else:
-            chunks.append(_build_chunk(f["path"], content))
-            total_chars += len(content)
+            new_chunks = [_build_chunk(f["path"], content)]
 
-        stats["total_chars_loaded"] = total_chars
-        if total_chars > TOTAL_CHARS_LIMIT:
+        bounded_chunks, total_chars, truncated_by_total_chars, truncated_by_code_chunks = _apply_chunk_budgets(
+            new_chunks,
+            total_chars,
+            len(chunks),
+        )
+        chunks.extend(bounded_chunks)
+        if truncated_by_code_chunks:
+            stats["truncated_by_code_chunks"] = True
+        if truncated_by_total_chars:
             stats["truncated_by_total_chars"] = True
+        stats["total_chars_loaded"] = total_chars
+        if truncated_by_total_chars or truncated_by_code_chunks:
             break
 
     stats["chunk_count"] = len(chunks)
