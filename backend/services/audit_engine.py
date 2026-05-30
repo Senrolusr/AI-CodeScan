@@ -11,7 +11,7 @@ import os
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, select
+from sqlalchemy import case, delete, select
 
 from database import async_session
 from models import AuditTask, AuditStage, Vulnerability, LlmConfig, Project
@@ -83,6 +83,17 @@ def _severity_match_values(severity: str) -> list[str]:
     normalized = _normalize_severity(severity)
     aliases = [k for k, v in SEVERITY_ALIASES.items() if v == normalized]
     return list(set([normalized] + aliases))
+
+
+def _severity_order_expr(column):
+    return case(
+        (column.in_(_severity_match_values("Critical")), 5),
+        (column.in_(_severity_match_values("High")), 4),
+        (column.in_(_severity_match_values("Medium")), 3),
+        (column.in_(_severity_match_values("Low")), 2),
+        (column.in_(_severity_match_values("Info")), 1),
+        else_=0,
+    )
 
 
 def _normalize_confidence(value: str | None) -> str:

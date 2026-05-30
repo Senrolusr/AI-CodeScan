@@ -35,6 +35,13 @@ onMounted(loadDashboard)
 
 const { removeAudit } = useAuditDeletion(loadDashboard)
 
+const auditProgressText = (row) => {
+  const total = Number(row.total_stages || 9)
+  const rawCurrent = Number(row.current_stage || 0)
+  const current = row.status === 'completed' && rawCurrent <= 0 ? total : rawCurrent
+  return `${current}/${total}`
+}
+
 const removeVuln = async (vuln) => {
   try {
     await ElMessageBox.confirm(
@@ -85,14 +92,14 @@ const removeVuln = async (vuln) => {
           </template>
           <el-table :data="recentAudits" stripe size="small" v-if="recentAudits.length">
             <el-table-column prop="id" label="ID" width="60" />
-            <el-table-column prop="project_id" :label="t('project')" width="80" />
+            <el-table-column prop="name" :label="t('auditName')" min-width="150" show-overflow-tooltip />
             <el-table-column prop="status" :label="t('status')" width="100">
               <template #default="{ row }">
                 <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
               </template>
             </el-table-column>
             <el-table-column prop="current_stage" :label="t('stage')" width="70">
-              <template #default="{ row }">{{ row.current_stage }}/{{ row.total_stages }}</template>
+              <template #default="{ row }">{{ auditProgressText(row) }}</template>
             </el-table-column>
             <el-table-column :label="t('action')" width="130">
               <template #default="{ row }">

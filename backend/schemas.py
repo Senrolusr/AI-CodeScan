@@ -60,6 +60,7 @@ class LlmConfigOut(BaseModel):
 
 # ===== Audit =====
 class AuditCreate(BaseModel):
+    name: Optional[str] = None
     project_id: int
     llm_config_id: int
 
@@ -68,6 +69,7 @@ class AuditTaskOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    name: str
     project_id: int
     llm_config_id: int
     status: str

@@ -10,7 +10,7 @@ from database import get_db
 from models import AuditStage, AuditTask, LlmConfig, Project, Vulnerability
 from prompts.stage_prompts import get_stage_name
 from schemas import AuditCreate, AuditStageOut, AuditTaskOut, VulnerabilityOut
-from services.audit_engine import _coerce_stage_findings, _severity_match_values
+from services.audit_engine import _coerce_stage_findings, _severity_match_values, _severity_order_expr
 from services.audit_worker import clear_task_queue_state, mark_task_queued
 from services.audit_cleanup import (
     delete_audit_task_records,
@@ -39,13 +39,19 @@ def _strip_lifecycle_summary(summary):
 
 
 def _serialize_task(task: AuditTask) -> dict:
+    current_stage = task.current_stage or 0
+    total_stages = task.total_stages or 9
+    if task.status == "completed" and current_stage <= 0:
+        current_stage = total_stages
+
     return {
         "id": task.id,
+        "name": task.name or f"审计 #{task.id}",
         "project_id": task.project_id,
         "llm_config_id": task.llm_config_id,
         "status": task.status,
-        "current_stage": task.current_stage,
-        "total_stages": task.total_stages,
+        "current_stage": current_stage,
+        "total_stages": total_stages,
         "audit_mode": task.audit_mode,
         "summary": _strip_lifecycle_summary(task.summary),
         "error_message": task.error_message,
@@ -127,6 +133,11 @@ async def create_audit(
     if not llm_config:
         raise HTTPException(404, "模型配置不存在")
 
+    audit_name = (data.name or "").strip()
+    if not audit_name:
+        audit_name = f"{project.name} 审计 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    audit_name = audit_name[:255]
+
     summary_data = {
         "selected_stage_nums": list(range(1, 10)),
         "current_phase": 1,
@@ -134,6 +145,7 @@ async def create_audit(
     }
 
     task = AuditTask(
+        name=audit_name,
         project_id=data.project_id,
         llm_config_id=data.llm_config_id,
         status="paused",
@@ -404,7 +416,9 @@ async def get_audit_vulns(
     query = select(Vulnerability).where(Vulnerability.task_id == task_id)
     if severity:
         query = query.where(Vulnerability.severity.in_(_severity_match_values(severity)))
-    result = await db.execute(query.order_by(Vulnerability.id))
+    result = await db.execute(
+        query.order_by(_severity_order_expr(Vulnerability.severity).desc(), Vulnerability.id.desc())
+    )
     return result.scalars().all()
 
 

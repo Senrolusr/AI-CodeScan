@@ -103,6 +103,13 @@ async def _run_migrations(conn):
 
     task_columns = await conn.execute(text("PRAGMA table_info(audit_tasks)"))
     task_column_names = {row[1] for row in task_columns.fetchall()}
+    if "name" not in task_column_names:
+        await conn.execute(
+            text("ALTER TABLE audit_tasks ADD COLUMN name VARCHAR(255) DEFAULT ''")
+        )
+        await conn.execute(
+            text("UPDATE audit_tasks SET name = '审计 #' || id WHERE name IS NULL OR name = ''")
+        )
     if "audit_mode" not in task_column_names:
         await conn.execute(
             text("ALTER TABLE audit_tasks ADD COLUMN audit_mode VARCHAR(20) DEFAULT 'multi_agent'")

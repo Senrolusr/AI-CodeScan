@@ -34,6 +34,7 @@ class AuditTask(Base):
     __tablename__ = "audit_tasks"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), default="")
     project_id = Column(Integer, nullable=False, index=True)
     llm_config_id = Column(Integer, nullable=False, index=True)
     status = Column(String(50), default="pending")  # pending/running/completed/failed

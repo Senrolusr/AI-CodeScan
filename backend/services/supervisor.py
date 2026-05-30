@@ -44,6 +44,26 @@ from services.audit_engine import (
 logger = logging.getLogger(__name__)
 
 
+def _add_task_degradation(task: AuditTask, code: str, message: str, phase: str) -> None:
+    summary = dict(task.summary) if isinstance(task.summary, dict) else {}
+    notes = summary.get("degradation_notes", [])
+    if not isinstance(notes, list):
+        notes = []
+
+    note = {
+        "code": code,
+        "phase": phase,
+        "message": message,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if not any(isinstance(item, dict) and item.get("code") == code and item.get("message") == message for item in notes):
+        notes.append(note)
+
+    summary["degraded"] = True
+    summary["degradation_notes"] = notes[-20:]
+    task.summary = summary
+
+
 def _normalize_rerun_stage_nums(rerun_agents: list) -> list[int]:
     stage_nums = []
     for item in rerun_agents or []:
@@ -395,7 +415,7 @@ async def run_multi_agent_audit(task_id: int):
                 return
 
             task.status = "completed"
-            task.current_stage = 0
+            task.current_stage = task.total_stages or 9
             task.completed_at = datetime.now(timezone.utc)
             await _refresh_task_summary(session, task, scan_stats=scan_stats, rule_hits=rule_hits)
             await session.commit()
@@ -403,9 +423,20 @@ async def run_multi_agent_audit(task_id: int):
 
         except Exception as exc:
             logger.error("Multi-agent task %s failed: %s", task_id, exc)
+            _add_task_degradation(
+                task,
+                "multi_agent_audit_failed",
+                "审计主流程异常终止，任务已标记失败。",
+                "audit",
+            )
+            failed_at = datetime.now(timezone.utc)
             task.status = "failed"
             task.error_message = str(exc)[:2000]
-            task.completed_at = datetime.now(timezone.utc)
+            task.completed_at = failed_at
+            for stage in stages:
+                if stage.status == "running":
+                    stage.status = "failed"
+                    stage.completed_at = failed_at
             await session.commit()
 
 
@@ -467,7 +498,15 @@ async def _run_supervisor_planning(session, task, stages, llm_config, project, a
 
         agent_plan = _parse_structured_response(result["content"], result.get("meta"))
         if isinstance(agent_plan, dict) and agent_plan.get("parse_error"):
+            _add_task_degradation(
+                task,
+                "supervisor_planning_parse_error",
+                "Supervisor 规划响应解析失败，已使用默认审计计划继续执行。",
+                "planning",
+            )
             agent_plan = _build_default_plan(rule_hits, source_sink_hints)
+            agent_plan["_fallback"] = True
+            agent_plan["_fallback_reason"] = "planning_parse_error"
 
         plan_stage.findings = agent_plan if isinstance(agent_plan, dict) else {"raw": str(agent_plan)[:5000]}
         plan_stage.llm_response = result["content"][:10000]
@@ -484,9 +523,18 @@ async def _run_supervisor_planning(session, task, stages, llm_config, project, a
         plan_stage.status = "failed"
         plan_stage.completed_at = datetime.now(timezone.utc)
         plan_stage.llm_response = str(exc)[:2000]
+        _add_task_degradation(
+            task,
+            "supervisor_planning_failed",
+            "Supervisor 规划失败，已使用默认审计计划继续执行。",
+            "planning",
+        )
         await session.commit()
         logger.warning("Supervisor planning failed, using default plan: %s", exc)
-        return _build_default_plan(rule_hits, source_sink_hints)
+        fallback_plan = _build_default_plan(rule_hits, source_sink_hints)
+        fallback_plan["_fallback"] = True
+        fallback_plan["_fallback_reason"] = "planning_failed"
+        return fallback_plan
 
 
 async def _run_supervisor_review(session, task, stages, llm_config, audit_memory, agent_plan, extra_findings: dict | None = None):
@@ -514,6 +562,12 @@ async def _run_supervisor_review(session, task, stages, llm_config, audit_memory
 
         review = _parse_structured_response(result["content"], result.get("meta"))
         if isinstance(review, dict) and review.get("parse_error"):
+            _add_task_degradation(
+                task,
+                "supervisor_review_parse_error",
+                "Supervisor 复核响应解析失败，已跳过自动重跑并保留已有结果。",
+                "review",
+            )
             review = {"review_summary": "审核响应解析失败，已跳过自动重跑。", "request_rerun": False, "rerun_agents": []}
         if isinstance(review, dict) and isinstance(extra_findings, dict):
             # Feed rerun execution back into the review payload for frontend visibility.
@@ -533,6 +587,12 @@ async def _run_supervisor_review(session, task, stages, llm_config, audit_memory
         review_stage.status = "failed"
         review_stage.completed_at = datetime.now(timezone.utc)
         review_stage.llm_response = str(exc)[:2000]
+        _add_task_degradation(
+            task,
+            "supervisor_review_failed",
+            "Supervisor 复核失败，任务结果需要人工关注。",
+            "review",
+        )
         summary = dict(task.summary) if isinstance(task.summary, dict) else {}
         summary["review_outcome"] = {
             "status": "review_failed",
@@ -632,8 +692,14 @@ async def _execute_sub_agents(session, task, stages, llm_config, project, code_c
                     )
                     await _apply_stage_payload(agent_stage, stage_payload, session=agent_session, task=agent_task, static_routes=static_routes, audit_memory=audit_memory)
                     agent_stage.status = "completed"
-                except Exception:
+                except Exception as exc:
                     agent_stage.status = "failed"
+                    _add_task_degradation(
+                        agent_task,
+                        f"sub_agent_stage_{stage_num}_failed",
+                        f"子 Agent Stage {stage_num} 执行失败，已保留该阶段失败状态并继续复核。",
+                        "sub_agent",
+                    )
                     logger.exception("Sub-agent stage %s failed for task %s", stage_num, task.id)
                 agent_stage.completed_at = datetime.now(timezone.utc)
                 await agent_session.commit()
@@ -644,6 +710,16 @@ async def _execute_sub_agents(session, task, stages, llm_config, project, code_c
 
     for s in stages:
         await session.refresh(s)
+    await session.refresh(task)
+
+    for stage in stages:
+        if 2 <= stage.stage_num <= 9 and stage.status == "failed":
+            _add_task_degradation(
+                task,
+                f"sub_agent_stage_{stage.stage_num}_failed",
+                f"子 Agent Stage {stage.stage_num} 执行失败，已保留该阶段失败状态并继续复核。",
+                "sub_agent",
+            )
 
     skipped = agent_plan.get("skipped_agents", [])
     for skip_spec in skipped:

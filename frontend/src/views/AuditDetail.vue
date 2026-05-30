@@ -71,16 +71,25 @@ const archStage = computed(() => stageOneDetail.value || stageMap.value[1] || nu
 const planStage = computed(() => stageMap.value[-1])
 const auditStages = computed(() => stages.value.filter(s => s.stage_num >= 2 && s.stage_num <= 9))
 const reviewStage = computed(() => stageMap.value[-2])
+const taskSummary = computed(() => {
+  const summary = task.value?.summary
+  return summary && typeof summary === 'object' ? summary : {}
+})
+const displayCurrentStage = computed(() => {
+  const total = Number(task.value?.total_stages || 9)
+  const current = Number(task.value?.current_stage || 0)
+  return task.value?.status === 'completed' && current <= 0 ? total : current
+})
 
 const PHASE_KEY_MAP = { 1: 'phaseArch', 2: 'phasePlan', 3: 'phaseAudit', 4: 'phaseReview' }
 const currentPhase = computed(() => {
   if (!task.value) return 1
-  const summary = task.value.summary
+  const summary = taskSummary.value
   return (summary && typeof summary === 'object' && summary.current_phase) ? summary.current_phase : 1
 })
 const isMultiAgentPhaseMode = computed(() => {
   if (!task.value) return false
-  const summary = task.value.summary
+  const summary = taskSummary.value
   return summary && typeof summary === 'object' && summary.multi_agent_phase_mode
 })
 
@@ -108,7 +117,7 @@ const stageOneGapSummary = computed(() => {
     : { static_route_count: 0, confirmed_route_count: 0, missing_route_count: 0 }
 })
 const scanStats = computed(() => {
-  const value = task.value?.summary?.scan_stats
+  const value = taskSummary.value.scan_stats
   return value && typeof value === 'object'
     ? value
     : {
@@ -130,13 +139,13 @@ const scanStats = computed(() => {
         partial_audit: false,
       }
 })
-const ruleHitsPreview = computed(() => Array.isArray(task.value?.summary?.rule_hits_preview) ? task.value.summary.rule_hits_preview : [])
+const ruleHitsPreview = computed(() => Array.isArray(taskSummary.value.rule_hits_preview) ? taskSummary.value.rule_hits_preview : [])
 const tokenStats = computed(() => {
-  const ts = task.value?.summary?.token_stats
+  const ts = taskSummary.value.token_stats
   return ts && typeof ts === 'object' && ts.llm_call_count > 0 ? ts : null
 })
 const severityStats = computed(() => {
-  const summaryValue = task.value?.summary?.severity_stats
+  const summaryValue = taskSummary.value.severity_stats
   if (summaryValue && typeof summaryValue === 'object') {
     return {
       Critical: Number(summaryValue.Critical || 0),
@@ -149,7 +158,7 @@ const severityStats = computed(() => {
   return buildSeverityStats(vulns.value || [])
 })
 const rescanRecommendations = computed(() => {
-  const summaryValue = task.value?.summary?.rescan_recommendations
+  const summaryValue = taskSummary.value.rescan_recommendations
   if (Array.isArray(summaryValue) && summaryValue.length) return summaryValue
   return buildTaskRescanRecommendations({
     vulns: vulns.value || [],
@@ -157,6 +166,35 @@ const rescanRecommendations = computed(() => {
     locale: locale.value,
   })
 })
+const reviewOutcome = computed(() => {
+  const summaryOutcome = taskSummary.value.review_outcome
+  if (summaryOutcome && typeof summaryOutcome === 'object') return summaryOutcome
+  const stageOutcome = reviewStage.value?.findings?.review_closure
+  return stageOutcome && typeof stageOutcome === 'object' ? stageOutcome : null
+})
+const degradationNotes = computed(() => {
+  const notes = taskSummary.value.degradation_notes
+  if (!Array.isArray(notes)) return []
+  return notes
+    .filter(note => note && typeof note === 'object' && note.message)
+    .slice(-5)
+})
+const workerFailure = computed(() => {
+  const value = taskSummary.value.worker_failure
+  return value && typeof value === 'object' ? value : null
+})
+const hasQualityNotice = computed(() => !!reviewOutcome.value || !!workerFailure.value || degradationNotes.value.length > 0)
+const reviewNoticeClass = computed(() => {
+  const outcome = reviewOutcome.value
+  if (!outcome) return 'info-surface'
+  const status = String(outcome.status || '')
+  const nextAction = String(outcome.next_action || '')
+  const unresolved = Array.isArray(outcome.unresolved_stage_nums) ? outcome.unresolved_stage_nums : []
+  if (status.includes('failed') || nextAction === 'manual_review' || unresolved.length > 0) return 'danger-surface'
+  if (nextAction === 'rerun' || nextAction === 'monitor' || status.includes('notes') || status.includes('recommended')) return 'warning-surface'
+  return 'success-surface'
+})
+const reviewStageNumsText = (nums) => Array.isArray(nums) && nums.length ? reviewRerunStageText(nums) : '--'
 
 // 阶段列表默认走轻量接口，阶段一详情单独拉取，避免轮询时携带完整 payload。
 const archInfo = computed(() => {
@@ -171,7 +209,7 @@ const gapAnalysis = computed(() => archInfo.value._gap_analysis && typeof archIn
 
 // 预扫描概况
 const preDiscovery = computed(() => {
-  const pd = task.value?.summary?.pre_discovery
+  const pd = taskSummary.value.pre_discovery
   return pd && typeof pd === 'object' ? pd : null
 })
 const preDiscoveryTech = computed(() => {
@@ -444,7 +482,7 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
     <div v-if="task">
       <div class="page-header">
         <div>
-          <h2 style="margin: 0 0 4px">{{ t('auditDetailTitle', { id: task.id }) }}</h2>
+          <h2 style="margin: 0 0 4px">{{ task.name || t('auditDetailTitle', { id: task.id }) }}</h2>
           <el-tag :type="statusType(task.status)" effect="dark">{{ statusLabel(task.status) }}</el-tag>
           <span style="margin-left: 12px" class="text-muted">
             {{ t('projectWithDate', { projectId: task.project_id, createdAt: formatDateTime(task.created_at) }) }}
@@ -461,7 +499,56 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
       <!-- 进度概览 -->
       <el-card style="margin-bottom: 20px">
         <template #header><span class="card-title">{{ t('auditProgress') }}</span></template>
-        <StageProgress :stages="stages" :current="task.current_stage" />
+        <StageProgress :stages="stages" :current="displayCurrentStage" />
+      </el-card>
+
+      <!-- 质量提示 -->
+      <el-card v-if="hasQualityNotice" style="margin-bottom: 20px">
+        <template #header><span class="card-title">{{ t('qualityNotice') }}</span></template>
+        <div style="display: grid; gap: 10px">
+          <div v-if="workerFailure" class="danger-surface" style="padding: 10px 12px; line-height: 1.6">
+            <strong>{{ t('workerFailureNotice') }}：</strong>{{ workerFailure.message || task.error_message || '--' }}
+            <div v-if="workerFailure.failed_at" style="margin-top: 4px; font-size: 12px; opacity: 0.85">
+              {{ t('failedAt') }}：{{ formatDateTime(workerFailure.failed_at) }}
+            </div>
+          </div>
+
+          <div v-if="degradationNotes.length" class="warning-surface" style="padding: 10px 12px; line-height: 1.6">
+            <strong>{{ t('degradedAuditNotice') }}</strong>
+            <div
+              v-for="(note, index) in degradationNotes"
+              :key="`${note.code || 'degradation'}-${index}`"
+              style="margin-top: 4px"
+            >
+              {{ note.message }}
+              <span style="font-size: 12px; opacity: 0.8">
+                ({{ note.phase || '--' }} · {{ formatDateTime(note.created_at) }})
+              </span>
+            </div>
+          </div>
+
+          <div v-if="reviewOutcome" :class="reviewNoticeClass" style="padding: 10px 12px; line-height: 1.6">
+            <div>
+              <strong>{{ t('reviewConclusion') }}：</strong>{{ reviewOutcome.status_summary || t('notAvailable') }}
+            </div>
+            <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px">
+              <el-tag size="small" effect="plain">{{ t('reviewStatus') }}：{{ reviewOutcome.status || '--' }}</el-tag>
+              <el-tag size="small" effect="plain">{{ t('nextAction') }}：{{ reviewOutcome.next_action || '--' }}</el-tag>
+              <el-tag v-if="Number.isFinite(Number(reviewOutcome.questionable_count))" size="small" effect="plain">
+                {{ t('questionableFindings') }}：{{ reviewOutcome.questionable_count || 0 }}
+              </el-tag>
+              <el-tag v-if="Number.isFinite(Number(reviewOutcome.coverage_gap_count))" size="small" effect="plain">
+                {{ t('coverageGaps') }}：{{ reviewOutcome.coverage_gap_count || 0 }}
+              </el-tag>
+            </div>
+            <div v-if="reviewOutcome.unresolved_stage_nums?.length" style="margin-top: 6px">
+              <strong>{{ t('unresolvedStages') }}：</strong>{{ reviewStageNumsText(reviewOutcome.unresolved_stage_nums) }}
+            </div>
+            <div v-if="reviewOutcome.failed_stage_nums?.length" style="margin-top: 6px">
+              <strong>{{ t('failedStages') }}：</strong>{{ reviewStageNumsText(reviewOutcome.failed_stage_nums) }}
+            </div>
+          </div>
+        </div>
       </el-card>
 
       <!-- 多阶段控制 -->

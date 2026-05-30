@@ -52,6 +52,38 @@ async def finalize_task_queue_state(task_id: int) -> None:
         await session.commit()
 
 
+async def mark_task_worker_failed(task_id: int, message: str) -> None:
+    async with async_session() as session:
+        result = await session.execute(select(AuditTask).where(AuditTask.id == task_id))
+        task = result.scalar_one_or_none()
+        if not task or task.status in {"completed", "cancelled"}:
+            return
+
+        now = datetime.now(timezone.utc)
+        summary = _task_summary(task)
+        summary["worker_failure"] = {
+            "message": message[:500],
+            "failed_at": now.isoformat(),
+        }
+
+        task.status = "failed"
+        task.error_message = message[:2000]
+        task.completed_at = now
+        task.summary = dict(summary)
+
+        stage_result = await session.execute(
+            select(AuditStage).where(
+                AuditStage.task_id == task_id,
+                AuditStage.status == "running",
+            )
+        )
+        for stage in stage_result.scalars().all():
+            stage.status = "failed"
+            stage.completed_at = now
+
+        await session.commit()
+
+
 async def recover_incomplete_audits() -> None:
     async with async_session() as session:
         task_result = await session.execute(select(AuditTask).order_by(AuditTask.id))
@@ -141,9 +173,12 @@ async def audit_worker_loop(stop_event: asyncio.Event) -> None:
             from services.supervisor import run_multi_agent_audit
             await asyncio.wait_for(run_multi_agent_audit(task_id), timeout=WORKER_TASK_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
+            message = f"审计任务超过 {WORKER_TASK_TIMEOUT_SECONDS} 秒未完成，已由 Worker 标记失败"
             logger.error("Audit worker timed out after %ss on task %s", WORKER_TASK_TIMEOUT_SECONDS, task_id)
+            await mark_task_worker_failed(task_id, message)
         except Exception:
             logger.exception("Audit worker failed while executing task %s", task_id)
+            await mark_task_worker_failed(task_id, "审计 Worker 执行异常，任务已标记失败")
         finally:
             await finalize_task_queue_state(task_id)
 

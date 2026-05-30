@@ -30,6 +30,7 @@ const rebuildingCache = ref(false)
 const auditDialog = ref(false)
 const llmConfigs = ref([])
 const selectedLlmConfig = ref(null)
+const auditName = ref('')
 const creatingAudit = ref(false)
 const existingAudits = ref([])
 
@@ -85,6 +86,13 @@ onMounted(loadProject)
 
 const { removeAudit } = useAuditDeletion(loadProject)
 
+const auditProgressText = (row) => {
+  const total = Number(row.total_stages || 9)
+  const rawCurrent = Number(row.current_stage || 0)
+  const current = row.status === 'completed' && rawCurrent <= 0 ? total : rawCurrent
+  return `${current}/${total} ${t('stages')}`
+}
+
 const openFile = async (path) => {
   currentFile.value = path
   fileLoading.value = true
@@ -107,6 +115,7 @@ const openAuditDialog = async () => {
     return
   }
   selectedLlmConfig.value = llmConfigs.value.find(c => c.is_default)?.id || llmConfigs.value[0]?.id
+  auditName.value = ''
   auditDialog.value = true
 }
 
@@ -118,6 +127,7 @@ const startAudit = async () => {
   creatingAudit.value = true
   try {
     const res = await createAudit({
+      name: auditName.value.trim() || undefined,
       project_id: parseInt(props.id, 10),
       llm_config_id: selectedLlmConfig.value,
     })
@@ -234,13 +244,14 @@ const handleRebuildCache = async () => {
         </template>
         <el-table :data="existingAudits" stripe size="small">
           <el-table-column prop="id" label="ID" width="60" />
+          <el-table-column prop="name" :label="t('auditName')" min-width="160" show-overflow-tooltip />
           <el-table-column prop="status" :label="t('status')" width="120">
             <template #default="{ row }">
               <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
             </template>
           </el-table-column>
           <el-table-column :label="t('progress')" width="140">
-            <template #default="{ row }">{{ row.current_stage || 0 }}/{{ row.total_stages }} {{ t('stages') }}</template>
+            <template #default="{ row }">{{ auditProgressText(row) }}</template>
           </el-table-column>
           <el-table-column prop="created_at" :label="t('createdAt')" width="180">
             <template #default="{ row }">{{ formatDate(row.created_at) }}</template>
@@ -284,6 +295,14 @@ const handleRebuildCache = async () => {
 
       <el-dialog v-model="auditDialog" :title="t('startCodeAudit')" width="560px">
         <el-form label-width="110px">
+          <el-form-item :label="t('auditName')">
+            <el-input
+              v-model="auditName"
+              maxlength="255"
+              show-word-limit
+              :placeholder="t('auditNamePlaceholder')"
+            />
+          </el-form-item>
           <el-form-item :label="t('llmConfig')">
             <el-select v-model="selectedLlmConfig" style="width: 100%">
               <el-option

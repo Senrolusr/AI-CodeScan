@@ -4,7 +4,7 @@ from sqlalchemy import select
 from database import get_db
 from models import Vulnerability
 from schemas import VulnerabilityOut
-from services.audit_engine import _severity_match_values
+from services.audit_engine import _severity_match_values, _severity_order_expr
 
 router = APIRouter()
 
@@ -21,7 +21,7 @@ async def list_vulnerabilities(
         query = query.where(Vulnerability.task_id == task_id)
     if severity:
         query = query.where(Vulnerability.severity.in_(_severity_match_values(severity)))
-    query = query.order_by(Vulnerability.id.desc())
+    query = query.order_by(_severity_order_expr(Vulnerability.severity).desc(), Vulnerability.id.desc())
     if limit:
         query = query.limit(min(limit, 200))
     result = await db.execute(query)
