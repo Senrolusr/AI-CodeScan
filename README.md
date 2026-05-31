@@ -3,60 +3,57 @@
 [![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi)](https://fastapi.tiangolo.com/)
 [![Vue](https://img.shields.io/badge/Vue-3.5-4FC08D?logo=vue.js)](https://vuejs.org/)
-[![Vite](https://img.shields.io/badge/Vite-8.0-646CFF?logo=vite)](https://vitejs.dev/)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![Vite](https://img.shields.io/badge/Vite-8.0-646CFF?logo=vite)](https://vite.dev/)
 
-CodeScan 是一个基于大语言模型的多 Agent 代码安全审计平台，采用前后端分离架构。用户上传源码 ZIP 后，系统会先做项目解析、静态规则预筛和缓存构建，再自动进入完整审计流程，最终输出漏洞列表以及 Markdown/PDF 报告。
+CodeScan 是一个基于大语言模型的多 Agent 代码安全审计平台，采用前后端分离架构。用户上传源码 ZIP 后，系统会先完成项目解析、静态规则预筛、路由抽取和审计缓存构建，再自动执行完整审计流程，最终输出漏洞列表和 HTML 审计报告。
 
 ## 核心能力
 
-- 自动审计：点击“开始审计”后自动完成全流程，不需要再手动执行下一阶段
-- 自定义审计任务：创建审计时可填写审计名称，留空则自动使用项目名和创建时间
-- 多 Agent 协同：Supervisor 负责规划与复核，子 Agent 按安全领域并行审计
-- 分阶段可视化：可查看 Phase 进度、阶段产物、调试信息、漏洞统计和质量提示
-- 路由与架构提取：自动识别技术栈、入口点、路由、认证边界和关键数据流
-- 漏洞风险排序：漏洞列表默认按危险程度排序，优先展示 Critical 和 High 风险
-- 漏洞生命周期管理：支持确认、误报、已修复、验证状态和跨任务去重
-- 流程异常可观测：Worker 超时、Supervisor 降级、子 Agent 失败会记录到审计详情
-- 报告导出：支持 Markdown 和 PDF
+- 自动审计：创建审计任务后由后台 Worker 自动执行完整流程。
+- 多 Agent 协同：Supervisor 负责任务规划与复核，子 Agent 按安全领域并行审计。
+- 分阶段可视化：展示 Phase 进度、阶段产物、调试信息、覆盖摘要和质量提示。
+- 路由与架构提取：识别技术栈、入口点、路由、认证边界和关键数据流。
+- 风险排序：漏洞列表默认按风险等级排序，优先展示 Critical 和 High。
+- 流程异常可观测：Worker 超时、Supervisor 降级、子 Agent 失败会写入任务详情。
+- HTML 报告导出：报告按漏洞类型分组，每组内部按风险等级展示。
 
 ## 审计流程
 
-平台内部仍按四个 Phase 执行，但已经改为自动串行执行：
+平台按四个 Phase 自动串行推进：
 
-1. Phase 1: 架构分析
-   识别技术栈、路由、认证机制、模块边界和高价值审计范围。
-2. Phase 2: Supervisor 规划
-   基于静态证据决定运行哪些子 Agent，并给出聚焦文件、函数、路由。规划解析失败时会使用默认计划继续执行，并记录降级提示。
-3. Phase 3: 子 Agent 并行审计
-   按 9 个安全方向执行深度审计，默认最多 3 个子 Agent 并发。
-4. Phase 4: Supervisor 复核
-   汇总结果、审查覆盖缺口、处理补充审计建议并生成最终结论。复核建议重跑时会自动重跑对应子 Agent，并在审计详情中展示复核结论、未收敛阶段和失败阶段。
+1. Phase 1：架构分析
+   识别技术栈、路由、认证机制、模块边界、关键数据流和高价值审计范围。
+2. Phase 2：Supervisor 规划
+   基于阶段一结果、静态规则命中和 source-sink 线索决定执行哪些子 Agent。
+3. Phase 3：子 Agent 并行审计
+   按 8 个漏洞方向执行深度审计，默认最多 3 个子 Agent 并发。
+4. Phase 4：Supervisor 复核
+   汇总结果、检查覆盖缺口、评估发现质量，并在需要时自动重跑指定阶段。
 
-审计任务完成后，进度会保持在 `9/9`。如果 Worker 超时或执行异常，任务会被标记为失败，运行中的阶段会同步收口为失败状态，错误信息会展示在审计详情页的“质量提示”中。
+任务完成后进度保持在 `9/9`。如果 Worker 超时或执行异常，任务会被标记为失败，错误原因会展示在审计详情页的质量提示中。
 
 ## 9 个审计阶段
 
 | Stage | 名称 | 审计范围 |
 |---|---|---|
-| 1 | 架构理解与入口梳理 | 技术栈、路由、认证、数据流、入口点 |
-| 2 | RCE 与危险执行 | `exec` / `eval` / 反序列化 / 模板注入 / 代码执行 |
-| 3 | 注入类漏洞 | SQL / NoSQL / 命令 / LDAP 注入 |
-| 4 | XSS 与输出编码 | 反射型 / 存储型 / DOM 型 XSS |
-| 5 | 认证与会话安全 | JWT / Session / OAuth / CSRF / 暴力破解 |
-| 6 | 授权与访问控制 | 水平越权 / 垂直越权 / IDOR / 权限绕过 |
-| 7 | 配置与依赖安全 | 硬编码密钥 / CORS / 调试模式 / 危险依赖 |
-| 8 | 文件操作安全 | 任意上传 / 下载 / 路径遍历 / Zip Slip |
-| 9 | 业务逻辑安全 | 状态机缺陷 / 竞态 / 金额或流程滥用 |
+| 1 | 项目架构理解与映射 | 技术栈、路由、认证、数据流、入口点 |
+| 2 | RCE 与危险执行审计 | `exec` / `eval` / 反序列化 / 模板注入 / 代码执行 |
+| 3 | 注入类漏洞审计 | SQL / NoSQL / 命令 / LDAP / 模板注入 |
+| 4 | XSS 与输出编码审计 | 反射型 / 存储型 / DOM 型 XSS |
+| 5 | 认证与会话安全审计 | JWT / Session / OAuth / CSRF / 暴力破解 |
+| 6 | 授权与访问控制审计 | 水平越权 / 垂直越权 / IDOR / 权限绕过 |
+| 7 | 配置与依赖安全审计 | 硬编码密钥 / CORS / Debug 模式 / 危险依赖 |
+| 8 | 文件操作安全审计 | 任意上传 / 下载 / 路径遍历 / Zip Slip |
+| 9 | 业务逻辑安全审计 | 状态机缺陷 / 竞争条件 / 金额或流程滥用 |
 
 ## 技术栈
 
 | 层 | 技术 |
 |---|---|
-| 后端 | Python 3.11+, FastAPI, SQLAlchemy Async, SQLite |
-| 前端 | Vue 3, Vite 8, Element Plus, Pinia, Vue Router |
-| LLM | OpenAI 兼容 API |
-| 报告 | Markdown, WeasyPrint, Pillow |
+| 后端 | Python 3.11+、FastAPI、SQLAlchemy Async、SQLite |
+| 前端 | Vue 3、Vite、Element Plus、Pinia、Vue Router |
+| LLM | OpenAI 兼容 API，支持 Chat Completions 和 Responses 接口模式 |
+| 报告 | HTML |
 
 ## 项目结构
 
@@ -77,7 +74,6 @@ codescan/
 │   │   ├── audit_engine.py
 │   │   ├── audit_worker.py
 │   │   ├── code_parser.py
-│   │   ├── config.py
 │   │   ├── llm_client.py
 │   │   ├── report_generator.py
 │   │   └── supervisor.py
@@ -107,14 +103,9 @@ codescan/
 - Node.js 20+
 - Windows / Linux / macOS
 
-### 方式一：Windows 一键启动
+### Windows 一键启动
 
-仓库根目录提供了启动脚本：
-
-- `start-platform.ps1`
-- `start-platform.bat`
-
-PowerShell 用法：
+仓库根目录提供启动脚本：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start-platform.ps1
@@ -123,9 +114,9 @@ powershell -ExecutionPolicy Bypass -File .\start-platform.ps1
 脚本会：
 
 - 检查 `python` 和 `npm.cmd`
-- 在依赖缺失时自动安装后端和前端依赖
-- 分别启动后端 `http://127.0.0.1:8000`
-- 分别启动前端 `http://127.0.0.1:3000`
+- 在依赖缺失时安装后端和前端依赖
+- 启动后端 `http://127.0.0.1:8000`
+- 启动前端 `http://127.0.0.1:3000`
 
 预演模式：
 
@@ -133,7 +124,7 @@ powershell -ExecutionPolicy Bypass -File .\start-platform.ps1
 powershell -ExecutionPolicy Bypass -File .\start-platform.ps1 -DryRun
 ```
 
-### 方式二：手动启动
+### 手动启动
 
 安装依赖：
 
@@ -165,38 +156,15 @@ npm run dev -- --host 127.0.0.1 --port 3000
 - 后端：`http://127.0.0.1:8000`
 - API 文档：`http://127.0.0.1:8000/docs`
 
-## 仓库清理状态
-
-仓库只保留源码、依赖清单和必要占位文件，不提交本地依赖、构建产物、数据库、日志、上传源码或导出报告。首次运行或拉取到新环境后需要重新安装依赖。
-
-已忽略的运行时目录和文件包括：
-
-- `frontend/node_modules/`
-- `frontend/dist/`
-- `backend/data/audit.db`
-- `backend/data/audit.log`
-- `backend/data/project_cache/`
-- `backend/data/stage_artifacts/`
-- `backend/uploads/`
-- `backend/reports/`
-
-如需清空本地运行数据，可删除以上目录或文件；应用启动时会自动创建必要目录和 SQLite 数据库。
-
 ## 使用流程
 
-1. 启动前后端
-2. 进入“模型配置”页面，添加 LLM 配置并测试连通性
-3. 进入“项目”页面，上传源码 ZIP
-4. 打开项目详情，点击“开始审计”，可按需填写审计名称
-5. 审计任务会自动进入完整流程，无需手动推进 Phase
-6. 在审计详情页查看：
-   - Phase 进度
-   - 质量提示、复核结论和降级记录
-   - Stage 1 架构明细
-   - 各阶段漏洞结果，默认按危险程度排序
-   - Token 用量、规则命中、覆盖摘要
-7. 对漏洞执行状态更新：待处理、已确认、误报、已修复
-8. 导出 Markdown 或 PDF 报告
+1. 启动前后端。
+2. 进入“模型配置”页面，添加 LLM 配置并测试连通性。
+3. 进入“项目”页面，上传源码 ZIP。
+4. 打开项目详情，点击“开始审计”，可按需填写审计名称。
+5. 审计任务会自动执行完整流程，无需手动推进阶段。
+6. 在审计详情页查看 Phase 进度、质量提示、阶段结果、漏洞列表和规则命中预览。
+7. 审计完成后导出 HTML 报告。
 
 ## API 模块
 
@@ -233,22 +201,20 @@ npm run dev -- --host 127.0.0.1 --port 3000
 
 说明：
 
-- 创建审计任务后会自动入队并执行完整流程
-- 创建审计任务支持可选 `name` 字段；不传或为空时自动生成审计名称
-- 任务返回体包含 `name`、进度、摘要、错误信息和完成时间
-- `GET /{task_id}/vulns` 默认按危险程度排序，同等级按较新的记录优先
-- 不再提供手动“执行下一阶段”的接口
+- 创建审计任务后会自动入队并执行完整流程。
+- 创建审计任务支持可选 `name` 字段；为空时自动生成审计名称。
+- `GET /{task_id}/vulns` 默认按风险等级排序，同等级按较新的记录优先。
+- 不再提供手动“执行下一阶段”的接口。
 
 ### 漏洞管理 `/api/vulnerabilities`
 
 - `GET /`
 - `GET /{vuln_id}`
-- `PATCH /{vuln_id}`
 - `DELETE /{vuln_id}`
 
 说明：
 
-- 全局漏洞列表默认按危险程度排序，同等级按较新的记录优先
+- 全局漏洞列表默认按风险等级排序，同等级按较新的记录优先。
 
 ### 报告管理 `/api/reports`
 
@@ -256,6 +222,11 @@ npm run dev -- --host 127.0.0.1 --port 3000
 - `GET /download/{task_id}/{filename}`
 - `GET /list/{task_id}`
 - `DELETE /{task_id}/{filename}`
+
+说明：
+
+- `POST /export` 仅支持 `format: "html"`。
+- HTML 报告会按漏洞类型分组输出，每个类型内按风险等级和标题排序。
 
 ## 关键配置
 
@@ -267,42 +238,31 @@ npm run dev -- --host 127.0.0.1 --port 3000
 | `WORKER_TASK_TIMEOUT_SECONDS` | 3600 | 单次审计任务超时时间 |
 | `WORKER_POLL_INTERVAL_SECONDS` | 2.0 | Worker 轮询间隔 |
 | `MAX_FILE_SIZE` | 500KB | 单个源码文件大小上限 |
-| `MAX_TREE_FILES` | 10,000 | 单项目最多索引源码/配置文件数 |
+| `MAX_TREE_FILES` | 10,000 | 单项目最大索引源码和配置文件数 |
 | `MAX_AUDIT_SOURCE_FILES` | 1,200 | 进入审计切片的高优先级文件上限 |
 | `MAX_CODE_CHUNKS` | 2,000 | 缓存给阶段选择器使用的代码块上限 |
 | `TOTAL_CHARS_LIMIT` | 2,000,000 | 总字符预算 |
 
-## PDF 导出依赖
+## 仓库清理状态
 
-PDF 优先通过 WeasyPrint 生成，失败时回退到 Pillow。
+仓库只保留源码、依赖清单和必要占位文件，不提交本地依赖、构建产物、数据库、日志、上传源码或导出报告。运行时目录包括：
 
-Ubuntu / Debian:
+- `frontend/node_modules/`
+- `frontend/dist/`
+- `backend/data/audit.db`
+- `backend/data/audit.log`
+- `backend/data/project_cache/`
+- `backend/data/stage_artifacts/`
+- `backend/uploads/`
+- `backend/reports/`
 
-```bash
-apt install libpango-1.0-0 libcairo2 libgdk-pixbuf2.0-0 libffi-dev
-```
-
-CentOS / RHEL:
-
-```bash
-yum install pango cairo gdk-pixbuf2 libffi
-```
-
-Windows:
-
-- 通常安装 Python 包即可
-- 如需更稳定的中文渲染，建议安装中文字体，例如微软雅黑
+如需清空本地运行数据，可删除以上目录或文件；应用启动时会自动创建必要目录和 SQLite 数据库。
 
 ## 注意事项
 
-- Windows 下如果 `npm` 执行策略受限，请使用 `npm.cmd`
-- 默认数据库为 SQLite，位于 `backend/data/audit.db`
-- LLM 配置、项目记录、审计任务和漏洞状态存储在本地 SQLite 数据库中；清理 `backend/data/audit.db` 会重置这些配置数据
-- 大项目上传后会先做预扫描和缓存构建，首次分析可能需要几十秒
-- 多 Agent 模式默认最多 3 个子 Agent 并发调用 LLM，请确保模型服务端允许足够并发
-- 审计 Worker 内置超时保护；超时或异常会把任务标记为失败，并在审计详情中保留失败原因
-- Supervisor 规划或复核失败时，系统会尽量使用默认计划或保留已有结果继续收口，但这类降级会显示在“质量提示”中，建议人工复核
-
-## 许可证
-
-[MIT](LICENSE)
+- Windows 下如果 `npm` 执行策略受限，请使用 `npm.cmd`。
+- 默认数据库为 SQLite，路径为 `backend/data/audit.db`。
+- LLM 配置、项目记录、审计任务和漏洞结果存储在本地 SQLite 数据库中。
+- 大项目上传后会先做预扫描和缓存构建，首次分析可能需要几十秒。
+- 多 Agent 模式默认最多 3 个子 Agent 并发调用 LLM，请确认模型服务端允许足够并发。
+- Supervisor 规划或复核失败时，系统会尽量使用默认计划或保留已有结果继续收口，但这类降级会展示在“质量提示”中，建议人工复核。

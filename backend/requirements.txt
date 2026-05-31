@@ -7,6 +7,3 @@ python-multipart==0.0.19
 openai==1.58.1
 httpx==0.28.1
 aiofiles==24.1.0
-weasyprint==63.0
-markdown==3.7
-Pillow==11.1.0

@@ -126,4 +126,4 @@ class VulnerabilityOut(BaseModel):
 # ===== Report =====
 class ReportExport(BaseModel):
     task_id: int
-    format: str  # md / pdf
+    format: str = "html"

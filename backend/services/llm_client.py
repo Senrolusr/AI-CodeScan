@@ -1,4 +1,3 @@
-import json
 import re
 import time
 
@@ -129,13 +128,6 @@ def _extract_response_finish_reason(response: dict) -> str | None:
                 return lower_status
 
     return None
-
-
-async def call_llm(config: LlmConfig, system_prompt: str, user_prompt: str) -> str:
-    result = await call_llm_with_meta(config, system_prompt, user_prompt)
-    if not result["success"]:
-        raise RuntimeError(result["error"]["message"])
-    return result["content"]
 
 
 async def _call_with_mode(
@@ -434,33 +426,3 @@ async def test_llm_connection(config: LlmConfig) -> dict:
         "attempts": attempts,
         "model": config.model_name,
     }
-
-
-async def call_llm_structured(config: LlmConfig, system_prompt: str, user_prompt: str) -> dict | list:
-    result = await call_llm_with_meta(config, system_prompt, user_prompt)
-    if not result["success"]:
-        raise RuntimeError(result["error"]["message"])
-    raw = result["content"]
-    text = raw.strip()
-
-    if text.startswith("```"):
-        lines = text.split("\n")
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines)
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        for start_char, end_char in [("[", "]"), ("{", "}")]:
-            start_idx = text.find(start_char)
-            end_idx = text.rfind(end_char)
-            if start_idx != -1 and end_idx > start_idx:
-                try:
-                    return json.loads(text[start_idx : end_idx + 1])
-                except json.JSONDecodeError:
-                    continue
-
-        return {"raw_response": raw, "parse_error": "无法从模型响应中提取 JSON"}

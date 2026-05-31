@@ -5,6 +5,8 @@ import { ElMessage } from 'element-plus'
 import { getAudit, getAuditStage, getAuditStageArtifact } from '../api'
 import { useI18n } from '../i18n'
 import { usePolling } from '../composables/usePolling'
+import ScanOverview from '../components/ScanOverview.vue'
+import { normalizeScanStats } from '../utils/scanStats'
 
 const props = defineProps({ id: [String, Number] })
 const router = useRouter()
@@ -50,6 +52,16 @@ const stageOneDataFlows = computed(() => {
   return Array.isArray(df) ? df : []
 })
 const stageOneRoutes = computed(() => Array.isArray(stageOneStage.value?.findings?.architecture_info?.routes) ? stageOneStage.value.findings.architecture_info.routes : [])
+const taskSummary = computed(() => {
+  const summary = task.value?.summary
+  return summary && typeof summary === 'object' ? summary : {}
+})
+const scanStats = computed(() => {
+  const value = taskSummary.value.scan_stats
+  return normalizeScanStats(value, {
+    routeCountFallback: routeGapSummary.value.static_route_count || stageOneRoutes.value.length || 0,
+  })
+})
 const filteredStageOneRoutes = computed(() => {
   const keyword = routeFilter.value.keyword.trim().toLowerCase()
   const auth = routeFilter.value.auth
@@ -80,6 +92,7 @@ const displayedStageOnePasses = computed(() => {
 const hiddenStageOnePassCount = computed(() => Math.max(stageOnePasses.value.length - displayedStageOnePasses.value.length, 0))
 const routeGapSummary = computed(() => artifact.value?.payload?.route_gap_summary || { static_route_count: 0, confirmed_route_count: 0, missing_route_count: 0, missing_route_samples: [] })
 const missingRouteSamples = computed(() => Array.isArray(routeGapSummary.value?.missing_route_samples) ? routeGapSummary.value.missing_route_samples : [])
+const projectSummaryClass = computed(() => stageOneSummary.value ? 'stage-one-summary' : 'stage-one-summary is-empty')
 
 const authLabel = (value) => ({
   JWT: t('authJwt'),
@@ -162,12 +175,9 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
       </template>
 
       <!-- 阶段摘要 -->
-      <div v-if="stageOneSummary" style="margin-bottom: 20px; padding: 16px 20px; background: linear-gradient(135deg, #f0f7ff 0%, #f5f0ff 100%); border-radius: 10px; line-height: 1.9; font-size: 15px; color: var(--text-primary)">
-        <div style="font-weight: bold; font-size: 14px; color: #409EFF; margin-bottom: 8px; letter-spacing: 1px">{{ t('projectOverview') }}</div>
-        {{ stageOneSummary }}
-      </div>
-      <div v-else style="margin-bottom: 20px; padding: 16px 20px; background: var(--bg-alt); border-radius: 10px; color: var(--text-muted); text-align: center">
-        {{ t('noProjectSummary') }}
+      <div :class="projectSummaryClass">
+        <div v-if="stageOneSummary" class="stage-one-summary-title">{{ t('projectOverview') }}</div>
+        {{ stageOneSummary || t('noProjectSummary') }}
       </div>
 
       <!-- 技术栈概览 -->
@@ -262,6 +272,8 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
         {{ t('earlyStopReason') }}: {{ stageOneEarlyStop.reason || `${t('round')} ${stageOneEarlyStop.after_pass}` }}
       </div>
     </el-card>
+
+    <ScanOverview v-if="stageOneStage" :stats="scanStats" :show-route-source-files="false" />
 
     <el-card style="margin-bottom: 20px">
       <template #header>
@@ -379,3 +391,37 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
     </el-card>
   </div>
 </template>
+
+<style scoped>
+.stage-one-summary {
+  margin-bottom: 20px;
+  padding: 16px 20px;
+  background: var(--bg-info);
+  border: 1px solid var(--border-info);
+  border-radius: 10px;
+  color: var(--text-primary);
+  line-height: 1.9;
+  font-size: 15px;
+}
+
+.stage-one-summary-title {
+  margin-bottom: 8px;
+  color: var(--text-info);
+  font-size: 14px;
+  font-weight: bold;
+  letter-spacing: 1px;
+}
+
+.stage-one-summary.is-empty {
+  background: var(--bg-alt);
+  border-color: var(--border-default);
+  color: var(--text-muted);
+  text-align: center;
+}
+
+@media (max-width: 760px) {
+  .stage-one-summary {
+    padding: 14px 16px;
+  }
+}
+</style>

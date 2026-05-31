@@ -16,10 +16,12 @@ import {
 } from '../api'
 import StageProgress from '../components/StageProgress.vue'
 import VulnCard from '../components/VulnCard.vue'
+import ScanOverview from '../components/ScanOverview.vue'
 import { useI18n } from '../i18n'
 import { buildSeverityStats, buildTaskRescanRecommendations } from '../utils/auditRecommendations'
 import { isAuditRetryBlocked } from '../utils/auditTaskState'
 import { usePolling } from '../composables/usePolling'
+import { normalizeScanStats } from '../utils/scanStats'
 
 const props = defineProps({ id: [String, Number] })
 const router = useRouter()
@@ -118,26 +120,11 @@ const stageOneGapSummary = computed(() => {
 })
 const scanStats = computed(() => {
   const value = taskSummary.value.scan_stats
-  return value && typeof value === 'object'
-    ? value
-    : {
-        source_files_detected: 0,
-        source_files_indexed: 0,
-        oversized_files_skipped: 0,
-        oversized_files_compacted: 0,
-        files_selected_for_audit: 0,
-        files_skipped_by_audit_file_budget: 0,
-        files_considered_for_chunks: 0,
-        files_with_content: 0,
-        chunk_count: 0,
-        rule_hit_count: 0,
-        truncated_by_audit_file_count: false,
-        truncated_by_code_chunks: false,
-        truncated_by_total_chars: false,
-        route_count: 0,
-        route_source_files: 0,
-        partial_audit: false,
-      }
+  const routeCountFallback = stageOneGapSummary.value.static_route_count || stageOneRouteCount.value || 0
+  return normalizeScanStats(value, {
+    routeCountFallback,
+    ruleHitFallback: ruleHitsPreview.value.length || 0,
+  })
 })
 const ruleHitsPreview = computed(() => Array.isArray(taskSummary.value.rule_hits_preview) ? taskSummary.value.rule_hits_preview : [])
 const tokenStats = computed(() => {
@@ -491,8 +478,7 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
         <div style="display: flex; gap: 8px; flex-wrap: wrap">
           <el-button v-if="task.status === 'pending' || task.status === 'running' || task.status === 'paused'" type="warning" plain :loading="actionLoading" @click="handleCancel">{{ t('cancel') }}</el-button>
           <el-button v-if="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'" :disabled="isAuditRetryBlocked(task)" :loading="actionLoading" @click="handleRetry">{{ t('retry') }}</el-button>
-          <el-button @click="handleExport('md')" :loading="exporting">{{ t('exportMd') }}</el-button>
-          <el-button type="primary" @click="handleExport('pdf')" :loading="exporting">{{ t('exportPdf') }}</el-button>
+          <el-button type="primary" @click="handleExport('html')" :loading="exporting">{{ t('exportHtml') }}</el-button>
         </div>
       </div>
 
@@ -589,37 +575,7 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
         </div>
       </el-card>
 
-      <!-- 扫描概览 -->
-      <el-card style="margin-bottom: 20px">
-        <template #header><span class="card-title">{{ t('scanOverview') }}</span></template>
-        <el-descriptions :column="4" border size="small">
-          <el-descriptions-item :label="t('sourceFilesDetected')">{{ scanStats.source_files_detected || 0 }}</el-descriptions-item>
-          <el-descriptions-item :label="t('sourceFilesIndexed')">{{ scanStats.source_files_indexed || scanStats.source_files_detected || 0 }}</el-descriptions-item>
-          <el-descriptions-item :label="t('auditFilesSelected')">{{ scanStats.files_selected_for_audit || scanStats.files_considered_for_chunks || 0 }}</el-descriptions-item>
-          <el-descriptions-item :label="t('chunkCandidateFiles')">{{ scanStats.files_considered_for_chunks || 0 }}</el-descriptions-item>
-          <el-descriptions-item :label="t('effectiveContentFiles')">{{ scanStats.files_with_content || 0 }}</el-descriptions-item>
-          <el-descriptions-item :label="t('chunkCount')">{{ scanStats.chunk_count || 0 }}</el-descriptions-item>
-          <el-descriptions-item :label="t('routeCount')">{{ scanStats.route_count || 0 }}</el-descriptions-item>
-          <el-descriptions-item :label="t('routeSourceFiles')">{{ scanStats.route_source_files || 0 }}</el-descriptions-item>
-          <el-descriptions-item :label="t('oversizedFilesSkipped')">{{ scanStats.oversized_files_skipped || 0 }}</el-descriptions-item>
-          <el-descriptions-item :label="t('oversizedFilesCompacted')">{{ scanStats.oversized_files_compacted || 0 }}</el-descriptions-item>
-          <el-descriptions-item :label="t('ruleHitCount')">{{ scanStats.rule_hit_count || 0 }}</el-descriptions-item>
-          <el-descriptions-item v-if="tokenStats" :label="t('tokenUsage')">
-            <span>{{ t('promptTokens') }}: {{ tokenStats.prompt_tokens?.toLocaleString() || 0 }} / {{ t('completionTokens') }}: {{ tokenStats.completion_tokens?.toLocaleString() || 0 }}</span>
-            <span style="margin-left: 12px; color: var(--el-color-info)">({{ tokenStats.llm_call_count || 0 }} {{ t('llmCalls') }})</span>
-          </el-descriptions-item>
-        </el-descriptions>
-        <div
-          v-if="scanStats.partial_audit || scanStats.truncated_by_audit_file_count || scanStats.truncated_by_code_chunks || scanStats.truncated_by_total_chars"
-          class="warning-notice"
-        >
-          <div>{{ t('scanTruncatedNotice') }}</div>
-          <div v-if="scanStats.oversized_files_skipped">{{ t('oversizedFilesSkippedNotice', { count: scanStats.oversized_files_skipped }) }}</div>
-          <div v-if="scanStats.truncated_by_audit_file_count">{{ t('auditFilesTruncatedNotice', { selected: scanStats.files_selected_for_audit || 0, skipped: scanStats.files_skipped_by_audit_file_budget || 0 }) }}</div>
-          <div v-if="scanStats.truncated_by_code_chunks">{{ t('codeChunksTruncatedNotice') }}</div>
-          <div v-if="scanStats.truncated_by_total_chars">{{ t('totalCharsTruncatedNotice') }}</div>
-        </div>
-      </el-card>
+      <ScanOverview :stats="scanStats" :token-stats="tokenStats" show-token-usage />
 
       <el-card v-if="ruleHitsPreview.length" style="margin-bottom: 20px">
         <template #header>

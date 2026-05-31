@@ -183,6 +183,47 @@ def _build_task_rescan_recommendations(vulns: list[Vulnerability], scan_stats: d
     return recommendations[:5]
 
 
+def _summarize_pre_discovery(pre_discovery: dict | None) -> dict | None:
+    if not isinstance(pre_discovery, dict):
+        return None
+
+    summary: dict = {}
+
+    tech_profile = pre_discovery.get("tech_profile")
+    if isinstance(tech_profile, dict):
+        summary["tech_profile"] = {
+            key: value[:20] if isinstance(value, list) else value
+            for key, value in tech_profile.items()
+            if value
+        }
+
+    dir_structure = pre_discovery.get("dir_structure")
+    if isinstance(dir_structure, dict):
+        summary["dir_structure"] = {
+            key: dir_structure.get(key)
+            for key in ["pattern", "confidence", "entry_dirs", "source_dirs", "config_dirs"]
+            if dir_structure.get(key)
+        }
+
+    security_files = pre_discovery.get("security_files")
+    if isinstance(security_files, dict):
+        summary["security_files"] = {
+            "total_critical_count": int(security_files.get("total_critical_count", 0) or 0),
+            "must_cover_files": (security_files.get("must_cover_files") or [])[:60],
+        }
+
+    middleware_map = pre_discovery.get("middleware_map")
+    if isinstance(middleware_map, dict):
+        summary["middleware_map"] = {
+            "middleware_chain": (middleware_map.get("middleware_chain") or [])[:30],
+            "auth_decorators": dict(list((middleware_map.get("auth_decorators") or {}).items())[:30])
+            if isinstance(middleware_map.get("auth_decorators"), dict)
+            else {},
+        }
+
+    return summary or None
+
+
 def _accumulate_token_usage(task: AuditTask, meta: dict | None) -> None:
     """将单次 LLM 调用的 token 用量累计到 task.summary。"""
     if not isinstance(meta, dict):
@@ -208,12 +249,16 @@ async def _refresh_task_summary(
     *,
     scan_stats: dict | None = None,
     rule_hits: list | None = None,
+    pre_discovery: dict | None = None,
 ) -> None:
     summary = task.summary if isinstance(task.summary, dict) else {}
     if isinstance(scan_stats, dict):
         summary["scan_stats"] = scan_stats
     if isinstance(rule_hits, list):
         summary["rule_hits_preview"] = rule_hits[:20]
+    pre_discovery_summary = _summarize_pre_discovery(pre_discovery)
+    if pre_discovery_summary:
+        summary["pre_discovery"] = pre_discovery_summary
 
     vuln_result = await session.execute(select(Vulnerability).where(Vulnerability.task_id == task.id))
     vulns = list(vuln_result.scalars().all())
@@ -247,143 +292,6 @@ async def _refresh_task_summary(
             "audit_scope_chunk_count": int(stage1_coverage.get("audit_scope_chunk_count") or stage1_coverage.get("total_chunk_count") or 0),
         }
     task.summary = dict(summary)
-
-
-async def _run_stage(session, task, stage, llm_config, project, code_chunks, static_routes, prev_context, audit_memory, rule_hits, source_sink_hints):
-    if await _is_task_cancelled(session, task.id):
-        stage.status = "cancelled"
-        stage.completed_at = datetime.now(timezone.utc)
-        await session.commit()
-        return
-
-    stage.status = "running"
-    stage.started_at = datetime.now(timezone.utc)
-    stage.completed_at = None
-    task.current_stage = stage.stage_num
-    await session.commit()
-
-    stage_prompt = get_stage_prompt(stage.stage_num)
-    selected_chunks = _select_stage_chunks(
-        stage.stage_num,
-        code_chunks,
-        static_routes=static_routes,
-        audit_memory=audit_memory,
-        source_sink_hints=source_sink_hints,
-    )
-    if stage.stage_num == 1:
-        stage_payload = await _run_stage1_multi_pass(
-            session=session,
-            task=task,
-            stage=stage,
-            llm_config=llm_config,
-            project=project,
-            stage_prompt=stage_prompt,
-            selected_chunks=selected_chunks,
-            code_chunks=code_chunks,
-            static_routes=static_routes,
-            prev_context=prev_context,
-            audit_memory=audit_memory,
-            rule_hits=rule_hits,
-            source_sink_hints=source_sink_hints,
-        )
-    else:
-        stage_payload = await _run_single_pass_stage(
-            session=session,
-            task=task,
-            stage=stage,
-            llm_config=llm_config,
-            project=project,
-            stage_prompt=stage_prompt,
-            selected_chunks=selected_chunks,
-            code_chunks=code_chunks,
-            static_routes=static_routes,
-            prev_context=prev_context,
-            audit_memory=audit_memory,
-            rule_hits=rule_hits,
-            source_sink_hints=source_sink_hints,
-        )
-
-    response = stage_payload["response"]
-    stage.prompt_used = stage_payload["prompt_used"]
-    stage.llm_response = stage_payload["llm_response"]
-    repair_code_text = str(stage_payload.get("repair_code_text", "") or "")
-    repair_prev_context = str(stage_payload.get("repair_prev_context", "") or "")
-    if isinstance(stage_payload.get("compressed_summary"), (dict, list)):
-        stage.compressed_summary = stage_payload["compressed_summary"]
-    if stage_payload.get("artifact_path"):
-        stage.artifact_path = stage_payload["artifact_path"]
-
-    vulns_created = 0
-    policy_stats = {"invalid_poc_vulnerabilities": 0, "invalid_poc_titles": [], "merged_duplicate_vulnerabilities": 0}
-    if isinstance(response, dict):
-        if stage.stage_num == 1 and "vulnerabilities" not in response:
-            response["vulnerabilities"] = []
-        if stage.stage_num == 1:
-            response = _merge_stage1_routes(response, static_routes)
-        response = _hydrate_vulnerability_endpoints(
-            response=response,
-            static_routes=static_routes,
-            audit_memory=audit_memory,
-        )
-        response = _backfill_vulnerability_poc_templates(
-            stage_num=stage.stage_num,
-            response=response,
-            static_routes=static_routes,
-            audit_memory=audit_memory,
-        )
-        response = await _repair_invalid_vulnerability_pocs(
-            llm_config=llm_config,
-            stage=stage,
-            project=project,
-            stage_prompt=get_stage_prompt(stage.stage_num),
-            response=response,
-            code_text=repair_code_text,
-            prev_context=repair_prev_context or _build_prev_context(audit_memory),
-            static_routes=static_routes,
-        )
-        response, policy_stats = _enforce_vulnerability_output_policy(stage, response)
-        stage.findings = response
-        vulns_created = await _store_vulnerabilities(session, task, stage, response.get("vulnerabilities", []))
-    elif isinstance(response, list):
-        normalized_payload = _hydrate_vulnerability_endpoints(
-            response={"vulnerabilities": response},
-            static_routes=static_routes,
-            audit_memory=audit_memory,
-        )
-        normalized_payload = _backfill_vulnerability_poc_templates(
-            stage_num=stage.stage_num,
-            response=normalized_payload,
-            static_routes=static_routes,
-            audit_memory=audit_memory,
-        )
-        normalized_payload = await _repair_invalid_vulnerability_pocs(
-            llm_config=llm_config,
-            stage=stage,
-            project=project,
-            stage_prompt=get_stage_prompt(stage.stage_num),
-            response=normalized_payload,
-            code_text=repair_code_text,
-            prev_context=repair_prev_context or _build_prev_context(audit_memory),
-            static_routes=static_routes,
-        )
-        normalized_response, policy_stats = _enforce_vulnerability_output_policy(stage, normalized_payload)
-        response = normalized_response
-        stage.findings = response
-        vulns_created = await _store_vulnerabilities(session, task, stage, response.get("vulnerabilities", []))
-    else:
-        stage.findings = {"raw_response": str(response)[:5000], "vulnerabilities": []}
-
-    if isinstance(stage.findings, dict) and policy_stats["invalid_poc_vulnerabilities"]:
-        stage.findings.setdefault(
-            "_policy_note",
-            "已按 code_audit.md 规则校验 POC；漏洞均已入库，但部分漏洞未提供与其类型匹配的合规 PoC。",
-        )
-        stage.findings["_policy_stats"] = policy_stats
-
-    stage.status = "completed"
-    stage.completed_at = datetime.now(timezone.utc)
-    await session.commit()
-    logger.info("Task %s Stage %s: completed, %s vulns found", task.id, stage.stage_num, vulns_created)
 
 
 async def _apply_stage_payload(stage, stage_payload: dict, session=None, task=None, static_routes=None, audit_memory=None):
@@ -1680,63 +1588,6 @@ def _build_vulnerability_detail_prompt(
     )
 
 
-def _build_vulnerability_poc_repair_prompt(
-    *,
-    stage,
-    stage_prompt: str,
-    vulnerability: dict,
-    code_text: str,
-    prev_context: str,
-    static_routes: list[dict],
-) -> str:
-    route_text = ""
-    if static_routes:
-        route_text = _truncate_text("\n".join(_format_static_route_lines(static_routes[:20], total_count=len(static_routes))), 2400)
-
-    vulnerability_seed = json.dumps(vulnerability, ensure_ascii=False, indent=2)
-    requirement = _classify_poc_requirement(stage.stage_num, vulnerability)
-    validation = vulnerability.get("_poc_validation")
-    validation_reason = ""
-    if isinstance(validation, dict) and validation.get("reason"):
-        validation_reason = str(validation.get("reason") or "").strip()
-
-    poc_requirement_text = {
-        "raw_http": "当前漏洞必须修正为完整 raw HTTP 请求包，至少包含请求行、Host、必要 Header 和请求体（如需要），并与 endpoint 对齐。",
-        "stepwise": "当前漏洞可使用步骤化 PoC 或完整 raw HTTP 请求包；如果保留步骤化描述，必须写清前置条件、攻击步骤和预期结果。",
-        "cli": "当前漏洞可使用命令行验证、配置 diff、日志/环境变量检查或完整 raw HTTP 请求包，必须能直接指导人工复现。",
-        "none": "当前漏洞无需补 PoC，保持代码证据说明即可。",
-    }.get(requirement, "请根据漏洞类型修正为可复现的 PoC，不要编造不存在的请求。")
-
-    return "\n".join(
-        [
-            "修复当前漏洞的 PoC 可复现性问题。只处理这一条漏洞，不要新增其他漏洞。",
-            "必须返回单个合法 JSON 对象，不要返回数组，不要输出 Markdown。",
-            "默认保持以下字段不变：title、severity、vuln_type、file_path、line_start、line_end。",
-            "允许修正以下字段：endpoint、code_snippet、poc_raw、description、fix_suggestion。",
-            "若 endpoint 缺失或与 PoC 不匹配，可以根据代码和静态路由线索修正 endpoint；若证据不足，则保留原值，不要编造。",
-            poc_requirement_text,
-            f"当前校验失败原因：{validation_reason or '未提供明确原因'}。请优先修复这个问题。",
-            "",
-            "[当前阶段要求]",
-            stage_prompt,
-            "",
-            "[待修复漏洞]",
-            vulnerability_seed,
-            "",
-            "[前序上下文]",
-            _truncate_text(prev_context or "", 1800) if prev_context else "无",
-            "",
-            "[静态路由线索]",
-            route_text or "无",
-            "",
-            "[相关代码]",
-            _truncate_text(code_text or "", 12000),
-            "",
-            "返回单个 JSON 对象。",
-        ]
-    )
-
-
 async def _enrich_vulnerability_details(
     *,
     llm_config,
@@ -1857,165 +1708,6 @@ async def _enrich_vulnerability_details(
     normalized["_detail_enrichment_count"] = sum(
         1 for vuln in enriched_vulns if isinstance(vuln, dict) and vuln.get("_detail_enriched")
     )
-    return normalized
-
-
-def _poc_repair_priority(stage_num: int, vuln: dict) -> int:
-    score = _vulnerability_detail_priority(vuln)
-    validation = vuln.get("_poc_validation")
-    if not isinstance(validation, dict):
-        validation = _validate_vulnerability_poc(stage_num, vuln)
-    if not validation.get("accepted"):
-        score += 60
-    if not str(vuln.get("endpoint", "") or "").strip():
-        score += 20
-    return score
-
-
-def _poc_quality_score(stage_num: int, vuln: dict, validation: dict | None = None) -> int:
-    if not isinstance(vuln, dict):
-        return 0
-    validation = validation if isinstance(validation, dict) else _validate_vulnerability_poc(stage_num, vuln)
-    requirement = _classify_poc_requirement(stage_num, vuln)
-    poc_raw = str(vuln.get("poc_raw", "") or "").strip()
-    endpoint = str(vuln.get("endpoint", "") or "").strip()
-    score = 0
-    if validation.get("accepted"):
-        score += 100
-    if endpoint:
-        score += 20
-    if poc_raw:
-        score += min(20, max(1, len(poc_raw) // 80))
-    if requirement == "raw_http":
-        packet = _parse_raw_http_request(poc_raw)
-        if packet.get("valid"):
-            score += 25
-    elif requirement == "stepwise":
-        if _looks_like_stepwise_poc(poc_raw) or _parse_raw_http_request(poc_raw).get("valid"):
-            score += 20
-    elif requirement == "cli":
-        if _looks_like_cli_or_config_poc(poc_raw) or _parse_raw_http_request(poc_raw).get("valid"):
-            score += 20
-    return score
-
-
-async def _repair_invalid_vulnerability_pocs(
-    *,
-    llm_config,
-    stage,
-    project,
-    stage_prompt: str,
-    response: dict | list,
-    code_text: str,
-    prev_context: str,
-    static_routes: list[dict],
-) -> dict | list:
-    if not isinstance(response, dict):
-        return response
-
-    vulnerabilities = response.get("vulnerabilities", [])
-    if not isinstance(vulnerabilities, list) or not vulnerabilities:
-        return response
-
-    policy = _get_stage_retry_policy(stage.stage_num)
-    max_items = min(2, max(0, int(policy.get("detail_enrichment_max_items", 4) or 0)))
-    if max_items <= 0:
-        return response
-
-    candidates: list[tuple[int, dict]] = []
-    for index, vuln in enumerate(vulnerabilities):
-        if not isinstance(vuln, dict):
-            continue
-        validation = vuln.get("_poc_validation")
-        if not isinstance(validation, dict):
-            validation = _validate_vulnerability_poc(stage.stage_num, vuln)
-            vuln["_poc_validation"] = validation
-        if validation.get("accepted"):
-            continue
-        if _classify_poc_requirement(stage.stage_num, vuln) == "none":
-            continue
-        candidates.append((index, vuln))
-
-    if not candidates:
-        return response
-
-    candidates.sort(key=lambda item: (-_poc_repair_priority(stage.stage_num, item[1]), item[0]))
-    candidate_indexes = {index for index, _ in candidates[:max_items]}
-    semaphore = asyncio.Semaphore(1)
-
-    async def repair_one(vuln: dict) -> dict:
-        original_validation = vuln.get("_poc_validation")
-        if not isinstance(original_validation, dict):
-            original_validation = _validate_vulnerability_poc(stage.stage_num, vuln)
-        prompt = _build_vulnerability_poc_repair_prompt(
-            stage=stage,
-            stage_prompt=stage_prompt,
-            vulnerability=vuln,
-            code_text=code_text,
-            prev_context=prev_context,
-            static_routes=static_routes,
-        )
-        async with semaphore:
-            repair_result = await call_llm_with_meta(llm_config, SYSTEM_BASE, prompt)
-        if not repair_result.get("success"):
-            return vuln
-
-        repair_response = _parse_structured_response(repair_result["content"], repair_result.get("meta"))
-        if not isinstance(repair_response, dict) or repair_response.get("parse_error"):
-            return vuln
-
-        repaired = dict(vuln)
-        for field in ["endpoint", "code_snippet", "poc_raw", "description", "fix_suggestion"]:
-            value = repair_response.get(field)
-            if value is None:
-                continue
-            if isinstance(value, str):
-                if value.strip():
-                    repaired[field] = value
-            else:
-                repaired[field] = value
-        repaired.pop("_poc_template_generated", None)
-        repaired_validation = _validate_vulnerability_poc(stage.stage_num, repaired)
-        repaired["_poc_validation"] = repaired_validation
-
-        if _poc_quality_score(stage.stage_num, repaired, repaired_validation) <= _poc_quality_score(stage.stage_num, vuln, original_validation):
-            vuln["_poc_validation"] = original_validation
-            return vuln
-
-        repaired["_poc_repaired"] = True
-        return repaired
-
-    repair_tasks = {
-        index: asyncio.create_task(repair_one(vuln))
-        for index, vuln in candidates[:max_items]
-    }
-
-    repaired_vulns: list[dict] = []
-    changed = False
-    repaired_count = 0
-    for index, vuln in enumerate(vulnerabilities):
-        if not isinstance(vuln, dict):
-            continue
-        if index not in candidate_indexes:
-            repaired_vulns.append(vuln)
-            continue
-
-        repaired = await repair_tasks[index]
-        repaired_vulns.append(repaired)
-        if repaired is not vuln:
-            changed = True
-        if isinstance(repaired, dict) and repaired.get("_poc_repaired"):
-            repaired_count += 1
-
-    if not changed:
-        return response
-
-    normalized = dict(response)
-    normalized["vulnerabilities"] = repaired_vulns
-    normalized["_poc_repair_policy"] = {"max_items": max_items}
-    normalized["_poc_repair_count"] = repaired_count
-    if repaired_count:
-        normalized["_poc_repair_applied"] = True
     return normalized
 
 
@@ -2978,10 +2670,6 @@ def _validate_vulnerability_poc(stage_num: int, vuln: dict) -> dict:
         return {"accepted": False, "reason": "缺少可执行的命令行验证、配置 diff 或合法 raw HTTP 请求包"}
 
     return {"accepted": True, "reason": "requirement_unclassified"}
-
-
-def _requires_strict_http_poc(stage_num: int, vuln: dict) -> bool:
-    return _classify_poc_requirement(stage_num, vuln) == "raw_http"
 
 
 def _classify_poc_requirement(stage_num: int, vuln: dict) -> str:
@@ -6521,35 +6209,6 @@ def _apply_lightweight_stage_prompt_budget(
     return compact_context, _truncate_text(code_text or "", code_limit), _truncate_text(prev_context or "", prev_limit)
 
 
-def _apply_summary_stage_prompt_budget(
-    compact_context: dict | None,
-    code_text: str,
-    prev_context: str,
-    stage_num: int,
-    aggressive: bool = False,
-) -> tuple[dict, str, str]:
-    compact_context = dict(compact_context or {})
-    compact_context["response_mode"] = "index_first"
-    code_limit = 9000 if aggressive else 14000
-    prev_limit = 500 if aggressive else 1000
-    focus_file_limit = 12 if aggressive else 18
-
-    compact_context["route_lines"] = (compact_context.get("route_lines") or [])[:0]
-    compact_context["route_text_limit"] = 0
-    compact_context["rule_hit_lines"] = (compact_context.get("rule_hit_lines") or [])[:0]
-    compact_context["focus_files"] = (compact_context.get("focus_files") or [])[:focus_file_limit]
-
-    extra_guidance = str(compact_context.get("extra_guidance", "") or "").strip()
-    budget_guidance = (
-        "请优先输出可闭合的综合 JSON，避免长篇报告化描述。"
-        "architecture_info 仅保留全局关键结构；"
-        "vulnerabilities 优先保留 title、severity、vuln_type、file_path、endpoint、description。"
-    )
-    compact_context["extra_guidance"] = "\n".join(part for part in [extra_guidance, budget_guidance] if part)
-
-    return compact_context, _truncate_text(code_text or "", code_limit), _truncate_text(prev_context or "", prev_limit)
-
-
 def _summarize_project_tree(tree: list, limit: int = 180) -> str:
     lines: list[str] = []
 
@@ -7344,11 +7003,3 @@ def _build_audit_memory(stages: list[AuditStage], current_stage_num: int | None 
         "vulnerability_hints": vulnerability_hints[:30],
         "evidence_files": evidence_files[:40],
     }
-
-
-def _update_task_audit_memory(task: AuditTask, audit_memory: dict, selected_stage_nums: list[int] | None = None) -> None:
-    summary = task.summary if isinstance(task.summary, dict) else {}
-    if selected_stage_nums is not None:
-        summary["selected_stage_nums"] = list(selected_stage_nums)
-    summary["audit_memory"] = audit_memory
-    task.summary = dict(summary)

@@ -1,11 +1,11 @@
-"""报告生成服务，支持 Markdown 和 PDF。"""
+"""HTML report generation service."""
 
+from __future__ import annotations
+
+import html
 import os
-import re
-import textwrap
 from datetime import datetime
-
-from services.code_parser import load_project_cache
+from itertools import groupby
 
 
 def _status_label(status: str) -> str:
@@ -47,9 +47,10 @@ def _severity_rank(severity: str) -> int:
 
 
 def _build_severity_counts(vulns) -> dict:
-    counts = {}
+    counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
     for vuln in vulns:
-        counts[vuln.severity] = counts.get(vuln.severity, 0) + 1
+        severity = getattr(vuln, "severity", "Info") or "Info"
+        counts[severity] = counts.get(severity, 0) + 1
     return counts
 
 
@@ -92,415 +93,356 @@ def _get_scan_stats(task) -> dict:
     }
 
 
-def _get_cache_trace(project) -> dict:
-    if not project:
-        return {"available": False}
-    cached = load_project_cache(project.id, file_tree=getattr(project, "file_tree", None) or [])
-    if not cached:
-        return {"available": False}
-    return {
-        "available": True,
-        "cache_schema_version": cached.get("cache_schema_version"),
-        "project_fingerprint": cached.get("project_fingerprint") or "",
-        "analysis_strategy_fingerprint": cached.get("analysis_strategy_fingerprint") or "",
-    }
-
-
 def _vuln_location(vuln) -> str:
-    path = vuln.file_path or "-"
-    if vuln.line_start:
-        path += f":L{vuln.line_start}"
-        if vuln.line_end:
-            path += f"-{vuln.line_end}"
+    path = getattr(vuln, "file_path", "") or "-"
+    line_start = getattr(vuln, "line_start", None)
+    line_end = getattr(vuln, "line_end", None)
+    if line_start:
+        path += f":L{line_start}"
+        if line_end:
+            path += f"-{line_end}"
     return path
 
 
-def _append_table(lines: list[str], headers: list[str], rows: list[list[str]]) -> None:
-    lines.append("| " + " | ".join(headers) + " |\n")
-    lines.append("|" + "|".join(["---"] * len(headers)) + "|\n")
-    for row in rows:
-        safe_row = [str(item).replace("\n", " ").replace("|", "\\|").strip() for item in row]
-        lines.append("| " + " | ".join(safe_row) + " |\n")
-    lines.append("\n")
+def _esc(value) -> str:
+    return html.escape(str(value or ""), quote=True)
 
 
-def _build_markdown_content(project, task, stages, vulns) -> str:
-    lines = []
-    severity_counts = _get_summary_severity_counts(task) or _build_severity_counts(vulns)
-    poc_counts = _build_poc_counts(vulns)
-    scan_stats = _get_scan_stats(task)
+def _nl2br(value) -> str:
+    return _esc(value).replace("\n", "<br>")
 
-    # ── 标题 ──
-    lines.append("# AI 代码安全审计报告\n\n")
 
-    # ── 基本信息 ──
-    lines.append("## 基本信息\n\n")
-    lines.append(f"| 项目 | {project.name if project else '未知项目'} |\n")
-    lines.append(f"| --- | --- |\n")
-    lines.append(f"| 技术栈 | {project.tech_stack if project and project.tech_stack else '未识别'} |\n")
-    lines.append(f"| 审计时间 | {datetime.now().strftime('%Y-%m-%d %H:%M')} |\n")
-    lines.append(f"| 状态 | {_status_label(task.status)} |\n\n")
+def _severity_class(severity: str) -> str:
+    return f"sev-{str(severity or 'Info').lower()}"
 
-    # ── 风险概览（合并统计） ──
-    lines.append("## 风险概览\n\n")
-    sev_rows = []
-    for sev in ["Critical", "High", "Medium", "Low", "Info"]:
-        cnt = severity_counts.get(sev, 0)
-        if cnt:
-            sev_rows.append(f"**{_severity_label(sev)}** {cnt}")
-    lines.append("> " + " / ".join(sev_rows) + f" / **总计** {len(vulns)}\n\n")
 
-    overview_rows = [
-        ["POC 已通过", str(poc_counts["valid"])],
-        ["POC 不完整", str(poc_counts["invalid"])],
-        ["POC 待校验", str(poc_counts["unknown"])],
-        ["扫描文件数", str(scan_stats.get("total_files", 0))],
-        ["分析文件数", str(scan_stats.get("included_files", 0))],
-        ["代码块数", str(scan_stats.get("total_chunks", 0))],
-        ["规则命中", str(scan_stats.get("rule_hit_count", 0))],
-    ]
-    _append_table(lines, ["指标", "值"], overview_rows)
+def _confidence_label(value: str) -> str:
+    return {
+        "high": "高",
+        "medium": "中",
+        "low": "低",
+    }.get(str(value or "").lower(), value or "-")
 
-    # ── 重点关注 ──
+
+def _group_vulnerabilities(vulns) -> list[tuple[str, list]]:
     sorted_vulns = sorted(
         vulns,
-        key=lambda v: (
-            _severity_rank(getattr(v, "severity", "")),
-            getattr(v, "title", "") or "",
+        key=lambda item: (
+            str(getattr(item, "vuln_type", "") or "未分类漏洞"),
+            _severity_rank(getattr(item, "severity", "")),
+            str(getattr(item, "title", "") or ""),
         ),
     )
-    top_vulns = sorted_vulns[:5]
-    if top_vulns:
-        lines.append("## 重点关注\n\n")
-        _append_table(
-            lines,
-            ["#", "漏洞", "等级", "类型", "位置"],
-            [
-                [i, v.title or "未命名", _severity_label(v.severity), v.vuln_type or "-", _vuln_location(v)]
-                for i, v in enumerate(top_vulns, 1)
-            ],
+    groups = []
+    for vuln_type, items in groupby(sorted_vulns, key=lambda item: getattr(item, "vuln_type", "") or "未分类漏洞"):
+        groups.append((vuln_type, list(items)))
+    groups.sort(
+        key=lambda item: (
+            min(_severity_rank(getattr(vuln, "severity", "")) for vuln in item[1]),
+            item[0],
         )
+    )
+    return groups
 
-    # ── 漏洞详情 ──
-    lines.append("## 漏洞详情\n\n")
+
+def _render_metric(label: str, value) -> str:
+    return f"""
+      <div class="metric">
+        <span>{_esc(label)}</span>
+        <strong>{_esc(value)}</strong>
+      </div>
+    """
+
+
+def _render_badge(text: str, class_name: str = "") -> str:
+    classes = "badge" + (f" {class_name}" if class_name else "")
+    return f'<span class="{classes}">{_esc(text)}</span>'
+
+
+def _render_vulnerability(vuln, index: int) -> str:
+    severity = getattr(vuln, "severity", "Info") or "Info"
+    endpoint = getattr(vuln, "endpoint", "") or ""
+    poc_status = getattr(vuln, "poc_validation_status", "unknown") or "unknown"
+    poc_note = getattr(vuln, "poc_validation_note", "") or ""
+    confidence = getattr(vuln, "confidence", "") or ""
+
+    parts = [
+        '<article class="finding">',
+        '<div class="finding-head">',
+        f'<h3>{index}. {_esc(getattr(vuln, "title", "") or "未命名漏洞")}</h3>',
+        '<div class="badges">',
+        _render_badge(_severity_label(severity), _severity_class(severity)),
+        _render_badge(f"POC {_poc_status_label(poc_status)}", f"poc-{poc_status}"),
+        _render_badge(f"置信度 {_confidence_label(confidence)}", "confidence"),
+        "</div>",
+        "</div>",
+        '<dl class="finding-meta">',
+        f"<dt>位置</dt><dd><code>{_esc(_vuln_location(vuln))}</code></dd>",
+    ]
+    if endpoint:
+        parts.append(f"<dt>接口</dt><dd><code>{_esc(endpoint)}</code></dd>")
+    parts.append("</dl>")
+
+    description = getattr(vuln, "description", "") or ""
+    if description:
+        parts.append('<section><h4>根因与影响</h4>')
+        parts.append(f'<p class="text">{_nl2br(description)}</p></section>')
+
+    code_snippet = getattr(vuln, "code_snippet", "") or ""
+    if code_snippet:
+        parts.append('<section><h4>代码证据</h4>')
+        parts.append(f"<pre><code>{_esc(code_snippet[:1600])}</code></pre></section>")
+
+    poc_raw = getattr(vuln, "poc_raw", "") or ""
+    if poc_raw:
+        parts.append('<section><h4>复现方式</h4>')
+        parts.append(f"<pre><code>{_esc(poc_raw[:2200])}</code></pre></section>")
+    if poc_note:
+        parts.append(f'<p class="note">POC 校验说明：{_nl2br(poc_note)}</p>')
+
+    fix_suggestion = getattr(vuln, "fix_suggestion", "") or ""
+    if fix_suggestion:
+        parts.append('<section><h4>修复建议</h4>')
+        parts.append(f'<p class="text">{_nl2br(fix_suggestion)}</p></section>')
+
+    parts.append("</article>")
+    return "\n".join(parts)
+
+
+def _render_vulnerability_groups(vulns) -> str:
     if not vulns:
-        lines.append("未发现已确认的安全漏洞。\n")
-        return "".join(lines)
+        return '<section class="empty">未发现已确认的安全漏洞。</section>'
 
-    for index, vuln in enumerate(sorted_vulns, 1):
-        lines.append(f"### {index}. {vuln.title} [{_severity_label(vuln.severity)}]\n\n")
-        meta_parts = [f"`{vuln.vuln_type or '-'}`"]
-        meta_parts.append(f"`{_vuln_location(vuln)}`")
-        if vuln.endpoint:
-            meta_parts.append(f"`{vuln.endpoint}`")
-        lines.append(" / ".join(meta_parts) + "\n\n")
+    sections = []
+    for vuln_type, group_items in _group_vulnerabilities(vulns):
+        severity_counts = _build_severity_counts(group_items)
+        group_badges = "".join(
+            _render_badge(f"{_severity_label(sev)} {count}", _severity_class(sev))
+            for sev, count in severity_counts.items()
+            if count
+        )
+        findings = "\n".join(
+            _render_vulnerability(vuln, index)
+            for index, vuln in enumerate(
+                sorted(
+                    group_items,
+                    key=lambda item: (
+                        _severity_rank(getattr(item, "severity", "")),
+                        str(getattr(item, "title", "") or ""),
+                    ),
+                ),
+                1,
+            )
+        )
+        sections.append(
+            f"""
+            <section class="vuln-group">
+              <div class="group-head">
+                <h2>{_esc(vuln_type)}</h2>
+                <div class="badges">{group_badges}</div>
+              </div>
+              {findings}
+            </section>
+            """
+        )
+    return "\n".join(sections)
 
-        if vuln.description:
-            lines.append(f"{vuln.description}\n\n")
-        if vuln.code_snippet:
-            snippet = vuln.code_snippet
-            if len(snippet) > 800:
-                snippet = snippet[:800] + "\n... (已截断)"
-            lines.append("```text\n" + snippet + "\n```\n\n")
-        if vuln.poc_raw:
-            poc = vuln.poc_raw
-            if len(poc) > 1200:
-                poc = poc[:1200] + "\n... (已截断)"
-            lines.append("```http\n" + poc + "\n```\n\n")
-        if vuln.fix_suggestion:
-            lines.append(f"**修复**：{vuln.fix_suggestion}\n\n")
-        lines.append("---\n\n")
 
-    return "".join(lines)
-
-
-def _build_plaintext_content(project, task, stages, vulns) -> str:
+def _build_html_content(project, task, stages, vulns) -> str:
     severity_counts = _get_summary_severity_counts(task) or _build_severity_counts(vulns)
     poc_counts = _build_poc_counts(vulns)
     scan_stats = _get_scan_stats(task)
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    project_name = project.name if project else "未知项目"
+    tech_stack = project.tech_stack if project and project.tech_stack else "未识别"
 
-    sorted_vulns = sorted(
-        vulns,
-        key=lambda v: (
-            _severity_rank(getattr(v, "severity", "")),
-            getattr(v, "title", "") or "",
-        ),
+    severity_metrics = "".join(
+        _render_metric(_severity_label(sev), severity_counts.get(sev, 0))
+        for sev in ["Critical", "High", "Medium", "Low", "Info"]
+    )
+    scan_metrics = "".join(
+        [
+            _render_metric("漏洞总数", len(vulns)),
+            _render_metric("POC 通过", poc_counts["valid"]),
+            _render_metric("POC 不完整", poc_counts["invalid"]),
+            _render_metric("扫描文件数", scan_stats.get("total_files", 0)),
+            _render_metric("分析文件数", scan_stats.get("included_files", 0)),
+            _render_metric("代码块数", scan_stats.get("total_chunks", 0)),
+            _render_metric("规则命中", scan_stats.get("rule_hit_count", 0)),
+        ]
     )
 
-    lines = [
-        "AI 代码安全审计报告",
-        "",
-        f"项目：{project.name if project else '未知项目'}",
-        f"技术栈：{project.tech_stack if project and project.tech_stack else '未识别'}",
-        f"审计时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"状态：{_status_label(task.status)}",
-        "",
-        "风险概览",
-    ]
-    for sev in ["Critical", "High", "Medium", "Low", "Info"]:
-        cnt = severity_counts.get(sev, 0)
-        if cnt:
-            lines.append(f"  {_severity_label(sev)}：{cnt}")
-    lines.append(f"  总计：{len(vulns)}")
-    lines.append(f"  POC 通过：{poc_counts['valid']} / 不完整：{poc_counts['invalid']} / 待校验：{poc_counts['unknown']}")
-    lines.append(f"  扫描文件：{scan_stats.get('total_files', 0)} / 代码块：{scan_stats.get('total_chunks', 0)}")
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 代码安全审计报告 - {_esc(project_name)}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #667085;
+      --border: #d9e1ec;
+      --blue: #2563eb;
+      --red: #d92d20;
+      --orange: #b54708;
+      --green: #027a48;
+      --gray: #475467;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans SC", Arial, sans-serif;
+      color: var(--text);
+      background: var(--bg);
+      line-height: 1.65;
+    }}
+    .page {{ max-width: 1180px; margin: 0 auto; padding: 32px 24px 56px; }}
+    .hero {{
+      background: #111827;
+      color: #fff;
+      border-radius: 8px;
+      padding: 28px 32px;
+      margin-bottom: 20px;
+    }}
+    .hero h1 {{ margin: 0 0 12px; font-size: 28px; line-height: 1.25; }}
+    .hero-meta {{ display: flex; flex-wrap: wrap; gap: 12px 24px; color: #d1d5db; font-size: 14px; }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 18px;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+    }}
+    .metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }}
+    .metric {{ border: 1px solid var(--border); border-radius: 8px; padding: 12px; background: #fbfdff; }}
+    .metric span {{ display: block; color: var(--muted); font-size: 13px; }}
+    .metric strong {{ display: block; margin-top: 4px; font-size: 24px; }}
+    h2 {{ margin: 0 0 14px; font-size: 20px; }}
+    h3 {{ margin: 0; font-size: 17px; }}
+    h4 {{ margin: 16px 0 8px; font-size: 14px; color: var(--gray); }}
+    .vuln-group {{ margin-top: 24px; }}
+    .group-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 2px solid var(--border);
+      padding-bottom: 10px;
+      margin-bottom: 14px;
+    }}
+    .finding {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 18px;
+      margin-bottom: 14px;
+    }}
+    .finding-head {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }}
+    .badges {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+    .badge {{
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 2px 9px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: #f8fafc;
+      color: var(--gray);
+      white-space: nowrap;
+    }}
+    .sev-critical {{ color: #fff; background: var(--red); border-color: var(--red); }}
+    .sev-high {{ color: #fff; background: var(--orange); border-color: var(--orange); }}
+    .sev-medium {{ color: #fff; background: var(--blue); border-color: var(--blue); }}
+    .sev-low {{ color: #fff; background: var(--green); border-color: var(--green); }}
+    .sev-info {{ color: var(--gray); background: #eef2f6; }}
+    .poc-valid {{ color: var(--green); border-color: #abefc6; background: #ecfdf3; }}
+    .poc-invalid {{ color: var(--red); border-color: #fecdca; background: #fef3f2; }}
+    .poc-unknown, .confidence {{ color: var(--gray); background: #f2f4f7; }}
+    .finding-meta {{
+      display: grid;
+      grid-template-columns: 56px 1fr;
+      gap: 6px 10px;
+      margin: 14px 0 0;
+      font-size: 13px;
+    }}
+    .finding-meta dt {{ color: var(--muted); }}
+    .finding-meta dd {{ margin: 0; word-break: break-all; }}
+    code {{ font-family: Consolas, "Courier New", monospace; }}
+    pre {{
+      margin: 0;
+      padding: 14px;
+      border-radius: 8px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #101828;
+      color: #e5e7eb;
+      font-size: 12px;
+      line-height: 1.55;
+    }}
+    .text {{ margin: 0; }}
+    .note {{
+      margin: 12px 0 0;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: #fff7ed;
+      border: 1px solid #fed7aa;
+      color: #9a3412;
+      font-size: 13px;
+    }}
+    .empty {{
+      background: var(--panel);
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      padding: 24px;
+      color: var(--muted);
+      text-align: center;
+    }}
+    @media print {{
+      body {{ background: #fff; }}
+      .page {{ max-width: none; padding: 0; }}
+      .panel, .finding, .hero {{ box-shadow: none; break-inside: avoid; }}
+    }}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <h1>AI 代码安全审计报告</h1>
+      <div class="hero-meta">
+        <span>项目：{_esc(project_name)}</span>
+        <span>技术栈：{_esc(tech_stack)}</span>
+        <span>审计状态：{_esc(_status_label(task.status))}</span>
+        <span>生成时间：{_esc(generated_at)}</span>
+      </div>
+    </header>
 
-    lines.extend(["", "漏洞详情"])
-    if not vulns:
-        lines.append("未发现已确认的安全漏洞。")
-    else:
-        for index, vuln in enumerate(sorted_vulns, 1):
-            lines.append("")
-            lines.append(f"{index}. {vuln.title} [{_severity_label(vuln.severity)}]")
-            lines.append(f"  类型：{vuln.vuln_type or '-'} | 位置：{_vuln_location(vuln)}")
-            if vuln.endpoint:
-                lines.append(f"  接口：{vuln.endpoint}")
-            if vuln.description:
-                lines.append(f"  说明：{vuln.description}")
-            if vuln.fix_suggestion:
-                lines.append(f"  修复：{vuln.fix_suggestion}")
-            lines.append("-" * 60)
+    <section class="panel">
+      <h2>风险等级概览</h2>
+      <div class="metrics">{severity_metrics}</div>
+    </section>
 
-    return "\n".join(lines)
+    <section class="panel">
+      <h2>审计统计</h2>
+      <div class="metrics">{scan_metrics}</div>
+    </section>
+
+    {_render_vulnerability_groups(vulns)}
+  </main>
+</body>
+</html>
+"""
 
 
-def generate_markdown(report_dir, project, task, stages, vulns) -> str:
-    content = _build_markdown_content(project, task, stages, vulns)
-    filepath = os.path.join(report_dir, f"audit_report_{task.id}.md")
+def generate_html(report_dir, project, task, stages, vulns) -> str:
+    content = _build_html_content(project, task, stages, vulns)
+    filepath = os.path.join(report_dir, f"audit_report_{task.id}.html")
     with open(filepath, "w", encoding="utf-8") as file:
         file.write(content)
     return filepath
-
-
-_PDF_STYLE = """\
-body {
-  font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans SC", "SimSun", sans-serif;
-  font-size: 13px;
-  line-height: 1.75;
-  color: #1d1d1f;
-  padding: 0;
-  margin: 0;
-}
-
-/* ── cover header ── */
-h1 {
-  font-size: 22px;
-  font-weight: 700;
-  color: #fff;
-  background: linear-gradient(135deg, #1a1a2e, #16213e);
-  padding: 28px 32px;
-  margin: 0 -32px 32px;
-  border-radius: 0;
-  letter-spacing: 1px;
-}
-
-/* ── sections ── */
-h2 {
-  font-size: 16px;
-  font-weight: 600;
-  color: #1a1a2e;
-  margin-top: 32px;
-  margin-bottom: 12px;
-  padding-left: 12px;
-  border-left: 4px solid #3b82f6;
-}
-
-h3 {
-  font-size: 14px;
-  font-weight: 600;
-  color: #1e293b;
-  margin-top: 24px;
-  margin-bottom: 8px;
-  break-after: avoid;
-}
-
-/* ── tables ── */
-table {
-  border-collapse: separate;
-  border-spacing: 0;
-  width: 100%;
-  margin: 12px 0 20px;
-  font-size: 12.5px;
-  border-radius: 8px;
-  overflow: hidden;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-}
-th {
-  background: #f1f5f9;
-  font-weight: 600;
-  color: #334155;
-  padding: 10px 14px;
-  text-align: left;
-  border-bottom: 2px solid #e2e8f0;
-}
-td {
-  padding: 9px 14px;
-  border-bottom: 1px solid #f1f5f9;
-  vertical-align: top;
-}
-tr:nth-child(even) td { background: #f8fafc; }
-tr:last-child td { border-bottom: none; }
-
-/* ── blockquote (概览) ── */
-blockquote {
-  margin: 12px 0 20px;
-  padding: 14px 18px;
-  background: linear-gradient(90deg, #eff6ff, #f8fafc);
-  border-left: 4px solid #3b82f6;
-  border-radius: 0 8px 8px 0;
-  font-size: 13px;
-  color: #1e293b;
-}
-
-/* ── code blocks ── */
-pre {
-  background: #1e293b;
-  color: #e2e8f0;
-  padding: 16px 18px;
-  border-radius: 8px;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-size: 12px;
-  line-height: 1.6;
-  margin: 12px 0 20px;
-}
-pre code { background: transparent; color: inherit; padding: 0; }
-
-code {
-  background: #f1f5f9;
-  color: #0f172a;
-  padding: 2px 7px;
-  border-radius: 4px;
-  font-size: 12px;
-}
-
-/* ── strong / bold ── */
-strong { color: #0f172a; }
-
-/* ── hr ── */
-hr {
-  border: none;
-  border-top: 1px dashed #cbd5e1;
-  margin: 20px 0;
-}
-
-/* ── page break before each vuln after the first ── */
-h3 { break-before: auto; }
-"""
-
-_BODY_WRAPPER_CSS = f"""
-@page {{
-  size: A4;
-  margin: 32px;
-}}
-{_PDF_STYLE}
-"""
-
-
-def _render_pdf_with_weasyprint(md_path: str, pdf_path: str) -> str:
-    import markdown as md_lib
-    from weasyprint import HTML
-
-    with open(md_path, "r", encoding="utf-8") as file:
-        md_content = file.read()
-
-    html_content = md_lib.markdown(md_content, extensions=["tables", "fenced_code"])
-    full_html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>{_BODY_WRAPPER_CSS}</style>
-</head>
-<body>
-{html_content}
-</body>
-</html>"""
-
-    HTML(string=full_html).write_pdf(pdf_path)
-    return pdf_path
-
-
-def _pick_chinese_font() -> str | None:
-    candidates = [
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simsun.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return None
-
-
-def _sanitize_line(line: str) -> str:
-    line = line.replace("\t", "    ").rstrip()
-    return re.sub(r"\r", "", line)
-
-
-def _wrap_text_for_pdf(text: str, width: int = 44) -> list[str]:
-    wrapped = []
-    for raw_line in text.splitlines():
-        line = _sanitize_line(raw_line)
-        if not line:
-            wrapped.append("")
-            continue
-        if len(line) <= width:
-            wrapped.append(line)
-            continue
-        wrapped.extend(textwrap.wrap(line, width=width, break_long_words=True, break_on_hyphens=False))
-    return wrapped
-
-
-def _render_pdf_with_pillow(pdf_path: str, text_content: str) -> str:
-    from PIL import Image, ImageDraw, ImageFont
-
-    font_path = _pick_chinese_font()
-    if not font_path:
-        raise RuntimeError("未找到可用的中文字体，无法生成 PDF。")
-
-    title_font = ImageFont.truetype(font_path, 24)
-    body_font = ImageFont.truetype(font_path, 16)
-
-    page_width = 1240
-    page_height = 1754
-    margin_x = 72
-    margin_y = 72
-    line_height = 28
-    body_top = margin_y + 50
-    max_lines = (page_height - body_top - margin_y) // line_height
-
-    lines = _wrap_text_for_pdf(text_content, width=46)
-    pages = []
-
-    while lines:
-        current_lines = lines[:max_lines]
-        lines = lines[max_lines:]
-
-        image = Image.new("RGB", (page_width, page_height), "white")
-        draw = ImageDraw.Draw(image)
-        draw.text((margin_x, margin_y), "AI 代码审计报告", fill="black", font=title_font)
-
-        y = body_top
-        for line in current_lines:
-            draw.text((margin_x, y), line, fill="black", font=body_font)
-            y += line_height
-        pages.append(image)
-
-    if not pages:
-        pages = [Image.new("RGB", (page_width, page_height), "white")]
-
-    first_page, rest_pages = pages[0], pages[1:]
-    first_page.save(pdf_path, "PDF", resolution=150.0, save_all=True, append_images=rest_pages)
-    return pdf_path
-
-
-def generate_pdf(report_dir, project, task, stages, vulns) -> str:
-    md_path = generate_markdown(report_dir, project, task, stages, vulns)
-    pdf_path = md_path.replace(".md", ".pdf")
-
-    try:
-        return _render_pdf_with_weasyprint(md_path, pdf_path)
-    except Exception:
-        text_content = _build_plaintext_content(project, task, stages, vulns)
-        return _render_pdf_with_pillow(pdf_path, text_content)

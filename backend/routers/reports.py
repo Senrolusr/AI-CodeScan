@@ -9,9 +9,20 @@ from database import get_db
 from models import AuditTask, Vulnerability, AuditStage, Project
 from schemas import ReportExport
 from services.audit_cleanup import get_audit_report_dir
-from services.report_generator import generate_markdown, generate_pdf
+from services.report_generator import generate_html
 
 router = APIRouter()
+
+
+def _remove_legacy_report_outputs(report_dir: str) -> None:
+    if not os.path.isdir(report_dir):
+        return
+    for file_name in os.listdir(report_dir):
+        if not file_name.lower().endswith((".md", ".pdf")):
+            continue
+        filepath = os.path.join(report_dir, file_name)
+        if os.path.isfile(filepath):
+            os.remove(filepath)
 
 
 @router.post("/export")
@@ -35,12 +46,11 @@ async def export_report(data: ReportExport, db: AsyncSession = Depends(get_db)):
     report_dir = get_audit_report_dir(data.task_id)
     os.makedirs(report_dir, exist_ok=True)
 
-    if data.format == "md":
-        filepath = generate_markdown(report_dir, project, task, stages, vulns)
-    elif data.format == "pdf":
-        filepath = generate_pdf(report_dir, project, task, stages, vulns)
-    else:
-        raise HTTPException(400, "不支持的导出格式，仅支持 md 或 pdf")
+    if data.format != "html":
+        raise HTTPException(400, "不支持的导出格式，仅支持 html")
+
+    _remove_legacy_report_outputs(report_dir)
+    filepath = generate_html(report_dir, project, task, stages, vulns)
 
     filename = os.path.basename(filepath)
     return {
@@ -60,7 +70,10 @@ async def download_report(task_id: int, filename: str):
     if not os.path.exists(filepath):
         raise HTTPException(404, "报告文件不存在")
 
-    media_type = "application/pdf" if filename.endswith(".pdf") else "text/markdown"
+    if not filename.lower().endswith(".html"):
+        raise HTTPException(400, "仅支持下载 HTML 报告")
+
+    media_type = "text/html"
     return FileResponse(filepath, media_type=media_type, filename=filename)
 
 
@@ -72,6 +85,8 @@ async def list_reports(task_id: int):
 
     files = []
     for file_name in os.listdir(report_dir):
+        if not file_name.lower().endswith(".html"):
+            continue
         filepath = os.path.join(report_dir, file_name)
         if not os.path.isfile(filepath):
             continue

@@ -39,6 +39,7 @@ from services.audit_engine import (
     _enforce_vulnerability_output_policy,
     _hydrate_vulnerability_endpoints,
     _build_stage_artifact_path,
+    _summarize_pre_discovery,
 )
 
 logger = logging.getLogger(__name__)
@@ -326,6 +327,18 @@ async def _load_audit_context(session, task_id: int):
     if await _is_task_cancelled(session, task_id):
         return None
 
+    scan_stats = project_cache.get("scan_stats", {})
+    rule_hits = project_cache.get("rule_hits", [])
+    pre_discovery = project_cache.get("pre_discovery")
+    summary = dict(task.summary) if isinstance(task.summary, dict) else {}
+    if isinstance(scan_stats, dict):
+        summary["scan_stats"] = scan_stats
+    if isinstance(rule_hits, list):
+        summary["rule_hits_preview"] = rule_hits[:20]
+    pre_discovery_summary = _summarize_pre_discovery(pre_discovery)
+    if pre_discovery_summary:
+        summary["pre_discovery"] = pre_discovery_summary
+    task.summary = summary
     task.status = "running"
     task.error_message = ""
     task.completed_at = None
@@ -338,10 +351,10 @@ async def _load_audit_context(session, task_id: int):
         "stages": stages,
         "code_chunks": project_cache.get("code_chunks", []),
         "static_routes": project_cache.get("static_routes", []),
-        "scan_stats": project_cache.get("scan_stats", {}),
-        "rule_hits": project_cache.get("rule_hits", []),
+        "scan_stats": scan_stats,
+        "rule_hits": rule_hits,
         "source_sink_hints": project_cache.get("source_sink_hints", []),
-        "pre_discovery": project_cache.get("pre_discovery"),
+        "pre_discovery": pre_discovery,
     }
 
 
@@ -417,7 +430,7 @@ async def run_multi_agent_audit(task_id: int):
             task.status = "completed"
             task.current_stage = task.total_stages or 9
             task.completed_at = datetime.now(timezone.utc)
-            await _refresh_task_summary(session, task, scan_stats=scan_stats, rule_hits=rule_hits)
+            await _refresh_task_summary(session, task, scan_stats=scan_stats, rule_hits=rule_hits, pre_discovery=pre_discovery)
             await session.commit()
             logger.info("Multi-agent task %s completed", task_id)
 

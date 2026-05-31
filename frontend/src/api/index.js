@@ -49,7 +49,7 @@ export const getVuln = (id) => api.get(`/vulnerabilities/${id}`)
 export const deleteVuln = (id) => api.delete(`/vulnerabilities/${id}`)
 
 // Reports
-export const exportReport = (taskId, format) => api.post('/reports/export', { task_id: taskId, format })
+export const exportReport = (taskId, format = 'html') => api.post('/reports/export', { task_id: taskId, format })
 export const getReports = (taskId) => api.get(`/reports/list/${taskId}`)
 export const deleteReport = (taskId, filename) => api.delete(`/reports/${taskId}/${encodeURIComponent(filename)}`)
 

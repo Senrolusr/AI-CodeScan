@@ -21,7 +21,7 @@ from services.audit_cleanup import (
 router = APIRouter()
 
 VALID_STAGE_NUMS = set(range(1, 10))
-REMOVED_LIFECYCLE_SUMMARY_KEYS = {
+REMOVED_SUMMARY_KEYS = {
     "verification_stats",
     "candidate_severity_stats",
     "diff_stats",
@@ -29,11 +29,11 @@ REMOVED_LIFECYCLE_SUMMARY_KEYS = {
 }
 
 
-def _strip_lifecycle_summary(summary):
+def _strip_removed_summary_keys(summary):
     if not isinstance(summary, dict):
         return summary
     sanitized = dict(summary)
-    for key in REMOVED_LIFECYCLE_SUMMARY_KEYS:
+    for key in REMOVED_SUMMARY_KEYS:
         sanitized.pop(key, None)
     return sanitized
 
@@ -53,7 +53,7 @@ def _serialize_task(task: AuditTask) -> dict:
         "current_stage": current_stage,
         "total_stages": total_stages,
         "audit_mode": task.audit_mode,
-        "summary": _strip_lifecycle_summary(task.summary),
+        "summary": _strip_removed_summary_keys(task.summary),
         "error_message": task.error_message,
         "created_at": task.created_at,
         "completed_at": task.completed_at,
