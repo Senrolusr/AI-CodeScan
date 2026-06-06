@@ -13,25 +13,27 @@ from datetime import datetime, timezone
 
 from sqlalchemy import case, delete, select
 
-from database import async_session
-from models import AuditTask, AuditStage, Vulnerability, LlmConfig, Project
-from prompts.stage_prompts import SYSTEM_BASE, get_spec_label, get_stage_name, get_stage_prompt
-from services.code_parser import get_or_build_project_cache
+from models import AuditTask, AuditStage, Vulnerability, Project
+from prompts.stage_prompts import SYSTEM_BASE, get_spec_label
 from services.audit_cleanup import get_stage_artifact_dir, resolve_audit_artifact_path
+from services.json_repair import (
+    decode_json_string_fragment as _decode_json_string_fragment,
+    extract_balanced_json_value as _extract_balanced_json_value,
+)
 from services.llm_client import call_llm_with_meta
-from vulnerability_normalization import normalize_vulnerability_fields
+from vulnerability_normalization import is_unknown_placeholder, normalize_vulnerability_fields
 
 logger = logging.getLogger(__name__)
 
 STAGE1_MAX_PASSES = 5
-STAGE1_BATCH_TARGET_LEN = 120000
+STAGE1_BATCH_TARGET_LEN = 55000
 STAGE1_MIN_PASSES = 3
 STAGE1_EARLY_STOP_COVERAGE = 0.82
 STAGE1_STRONG_STOP_COVERAGE = 0.94
-STAGE1_PASS1_CODE_MAX_LEN = 150000
-STAGE1_LATER_PASS_CODE_MAX_LEN = 90000
-STAGE1_SOFT_MAX_BATCHES = 12
-SECONDARY_STAGE_MAX_ROUNDS = 3
+STAGE1_PASS1_CODE_MAX_LEN = 65000
+STAGE1_LATER_PASS_CODE_MAX_LEN = 52000
+STAGE1_SOFT_MAX_BATCHES = 8
+SECONDARY_STAGE_MAX_ROUNDS = 1
 SECONDARY_STAGE_CHUNK_LIMIT = 16
 STAGE_RETRY_POLICIES = {
     1: {"enabled": True, "max_vulnerabilities": 0, "code_limit": 22000, "prev_context_limit": 800, "route_limit": 20, "detail_enrichment_max_items": 0, "detail_enrichment_concurrency": 1},
@@ -44,11 +46,13 @@ STAGE_RETRY_POLICIES = {
     8: {"enabled": True, "max_vulnerabilities": 3, "code_limit": 18000, "prev_context_limit": 1200, "route_limit": 8, "detail_enrichment_max_items": 2, "detail_enrichment_concurrency": 1},
     9: {"enabled": True, "max_vulnerabilities": 3, "code_limit": 18000, "prev_context_limit": 1200, "route_limit": 8, "detail_enrichment_max_items": 2, "detail_enrichment_concurrency": 1},
 }
+STAGE1_RISK_HINT_LIMIT = 40
+_SOURCE_TEXT_CACHE: dict[tuple[int, str], str] = {}
 
 
 def _is_auto_second_pass_enabled(task: AuditTask) -> bool:
     summary = task.summary if isinstance(task.summary, dict) else {}
-    return bool(summary.get("auto_second_pass", True))
+    return bool(summary.get("auto_second_pass", False))
 
 
 def _coerce_stage_findings(findings):
@@ -101,6 +105,242 @@ def _normalize_confidence(value: str | None) -> str:
     if normalized in CONFIDENCE_RANK:
         return normalized
     return "medium"
+
+
+def _normalize_stage_num_list(*values) -> list[int]:
+    stage_nums: list[int] = []
+    for value in values:
+        if value is None:
+            continue
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            if isinstance(item, int) or str(item).isdigit():
+                stage_num = int(item)
+                if 2 <= stage_num <= 9 and stage_num not in stage_nums:
+                    stage_nums.append(stage_num)
+    return stage_nums
+
+
+def _collect_stage1_risk_hints(response: dict | list | None) -> list[dict]:
+    candidates = []
+    if isinstance(response, list):
+        candidates.extend(response)
+    elif isinstance(response, dict):
+        for key in ["risk_hints", "vulnerability_hints", "vulnerabilities"]:
+            value = response.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+
+    hints = []
+    for item in candidates:
+        hint = _normalize_stage1_risk_hint(item)
+        if hint:
+            hints.append(hint)
+    return _merge_vulnerability_lists([], hints)[:STAGE1_RISK_HINT_LIMIT]
+
+
+def _normalize_stage1_risk_hint(item) -> dict | None:
+    if isinstance(item, str):
+        text = item.strip()
+        if not text:
+            return None
+        return {
+            "title": text[:160],
+            "severity": "Info",
+            "vuln_type": "未验证风险线索",
+            "confidence": "low",
+            "description": text[:1000],
+            "source": "stage1_architecture",
+            "validation_status": "unverified",
+            "is_formal_vulnerability": False,
+        }
+    if not isinstance(item, dict):
+        return None
+
+    hint = normalize_vulnerability_fields(item)
+    title = str(hint.get("title", "") or "").strip()
+    vuln_type = str(hint.get("vuln_type", "") or "").strip()
+    description = str(hint.get("description", "") or "").strip()
+    if is_unknown_placeholder(title):
+        title = vuln_type if not is_unknown_placeholder(vuln_type) else ""
+    if is_unknown_placeholder(title) and description:
+        title = description[:80]
+    if is_unknown_placeholder(title):
+        title = "未命名风险线索"
+    if is_unknown_placeholder(vuln_type):
+        vuln_type = "未验证风险线索"
+
+    hint["title"] = title
+    hint["vuln_type"] = vuln_type
+    hint["severity"] = _normalize_severity(str(hint.get("severity", "Info") or "Info"))
+    hint["confidence"] = _normalize_confidence(hint.get("confidence"))
+    hint["source"] = "stage1_architecture"
+    hint["validation_status"] = "unverified"
+    hint["is_formal_vulnerability"] = False
+    stage_nums = _normalize_stage_num_list(hint.get("stage_nums"), hint.get("suggested_stage_nums"))
+    if stage_nums:
+        hint["stage_nums"] = stage_nums
+        hint["suggested_stage_nums"] = stage_nums
+    hint.pop("_poc_validation", None)
+    return hint
+
+
+def _stage1_response_with_risk_hints(response: dict | list | None) -> dict:
+    if isinstance(response, dict):
+        normalized = dict(response)
+    else:
+        normalized = {
+            "stage_summary": "",
+            "architecture_info": {},
+        }
+
+    normalized["risk_hints"] = _collect_stage1_risk_hints(response)
+    normalized["vulnerabilities"] = []
+    normalized.pop("_invalid_poc_vulnerabilities", None)
+    return normalized
+
+
+def _is_formal_vulnerability_candidate(vuln_data: dict) -> bool:
+    if not isinstance(vuln_data, dict):
+        return False
+    if vuln_data.get("_salvaged"):
+        return False
+    title = str(vuln_data.get("title", "") or "").strip()
+    vuln_type = str(vuln_data.get("vuln_type", "") or "").strip()
+    if is_unknown_placeholder(title) or is_unknown_placeholder(vuln_type):
+        return False
+    if not str(vuln_data.get("file_path", "") or "").strip() and not str(vuln_data.get("endpoint", "") or "").strip():
+        return False
+    return True
+
+
+def _normalize_match_path(path: str) -> str:
+    return str(path or "").replace("\\", "/").strip().strip("/").lower()
+
+
+def _is_frontend_evidence_path(path: str) -> bool:
+    normalized = _normalize_match_path(path)
+    if not normalized:
+        return False
+    return (
+        "/src/api/" in f"/{normalized}"
+        or "/src/views/" in f"/{normalized}"
+        or "/src/components/" in f"/{normalized}"
+        or normalized.endswith((".vue", ".tsx", ".jsx"))
+        or "ui-console/" in normalized
+        or normalized.startswith(("frontend/", "src/views/", "src/api/", "src/components/"))
+    )
+
+
+def _resolve_project_source_path(project: Project | None, file_path: str) -> str:
+    if not project or not str(file_path or "").strip():
+        return ""
+
+    upload_root = os.path.abspath(str(project.upload_path or ""))
+    if not upload_root or not os.path.isdir(upload_root):
+        return ""
+
+    normalized = str(file_path or "").replace("\\", "/").strip().strip("/")
+    if not normalized:
+        return ""
+
+    root_name = os.path.basename(upload_root.rstrip(os.sep))
+    candidates = [normalized]
+    if root_name and normalized.lower().startswith(root_name.lower() + "/"):
+        candidates.append(normalized[len(root_name) + 1 :])
+
+    for candidate in candidates:
+        abs_path = os.path.abspath(os.path.join(upload_root, candidate))
+        if abs_path == upload_root or not abs_path.startswith(upload_root + os.sep):
+            continue
+        if os.path.isfile(abs_path):
+            return abs_path
+
+    wanted_suffixes = {_normalize_match_path(item) for item in candidates if item}
+    for root, _, files in os.walk(upload_root):
+        for name in files:
+            abs_path = os.path.join(root, name)
+            rel_path = _normalize_match_path(os.path.relpath(abs_path, upload_root))
+            if rel_path in wanted_suffixes or any(rel_path.endswith("/" + suffix) for suffix in wanted_suffixes):
+                return abs_path
+    return ""
+
+
+def _read_project_source_text(project: Project | None, file_path: str) -> str:
+    if not project or not file_path:
+        return ""
+    cache_key = (int(getattr(project, "id", 0) or 0), _normalize_match_path(file_path))
+    if cache_key in _SOURCE_TEXT_CACHE:
+        return _SOURCE_TEXT_CACHE[cache_key]
+
+    resolved = _resolve_project_source_path(project, file_path)
+    if not resolved:
+        _SOURCE_TEXT_CACHE[cache_key] = ""
+        return ""
+    try:
+        with open(resolved, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read(60000)
+    except OSError:
+        text = ""
+    _SOURCE_TEXT_CACHE[cache_key] = text
+    return text
+
+
+def _compact_quality_text(vuln_data: dict) -> str:
+    fields = [
+        "title",
+        "vuln_type",
+        "file_path",
+        "endpoint",
+        "code_snippet",
+        "description",
+        "poc_raw",
+        "fix_suggestion",
+    ]
+    return "\n".join(str(vuln_data.get(field, "") or "") for field in fields).lower()
+
+
+def _quality_gate_contradiction_reason(stage_num: int, vuln_data: dict, project: Project | None) -> str:
+    combined = _compact_quality_text(vuln_data)
+    source_text = _read_project_source_text(project, str(vuln_data.get("file_path", "") or "")).lower()
+    source_compact = re.sub(r"\s+", "", source_text)
+
+    if stage_num == 6 and (
+        "enablemethodsecurity" in combined
+        or "方法级安全" in combined
+        or "preauthorize" in combined
+    ):
+        negative_claim = any(
+            marker in combined
+            for marker in ["未启用", "未开启", "未见", "缺少", "没有", "no ", "without", "missing"]
+        )
+        if negative_claim and ("@enablemethodsecurity" in source_text or "@enableglobalmethodsecurity" in source_text):
+            return "源码中已存在方法级安全启用注解，模型结论与直接代码证据冲突"
+
+    if stage_num == 5 and "验证码" in combined and any(marker in combined for marker in ["未作废", "可重用", "重复使用", "reuse"]):
+        if "validatecaptcha" in source_text and "updateattempts(signature,-1)" in source_compact:
+            return "验证码校验源码已在 validateCaptcha 中将 token 标记为已使用"
+
+    if stage_num == 5 and any(marker in combined for marker in ["暴力破解", "失败尝试", "登录尝试", "rate limit", "lockout"]):
+        if "iploginattemptservice.isexcessive" in source_compact:
+            return "登录过滤器源码已调用 IP 登录失败次数限制"
+
+    return ""
+
+
+def _formal_vulnerability_rejection_reason(stage_num: int, vuln_data: dict, project: Project | None = None) -> str:
+    if not _is_formal_vulnerability_candidate(vuln_data):
+        return "缺少正式漏洞必需字段或来自截断恢复结果"
+
+    file_path = str(vuln_data.get("file_path", "") or "").strip()
+    if stage_num in {5, 6} and _is_frontend_evidence_path(file_path):
+        return "认证/授权类正式漏洞必须引用服务端控制器、配置或服务层证据，不能只引用前端 API 封装"
+
+    contradiction = _quality_gate_contradiction_reason(stage_num, vuln_data, project)
+    if contradiction:
+        return contradiction
+
+    return ""
 
 
 async def _is_task_cancelled(session, task_id: int) -> bool:
@@ -260,7 +500,14 @@ async def _refresh_task_summary(
     if pre_discovery_summary:
         summary["pre_discovery"] = pre_discovery_summary
 
-    vuln_result = await session.execute(select(Vulnerability).where(Vulnerability.task_id == task.id))
+    vuln_result = await session.execute(
+        select(Vulnerability)
+        .join(AuditStage, Vulnerability.stage_id == AuditStage.id)
+        .where(
+            Vulnerability.task_id == task.id,
+            AuditStage.stage_num.between(2, 9),
+        )
+    )
     vulns = list(vuln_result.scalars().all())
     effective_scan_stats = summary.get("scan_stats", {}) if isinstance(summary.get("scan_stats"), dict) else {}
     for stale_key in [
@@ -305,11 +552,11 @@ async def _apply_stage_payload(stage, stage_payload: dict, session=None, task=No
         stage.artifact_path = stage_payload["artifact_path"]
 
     if isinstance(response, dict):
-        if stage.stage_num == 1 and "vulnerabilities" not in response:
-            response["vulnerabilities"] = []
-        if stage.stage_num == 1 and static_routes is not None:
-            response = _merge_stage1_routes(response, static_routes)
-        if static_routes is not None and audit_memory is not None:
+        if stage.stage_num == 1:
+            response = _stage1_response_with_risk_hints(response)
+            if static_routes is not None:
+                response = _merge_stage1_routes(response, static_routes)
+        elif static_routes is not None and audit_memory is not None:
             response = _hydrate_vulnerability_endpoints(
                 response=response,
                 static_routes=static_routes,
@@ -321,29 +568,36 @@ async def _apply_stage_payload(stage, stage_payload: dict, session=None, task=No
                 static_routes=static_routes,
                 audit_memory=audit_memory,
             )
-        response, _ = _enforce_vulnerability_output_policy(stage, response)
+        if stage.stage_num != 1:
+            response, _ = _enforce_vulnerability_output_policy(stage, response)
         stage.findings = response
     elif isinstance(response, list):
-        normalized_payload = {"vulnerabilities": response}
-        if static_routes is not None and audit_memory is not None:
-            normalized_payload = _hydrate_vulnerability_endpoints(
-                response=normalized_payload,
-                static_routes=static_routes,
-                audit_memory=audit_memory,
-            )
-            normalized_payload = _backfill_vulnerability_poc_templates(
-                stage_num=stage.stage_num,
-                response=normalized_payload,
-                static_routes=static_routes,
-                audit_memory=audit_memory,
-            )
-        normalized_response, _ = _enforce_vulnerability_output_policy(stage, normalized_payload)
-        response = normalized_response
-        stage.findings = response
+        if stage.stage_num == 1:
+            stage.findings = _stage1_response_with_risk_hints(response)
+        else:
+            normalized_payload = {"vulnerabilities": response}
+            if static_routes is not None and audit_memory is not None:
+                normalized_payload = _hydrate_vulnerability_endpoints(
+                    response=normalized_payload,
+                    static_routes=static_routes,
+                    audit_memory=audit_memory,
+                )
+                normalized_payload = _backfill_vulnerability_poc_templates(
+                    stage_num=stage.stage_num,
+                    response=normalized_payload,
+                    static_routes=static_routes,
+                    audit_memory=audit_memory,
+                )
+            normalized_response, _ = _enforce_vulnerability_output_policy(stage, normalized_payload)
+            response = normalized_response
+            stage.findings = response
     else:
-        stage.findings = {"raw_response": str(response)[:5000], "vulnerabilities": []}
+        if stage.stage_num == 1:
+            stage.findings = {"raw_response": str(response)[:5000], "risk_hints": [], "vulnerabilities": []}
+        else:
+            stage.findings = {"raw_response": str(response)[:5000], "vulnerabilities": []}
 
-    if session and task:
+    if session and task and stage.stage_num != 1:
         await _store_vulnerabilities(session, task, stage, stage.findings.get("vulnerabilities", []) if isinstance(stage.findings, dict) else stage.findings)
 
 
@@ -669,7 +923,7 @@ async def _run_stage1_multi_pass(
     )
     chunk_batches = _split_chunks_for_stage1(selected_chunks, pre_discovery=pre_discovery)
     pass_outputs = []
-    merged_response = {"stage_summary": "", "architecture_info": {}, "vulnerabilities": []}
+    merged_response = {"stage_summary": "", "architecture_info": {}, "risk_hints": [], "vulnerabilities": []}
     compressed_summary = _coerce_stage_summary(stage.compressed_summary)
     artifact_path = _build_stage_artifact_path(task.id, stage.stage_num)
     early_stop = {"triggered": False, "reason": "", "after_pass": 0}
@@ -774,6 +1028,7 @@ async def _run_stage1_multi_pass(
             initial_response=initial_response,
             retry_policy=retry_policy,
         )
+        response = _stage1_response_with_risk_hints(response)
         summary_delta = _extract_stage1_delta(response)
         pass_progress = _assess_stage1_pass_progress(
             compressed_summary,
@@ -877,6 +1132,7 @@ async def _run_stage1_multi_pass(
         prev_context=prev_context,
         static_routes=static_routes,
     )
+    merged_response = _stage1_response_with_risk_hints(merged_response)
 
     prompt_used = json.dumps(
         {
@@ -951,10 +1207,21 @@ async def _run_stage1_multi_pass(
 
 
 async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
-    if stage.stage_num >= 10:
+    if stage.stage_num == 1 or stage.stage_num >= 10:
         return 0
 
-    result = await session.execute(select(Vulnerability).where(Vulnerability.task_id == task.id))
+    project = None
+    project_result = await session.execute(select(Project).where(Project.id == task.project_id))
+    project = project_result.scalar_one_or_none()
+
+    result = await session.execute(
+        select(Vulnerability)
+        .join(AuditStage, Vulnerability.stage_id == AuditStage.id)
+        .where(
+            Vulnerability.task_id == task.id,
+            AuditStage.stage_num.between(2, 9),
+        )
+    )
     existing = {}
     for vuln in result.scalars().all():
         existing[_vuln_key(
@@ -973,11 +1240,23 @@ async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
     normalized_vulns = _merge_vulnerability_lists([], vulns_data if isinstance(vulns_data, list) else [])
 
     created = 0
+    quality_gate_rejections: list[dict] = []
     for vuln_data in normalized_vulns:
         if not isinstance(vuln_data, dict):
             continue
         vuln_data = normalize_vulnerability_fields(vuln_data)
         vuln_data["severity"] = _normalize_severity(vuln_data.get("severity", "Medium"))
+        rejection_reason = _formal_vulnerability_rejection_reason(stage.stage_num, vuln_data, project)
+        if rejection_reason:
+            quality_gate_rejections.append(
+                {
+                    "title": str(vuln_data.get("title", "") or "未命名漏洞")[:160],
+                    "reason": rejection_reason,
+                    "file_path": str(vuln_data.get("file_path", "") or "")[:260],
+                    "endpoint": str(vuln_data.get("endpoint", "") or "")[:260],
+                }
+            )
+            continue
         poc_raw = str(vuln_data.get("poc_raw", "") or "").strip()
         if not poc_raw:
             endpoint = str(vuln_data.get("endpoint", "") or "").strip()
@@ -1066,6 +1345,10 @@ async def _store_vulnerabilities(session, task, stage, vulns_data) -> int:
         session.add(vuln)
         existing[vuln_key] = vuln
         created += 1
+    if quality_gate_rejections and isinstance(stage.findings, dict):
+        updated_findings = dict(stage.findings)
+        updated_findings["_quality_gate_rejected"] = quality_gate_rejections[:30]
+        stage.findings = updated_findings
     return created
 
 
@@ -1996,7 +2279,7 @@ async def _run_secondary_stage_pass(
         )
 
         previous_vuln_count = len(merged_response.get("vulnerabilities", []) if isinstance(merged_response.get("vulnerabilities"), list) else [])
-        merged_response = _merge_stage1_pass_response(merged_response, selected_response)
+        merged_response = _merge_stage_vulnerability_response(merged_response, selected_response)
         merged_response["_second_pass_applied"] = True
         current_round_meta["retry"] = retry_meta
         current_round_meta["new_vulnerability_count"] = max(
@@ -2219,7 +2502,7 @@ async def _run_stage5_followup_scan(
         prev_context=effective_prev_context,
         static_routes=static_routes,
     )
-    merged_response = _merge_stage1_pass_response(current_response, followup_payload)
+    merged_response = _merge_stage_vulnerability_response(current_response, followup_payload)
     merged_response["_stage5_followup_applied"] = True
     followup_meta["new_vulnerability_count"] = len(filtered_new[:2])
     return merged_response, followup_meta
@@ -3241,50 +3524,8 @@ def _extract_partial_json_number_field(segment: str, field: str) -> int | None:
         return None
 
 
-def _decode_json_string_fragment(value: str) -> str:
-    try:
-        return json.loads(f'"{value}"')
-    except Exception:
-        return value.replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r")
-
-
 def _extract_balanced_json_object(text: str, start_index: int) -> tuple[str, int]:
     return _extract_balanced_json_value(text, start_index, "{", "}")
-
-
-def _extract_balanced_json_value(
-    text: str,
-    start_index: int,
-    open_char: str = "{",
-    close_char: str = "}",
-) -> tuple[str, int]:
-    depth = 0
-    in_string = False
-    escaped = False
-
-    for index in range(start_index, len(text)):
-        char = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-            continue
-        if char == open_char:
-            depth += 1
-            continue
-        if char == close_char:
-            depth -= 1
-            if depth == 0:
-                return text[start_index : index + 1], index + 1
-
-    return "", start_index
 
 
 def _build_incomplete_json_retry_prompt(
@@ -4568,15 +4809,14 @@ def _format_chunks_for_prompt(chunks: list[dict], stage_num: int, max_len: int |
 
 
 def _format_stage1_chunks_for_prompt(chunk_batch: list[dict], compressed_summary: dict, pass_index: int) -> tuple[str, dict]:
-    batch_max_len = max(
-        STAGE1_PASS1_CODE_MAX_LEN if pass_index <= 1 else STAGE1_LATER_PASS_CODE_MAX_LEN,
-        _estimate_chunks_prompt_len(chunk_batch) + 2048,
-    )
-    # 已经分配到本轮的 chunk 不应再被提示词格式化阶段二次截断。
+    batch_max_len = STAGE1_PASS1_CODE_MAX_LEN if pass_index <= 1 else STAGE1_LATER_PASS_CODE_MAX_LEN
+    estimated_len = _estimate_chunks_prompt_len(chunk_batch) + 2048
     if pass_index <= 1:
         return _format_chunks_for_prompt(chunk_batch, 1, max_len=batch_max_len), {
-            "compacted_chunk_count": 0,
+            "compacted_chunk_count": 1 if estimated_len > batch_max_len else 0,
             "compacted_paths": [],
+            "input_estimated_length": estimated_len,
+            "input_max_length": batch_max_len,
         }
 
     parts = []
@@ -4626,6 +4866,8 @@ def _format_stage1_chunks_for_prompt(chunk_batch: list[dict], compressed_summary
         "compacted_chunk_count": compacted_chunk_count,
         "compacted_paths": _merge_unique_items([], compacted_paths),
         "signal_window_chunk_count": signal_window_chunk_count,
+        "input_estimated_length": estimated_len,
+        "input_max_length": batch_max_len,
     }
 
 
@@ -5236,14 +5478,14 @@ def _extract_stage1_delta(response: dict | list) -> dict:
         return {
             "stage_summary": "",
             "architecture_info": {},
-            "vulnerability_hints": response[:12],
+            "vulnerability_hints": _collect_stage1_risk_hints(response)[:6],
         }
     if not isinstance(response, dict):
         return {"stage_summary": "", "architecture_info": {}, "vulnerability_hints": []}
     return {
-        "stage_summary": str(response.get("stage_summary", "")).strip()[:4000],
+        "stage_summary": str(response.get("stage_summary", "")).strip()[:900],
         "architecture_info": _compact_stage1_architecture_info(response.get("architecture_info")),
-        "vulnerability_hints": response.get("vulnerabilities", [])[:12] if isinstance(response.get("vulnerabilities"), list) else [],
+        "vulnerability_hints": _collect_stage1_risk_hints(response)[:6],
     }
 
 
@@ -5487,9 +5729,11 @@ def _merge_compressed_summary(
 
     stage_summary = str(delta.get("stage_summary", "")).strip()
     if stage_summary:
-        existing = merged.get("stage_summary", "")
-        if stage_summary not in existing:
-            merged["stage_summary"] = (existing + "\n\n" + stage_summary).strip() if existing else stage_summary
+        merged["stage_summary"] = _merge_compact_stage_summary(
+            merged.get("stage_summary", ""),
+            stage_summary,
+            max_chars=1400,
+        )
 
     merged["architecture_info"] = _merge_architecture_info(
         merged.get("architecture_info"),
@@ -5498,7 +5742,7 @@ def _merge_compressed_summary(
     merged["vulnerability_hints"] = _merge_vulnerability_lists(
         merged.get("vulnerability_hints"),
         delta.get("vulnerability_hints"),
-    )[:24]
+    )[:18]
 
     coverage = merged.get("coverage", {}) if isinstance(merged.get("coverage"), dict) else {}
     covered_paths = _merge_unique_items(
@@ -5569,7 +5813,8 @@ def _persist_stage_pass_artifact(
         "merged_response_preview": {
             "stage_summary": str(merged_response.get("stage_summary", ""))[:4000],
             "architecture_info": _summarize_architecture_info(merged_response.get("architecture_info")),
-            "vulnerability_count": len(merged_response.get("vulnerabilities", [])) if isinstance(merged_response.get("vulnerabilities"), list) else 0,
+            "risk_hint_count": len(merged_response.get("risk_hints", [])) if isinstance(merged_response.get("risk_hints"), list) else 0,
+            "risk_hints": (merged_response.get("risk_hints", []) if isinstance(merged_response.get("risk_hints"), list) else [])[:20],
         },
     }
     with open(resolve_audit_artifact_path(artifact_path), "w", encoding="utf-8") as f:
@@ -5766,31 +6011,81 @@ def _run_stage1_gap_analysis(merged_response: dict, static_routes: list[dict], p
 
 
 def _merge_stage1_pass_response(base: dict, response: dict | list) -> dict:
-    if isinstance(response, list):
-        response = {"vulnerabilities": response}
+    response = _stage1_response_with_risk_hints(response)
     if not isinstance(response, dict):
         return base
 
     merged = {
         "stage_summary": str(base.get("stage_summary", "")).strip(),
         "architecture_info": dict(base.get("architecture_info", {})) if isinstance(base.get("architecture_info"), dict) else {},
-        "vulnerabilities": list(base.get("vulnerabilities", [])) if isinstance(base.get("vulnerabilities"), list) else [],
+        "risk_hints": list(base.get("risk_hints", [])) if isinstance(base.get("risk_hints"), list) else [],
+        "vulnerabilities": [],
     }
 
     if response.get("stage_summary"):
-        existing = merged.get("stage_summary", "")
-        addition = str(response.get("stage_summary", "")).strip()
-        if addition and addition not in existing:
-            merged["stage_summary"] = (existing + "\n\n" + addition).strip() if existing else addition
+        merged["stage_summary"] = _merge_compact_stage_summary(
+            merged.get("stage_summary", ""),
+            response.get("stage_summary", ""),
+            max_chars=1200,
+        )
 
     merged["architecture_info"] = _merge_architecture_info(merged["architecture_info"], response.get("architecture_info"))
-    merged["vulnerabilities"] = _merge_vulnerability_lists(merged["vulnerabilities"], response.get("vulnerabilities"))
+    merged["risk_hints"] = _merge_vulnerability_lists(merged["risk_hints"], response.get("risk_hints"))[:STAGE1_RISK_HINT_LIMIT]
 
     for key, value in response.items():
-        if key not in {"stage_summary", "architecture_info", "vulnerabilities"} and key not in merged:
+        if key not in {"stage_summary", "architecture_info", "risk_hints", "vulnerabilities"} and key not in merged:
             merged[key] = value
 
     return merged
+
+
+def _merge_stage_vulnerability_response(base: dict, incoming: dict | list) -> dict:
+    if isinstance(incoming, list):
+        incoming = {"stage_summary": "", "architecture_info": {}, "vulnerabilities": incoming}
+    if not isinstance(base, dict):
+        base = {"stage_summary": "", "architecture_info": {}, "vulnerabilities": []}
+    if not isinstance(incoming, dict):
+        return base
+
+    merged = dict(base)
+    merged["stage_summary"] = _merge_compact_stage_summary(
+        merged.get("stage_summary", ""),
+        incoming.get("stage_summary", ""),
+        max_chars=1600,
+    )
+    merged["architecture_info"] = _merge_architecture_info(merged.get("architecture_info"), incoming.get("architecture_info"))
+    merged["vulnerabilities"] = _merge_vulnerability_lists(
+        merged.get("vulnerabilities"),
+        incoming.get("vulnerabilities"),
+    )
+
+    for key, value in incoming.items():
+        if key in {"stage_summary", "architecture_info", "vulnerabilities"}:
+            continue
+        if key not in merged and value not in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+def _merge_compact_stage_summary(existing: str, addition: str, max_chars: int = 1200) -> str:
+    existing = str(existing or "").strip()
+    addition = str(addition or "").strip()
+    if not addition:
+        return existing[:max_chars]
+    if not existing:
+        return addition[:max_chars]
+    if addition in existing:
+        return existing[:max_chars]
+    if len(existing) >= max_chars:
+        return existing[:max_chars]
+
+    merged = f"{existing}\n\n{addition}".strip()
+    if len(merged) <= max_chars:
+        return merged
+    remaining = max(0, max_chars - len(existing) - 6)
+    if remaining <= 80:
+        return existing[:max_chars]
+    return f"{existing}\n\n{addition[:remaining].rstrip()}...".strip()
 
 
 def _merge_architecture_info(base: dict | None, incoming: dict | None) -> dict:
@@ -5937,10 +6232,16 @@ def _build_stage1_microcompact_context(project, static_routes: list[dict], compr
         if pass_index == 1
         else "以下仅保留与本轮代码批次强相关、且尚未在压缩摘要中确认的静态路由 delta。"
     )
+    stage1_output_contract = (
+        "阶段一只允许输出架构索引和未验证风险线索："
+        "stage_summary 不超过 180 字；architecture_info.routes 最多 12 条且 notes 每条不超过 40 字；"
+        "risk_hints 最多 3 条且每条 description 不超过 120 字；"
+        "vulnerabilities 必须固定为 []；不要输出 PoC、修复建议、最终漏洞评级或长篇背景。"
+    )
     extra_guidance = (
-        f"本轮聚焦 {len(focus_files)} 个文件。已覆盖文件数：{len(covered_paths)}。"
+        f"本轮聚焦 {len(focus_files)} 个文件。已覆盖文件数：{len(covered_paths)}。{stage1_output_contract}"
         if pass_index > 1
-        else f"本轮为阶段一首轮扫描，共计划 {total_passes} 轮，请先建立项目骨架。"
+        else f"本轮为阶段一首轮扫描，共计划 {total_passes} 轮，请先建立项目骨架。{stage1_output_contract}"
     )
 
     pre_discovery_summary = ""
@@ -6656,6 +6957,7 @@ def _build_stage_focus_compact_context(
     evidence_files = audit_memory.get("evidence_files", []) if isinstance(audit_memory.get("evidence_files"), list) else []
     route_inventory = audit_memory.get("route_inventory", []) if isinstance(audit_memory.get("route_inventory"), list) else []
     vulnerability_hints = audit_memory.get("vulnerability_hints", []) if isinstance(audit_memory.get("vulnerability_hints"), list) else []
+    stage_vulnerability_hints = _select_stage_vulnerability_hints(stage.stage_num, vulnerability_hints)
     stage_rule_hits = _select_stage_rule_hits(stage.stage_num, rule_hits, focus_files)
     rule_hit_lines = _format_stage_rule_hit_lines(stage_rule_hits)
     stage_source_sink_hints = _select_stage_source_sink_hints(stage.stage_num, source_sink_hints, focus_files)
@@ -6670,6 +6972,17 @@ def _build_stage_focus_compact_context(
         guidance.append(f"规则预筛命中数：{len(stage_rule_hits)}，优先核查这些线索，再扩展到相邻调用链。")
     if stage_source_sink_hints:
         guidance.append(f"已注入轻量 source-sink 线索：{len(stage_source_sink_hints)}，优先验证这些可达路径，再扩展到相邻调用链。")
+    if stage_vulnerability_hints:
+        guidance.append(
+            "阶段一未验证风险线索需强制复核："
+            + "；".join(_format_stage_vulnerability_hint_lines(stage_vulnerability_hints))
+            + "。请逐条给出 confirmed / ruled_out / insufficient_context 结论，不要只写笼统摘要。"
+        )
+    if stage.stage_num == 3:
+        guidance.append(
+            "阶段三需优先覆盖注入高风险链路：规则导入/规则变更、GORM Where/Raw/Exec、ClickHouse/Loki/PromQL 查询、LDAP SearchFilter、Redis/Lua/模板拼接、拨测创建参数。"
+            "若只确认少量漏洞，也要在 stage_summary 中说明已排除的主要危险点和证据缺口。"
+        )
     if stage.stage_num == 6:
         guidance.append("阶段六请只关注对象级授权、租户隔离、资源归属校验和越权访问链，不要重复展开登录认证流程。")
     if stage.stage_num == 9:
@@ -6732,6 +7045,66 @@ def _format_stage_source_sink_lines(source_sink_hints: list[dict]) -> list[str]:
             + f"sources={sources} | sinks={sinks} | routes={routes} | "
             + f"evidence={str(hint.get('evidence', '')).replace(chr(10), ' / ')}"
         )
+    return lines
+
+
+def _select_stage_vulnerability_hints(stage_num: int, hints: list[dict], limit: int = 6) -> list[dict]:
+    if not hints:
+        return []
+
+    topic_keywords = set(_get_stage_topic_keywords(stage_num))
+    scored: list[tuple[int, dict]] = []
+    for hint in hints:
+        if not isinstance(hint, dict):
+            continue
+        stage_nums = _normalize_stage_num_list(hint.get("stage_nums"), hint.get("suggested_stage_nums"))
+        if isinstance(stage_nums, list) and stage_nums and stage_num not in stage_nums:
+            continue
+        text = " ".join(
+            str(hint.get(key, "") or "").lower()
+            for key in ["title", "vuln_type", "description", "file_path", "endpoint"]
+        )
+        score = 0
+        if stage_num in stage_nums:
+            score += 20
+        for keyword in topic_keywords:
+            if keyword and keyword.lower() in text:
+                score += 3
+        if stage_num == 3 and any(marker in text for marker in ["sql", "query", "mybatis", "${", "queryparser", "queryinfo", "动态查询", "注入"]):
+            score += 20
+        if stage_num == 5 and any(marker in text for marker in ["captcha", "验证码", "jwt", "token", "login", "登录", "password"]):
+            score += 20
+        if stage_num == 6 and any(marker in text for marker in ["preauthorize", "enablemethodsecurity", "权限", "越权", "授权", "idor"]):
+            score += 20
+        if stage_num == 8 and any(marker in text for marker in ["file", "upload", "download", "path", "文件", "上传", "下载", "路径"]):
+            score += 20
+        if score > 0:
+            scored.append((score, hint))
+
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            str(item[1].get("file_path", "")),
+            str(item[1].get("title", "")),
+        )
+    )
+    return [hint for _, hint in scored[:limit]]
+
+
+def _format_stage_vulnerability_hint_lines(hints: list[dict]) -> list[str]:
+    lines = []
+    for hint in hints:
+        if not isinstance(hint, dict):
+            continue
+        title = str(hint.get("title", "") or hint.get("vuln_type", "") or "未命名风险线索").strip()
+        file_path = str(hint.get("file_path", "") or "").strip()
+        description = str(hint.get("description", "") or "").strip().replace("\n", " ")
+        line = title[:80]
+        if file_path:
+            line += f" | file={file_path[:140]}"
+        if description:
+            line += f" | evidence={description[:180]}"
+        lines.append(line)
     return lines
 
 
@@ -6946,6 +7319,17 @@ def _build_audit_memory(stages: list[AuditStage], current_stage_num: int | None 
         stage_vulns = findings.get("vulnerabilities", [])
         if not isinstance(stage_vulns, list):
             stage_vulns = []
+        stage_risk_hints = []
+        if stage.stage_num == 1:
+            hint_payload = {"risk_hints": [], "vulnerability_hints": []}
+            for source in [findings, compressed]:
+                if not isinstance(source, dict):
+                    continue
+                for key in ["risk_hints", "vulnerability_hints"]:
+                    value = source.get(key)
+                    if isinstance(value, list):
+                        hint_payload[key].extend(value)
+            stage_risk_hints = _collect_stage1_risk_hints(hint_payload)
 
         stage_summary = str(
             compressed.get("stage_summary")
@@ -6986,7 +7370,8 @@ def _build_audit_memory(stages: list[AuditStage], current_stage_num: int | None 
         output_points = _merge_unique_items(output_points, architecture_info.get("output_points"))
         vulnerability_hints = _merge_vulnerability_lists(
             vulnerability_hints,
-            compressed.get("vulnerability_hints") if isinstance(compressed.get("vulnerability_hints"), list) else stage_vulns,
+            stage_risk_hints
+            or (compressed.get("vulnerability_hints") if isinstance(compressed.get("vulnerability_hints"), list) else stage_vulns),
         )[:30]
         evidence_files = _merge_unique_items(evidence_files, stage_record["files"])[:40]
 

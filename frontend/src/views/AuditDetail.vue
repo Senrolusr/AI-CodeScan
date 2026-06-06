@@ -22,6 +22,7 @@ import { buildSeverityStats, buildTaskRescanRecommendations } from '../utils/aud
 import { isAuditRetryBlocked } from '../utils/auditTaskState'
 import { usePolling } from '../composables/usePolling'
 import { normalizeScanStats } from '../utils/scanStats'
+import { collectRiskHints, riskHintMeta } from '../utils/riskHints'
 
 const props = defineProps({ id: [String, Number] })
 const router = useRouter()
@@ -132,16 +133,6 @@ const tokenStats = computed(() => {
   return ts && typeof ts === 'object' && ts.llm_call_count > 0 ? ts : null
 })
 const severityStats = computed(() => {
-  const summaryValue = taskSummary.value.severity_stats
-  if (summaryValue && typeof summaryValue === 'object') {
-    return {
-      Critical: Number(summaryValue.Critical || 0),
-      High: Number(summaryValue.High || 0),
-      Medium: Number(summaryValue.Medium || 0),
-      Low: Number(summaryValue.Low || 0),
-      Info: Number(summaryValue.Info || 0),
-    }
-  }
   return buildSeverityStats(vulns.value || [])
 })
 const rescanRecommendations = computed(() => {
@@ -193,6 +184,10 @@ const databaseModels = computed(() => Array.isArray(archInfo.value.database_mode
 const securityBoundaries = computed(() => archInfo.value.security_boundaries && typeof archInfo.value.security_boundaries === 'object' ? archInfo.value.security_boundaries : null)
 const externalIntegrations = computed(() => Array.isArray(archInfo.value.external_integrations) ? archInfo.value.external_integrations : [])
 const gapAnalysis = computed(() => archInfo.value._gap_analysis && typeof archInfo.value._gap_analysis === 'object' ? archInfo.value._gap_analysis : null)
+const stageOneRiskHints = computed(() => collectRiskHints(
+  stageOneStage.value?.findings,
+  stageOneStage.value?.compressed_summary,
+))
 
 // 预扫描概况
 const preDiscovery = computed(() => {
@@ -445,9 +440,31 @@ const agentFocusGuidance = (stageNum) => {
 }
 const vulnCountForStage = (stageNum) => {
   const s = stageMap.value[stageNum]
-  if (!s?.findings || typeof s.findings !== 'object') return 0
-  if (Number.isFinite(Number(s.findings._vulnerability_count))) return Number(s.findings._vulnerability_count)
-  return Array.isArray(s.findings.vulnerabilities) ? s.findings.vulnerabilities.length : 0
+  return stageQualityStats(s).formal
+}
+const stageQualityStats = (stage) => {
+  const findings = stage?.findings
+  if (!findings || typeof findings !== 'object') return { candidate: 0, formal: 0, filtered: 0 }
+  const rawCandidate = Number(findings._candidate_vulnerability_count)
+  const fallbackCandidate = Number.isFinite(Number(findings._vulnerability_count))
+    ? Number(findings._vulnerability_count)
+    : (Array.isArray(findings.vulnerabilities) ? findings.vulnerabilities.length : 0)
+  const candidate = Number.isFinite(rawCandidate) ? rawCandidate : fallbackCandidate
+  const rawFormal = Number(findings._formal_vulnerability_count)
+  const formal = Number.isFinite(rawFormal) ? rawFormal : candidate
+  const rawFiltered = Number(findings._filtered_vulnerability_count)
+  const filtered = Number.isFinite(rawFiltered) ? rawFiltered : Math.max(candidate - formal, 0)
+  return { candidate, formal, filtered }
+}
+const stageQualityNote = (stage) => {
+  const stats = stageQualityStats(stage)
+  if (!stats.filtered) return ''
+  return stage?.findings?._quality_gate_note || t('stageQualityGateNote', stats)
+}
+const stageCandidateText = (stage) => {
+  const stats = stageQualityStats(stage)
+  if (!stats.candidate || stats.candidate === stats.formal) return ''
+  return t('stageCandidateSummary', stats)
 }
 const reviewRerunExecution = computed(() => {
   const value = reviewStage.value?.findings?.rerun_execution
@@ -661,6 +678,19 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
               </el-collapse-item>
             </el-collapse>
 
+            <div
+              v-if="stageOneRiskHints.length"
+              style="margin-top: 10px; padding: 10px 12px; border-radius: 8px; background: var(--bg-warning); border: 1px solid var(--border-warning); color: var(--text-warning); font-size: 12px; line-height: 1.6"
+            >
+              <div style="font-weight: 600; margin-bottom: 6px">{{ t('stageOneRiskHints') }} ({{ stageOneRiskHints.length }})</div>
+              <div style="color: var(--text-muted); margin-bottom: 8px">{{ t('stageOneRiskHintsNotice') }}</div>
+              <div v-for="(hint, index) in stageOneRiskHints.slice(0, 4)" :key="`stage1-hint-${index}`" style="margin-top: 6px">
+                <strong>{{ hint.title }}</strong>
+                <span v-if="hint.vuln_type"> · {{ hint.vuln_type === 'risk_hint' ? t('riskHint') : hint.vuln_type }}</span>
+                <div v-if="riskHintMeta(hint)" style="color: var(--text-muted)">{{ riskHintMeta(hint) }}</div>
+              </div>
+            </div>
+
             <!-- 扩展架构信息 -->
             <div v-if="archStage?.status === 'completed' && (middlewareChain.length || databaseModels.length || securityBoundaries || externalIntegrations.length)" style="margin-top: 12px">
               <el-descriptions :column="3" border size="small">
@@ -735,6 +765,7 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
                     <el-tag :type="statusType(stage.status)" size="small">{{ statusLabel(stage.status) }}</el-tag>
                     <el-tag v-if="stage.agent_role === 'sub_agent'" size="small" type="warning" effect="plain">Agent</el-tag>
                     <el-tag v-if="vulnCountForStage(stage.stage_num) > 0" size="small" type="danger" effect="plain">{{ vulnCountForStage(stage.stage_num) }} {{ t('vulnerabilities') }}</el-tag>
+                    <el-tag v-if="stageCandidateText(stage)" size="small" type="info" effect="plain">{{ stageCandidateText(stage) }}</el-tag>
                   </div>
                   <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
                     <span style="color: var(--text-muted); font-size: 12px">{{ formatTimeOnly(stage.started_at) }} ~ {{ formatTimeOnly(stage.completed_at) }}</span>
@@ -745,6 +776,9 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
                 </div>
                 <div v-if="stage.status === 'skipped' && stage.findings?.skip_reason" style="margin-top: 4px; color: var(--text-muted); font-size: 12px">
                   {{ stage.findings.skip_reason }}
+                </div>
+                <div v-if="stageQualityNote(stage)" style="margin-top: 4px; color: var(--text-muted); font-size: 12px; line-height: 1.5">
+                  {{ stageQualityNote(stage) }}
                 </div>
                 <div v-if="stageSummary(stage) && stage.status !== 'skipped'" style="margin-top: 6px; color: var(--text-secondary); line-height: 1.6; white-space: pre-wrap; font-size: 13px">{{ stageSummary(stage) }}</div>
                 <el-collapse v-if="stageRecoveryNote(stage) || (stage.findings?._debug && stage.status !== 'skipped')" style="margin-top: 6px; border: none">
@@ -811,6 +845,7 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
           <el-descriptions-item :label="t('identifiedRouteCount')">{{ stageOneRouteCount }}</el-descriptions-item>
           <el-descriptions-item :label="t('staticRoutes')">{{ stageOneGapSummary.static_route_count || 0 }}</el-descriptions-item>
           <el-descriptions-item :label="t('missingRoutes')">{{ stageOneGapSummary.missing_route_count || 0 }}</el-descriptions-item>
+          <el-descriptions-item :label="t('riskHints')">{{ stageOneRiskHints.length }}</el-descriptions-item>
           <el-descriptions-item :label="t('auditScopeCoverage')">
             {{ formatPercent(stageOneCoverageRatio) }}
           </el-descriptions-item>

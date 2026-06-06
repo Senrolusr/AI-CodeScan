@@ -67,16 +67,27 @@ if os.path.exists(REPORTS_DIR):
 @app.get("/api/stats")
 async def get_stats():
     from database import async_session
-    from models import Project, AuditTask, Vulnerability
+    from models import AuditStage, Project, AuditTask, Vulnerability
     from sqlalchemy import select, func
 
     async with async_session() as session:
         project_count = (await session.execute(select(func.count(Project.id)))).scalar() or 0
         audit_count = (await session.execute(select(func.count(AuditTask.id)))).scalar() or 0
-        vuln_count = (await session.execute(select(func.count(Vulnerability.id)))).scalar() or 0
+        vuln_count = (
+            await session.execute(
+                select(func.count(Vulnerability.id))
+                .join(AuditStage, Vulnerability.stage_id == AuditStage.id)
+                .where(AuditStage.stage_num.between(2, 9))
+            )
+        ).scalar() or 0
         crit_count = (
             await session.execute(
-                select(func.count(Vulnerability.id)).where(Vulnerability.severity.in_(["Critical", "High"]))
+                select(func.count(Vulnerability.id))
+                .join(AuditStage, Vulnerability.stage_id == AuditStage.id)
+                .where(
+                    AuditStage.stage_num.between(2, 9),
+                    Vulnerability.severity.in_(["Critical", "High"]),
+                )
             )
         ).scalar() or 0
 

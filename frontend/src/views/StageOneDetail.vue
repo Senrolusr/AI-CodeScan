@@ -7,6 +7,7 @@ import { useI18n } from '../i18n'
 import { usePolling } from '../composables/usePolling'
 import ScanOverview from '../components/ScanOverview.vue'
 import { normalizeScanStats } from '../utils/scanStats'
+import { collectRiskHints, riskHintMeta } from '../utils/riskHints'
 
 const props = defineProps({ id: [String, Number] })
 const router = useRouter()
@@ -51,6 +52,11 @@ const stageOneDataFlows = computed(() => {
   const df = stageOneArchitecture.value?.data_flows
   return Array.isArray(df) ? df : []
 })
+const stageOneRiskHints = computed(() => collectRiskHints(
+  stageOneStage.value?.findings,
+  stageOneStage.value?.compressed_summary,
+  artifact.value?.payload?.merged_response_preview,
+))
 const stageOneRoutes = computed(() => Array.isArray(stageOneStage.value?.findings?.architecture_info?.routes) ? stageOneStage.value.findings.architecture_info.routes : [])
 const taskSummary = computed(() => {
   const summary = task.value?.summary
@@ -241,10 +247,38 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
         <span>{{ t('outputPoints') }}: <strong>{{ stageOneOutputPoints.length }}</strong></span>
         <span>{{ t('coreModules') }}: <strong>{{ stageOneModules.length }}</strong></span>
         <span>{{ t('dataFlows') }}: <strong>{{ stageOneDataFlows.length }}</strong></span>
+        <span>{{ t('riskHints') }}: <strong>{{ stageOneRiskHints.length }}</strong></span>
         <span>{{ t('auditScopeCoverage') }}: <strong>{{ formatPercent(stageOneCoverageRatio) }}</strong></span>
       </div>
       <div style="margin-top: 8px; color: var(--text-muted); font-size: 12px; line-height: 1.6">
         {{ stageOneCoverageNote }}
+      </div>
+    </el-card>
+
+    <el-card v-if="stageOneRiskHints.length" style="margin-bottom: 20px">
+      <template #header>
+        <span class="card-title">{{ t('stageOneRiskHints') }} ({{ stageOneRiskHints.length }})</span>
+      </template>
+      <el-alert
+        :title="t('stageOneRiskHintsNotice')"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 12px"
+      />
+      <div style="display: grid; gap: 10px">
+        <div
+          v-for="(hint, index) in stageOneRiskHints.slice(0, 20)"
+          :key="`risk-hint-${index}`"
+          style="padding: 10px 12px; border: 1px solid var(--border-warning); border-radius: 8px; background: var(--bg-warning); line-height: 1.6"
+        >
+          <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
+            <el-tag size="small" type="warning" effect="plain">{{ hint.vuln_type && hint.vuln_type !== 'risk_hint' ? hint.vuln_type : t('riskHint') }}</el-tag>
+            <strong>{{ hint.title }}</strong>
+          </div>
+          <div v-if="riskHintMeta(hint)" style="margin-top: 4px; color: var(--text-muted); font-size: 12px">{{ riskHintMeta(hint) }}</div>
+          <div v-if="hint.description" style="margin-top: 6px; color: var(--text-secondary); font-size: 13px">{{ hint.description }}</div>
+        </div>
       </div>
     </el-card>
 
@@ -263,6 +297,7 @@ const previewList = (value, limit = 8) => Array.isArray(value) ? value.slice(0, 
         <el-descriptions-item :label="t('staticRoutes')">{{ routeGapSummary.static_route_count || 0 }}</el-descriptions-item>
         <el-descriptions-item :label="t('confirmedRoutes')">{{ routeGapSummary.confirmed_route_count || 0 }}</el-descriptions-item>
         <el-descriptions-item :label="t('missingRoutes')">{{ routeGapSummary.missing_route_count || 0 }}</el-descriptions-item>
+        <el-descriptions-item :label="t('riskHints')">{{ stageOneRiskHints.length }}</el-descriptions-item>
         <el-descriptions-item :label="t('riskWindowCompression')">{{ stageOneCoverage.signal_window_chunk_count || 0 }}</el-descriptions-item>
       </el-descriptions>
       <div style="margin-top: 10px; color: var(--text-muted); font-size: 12px; line-height: 1.6">

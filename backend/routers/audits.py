@@ -3,14 +3,19 @@ import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import AuditStage, AuditTask, LlmConfig, Project, Vulnerability
 from prompts.stage_prompts import get_stage_name
 from schemas import AuditCreate, AuditStageOut, AuditTaskOut, VulnerabilityOut
-from services.audit_engine import _coerce_stage_findings, _severity_match_values, _severity_order_expr
+from services.audit_engine import (
+    _coerce_stage_findings,
+    _collect_stage1_risk_hints,
+    _severity_match_values,
+    _severity_order_expr,
+)
 from services.audit_worker import clear_task_queue_state, mark_task_queued
 from services.audit_cleanup import (
     delete_audit_task_records,
@@ -142,6 +147,7 @@ async def create_audit(
         "selected_stage_nums": list(range(1, 10)),
         "current_phase": 1,
         "multi_agent_phase_mode": True,
+        "auto_second_pass": False,
     }
 
     task = AuditTask(
@@ -270,16 +276,48 @@ def _build_stage_debug_payload(stage: AuditStage) -> dict | None:
     }
 
 
-def _build_stage_findings_preview(stage: AuditStage) -> list | dict:
+def _stage1_risk_hints_from_findings(findings: dict, compressed: dict | None = None) -> list:
+    payload = {"risk_hints": [], "vulnerability_hints": [], "vulnerabilities": []}
+    compressed = compressed if isinstance(compressed, dict) else {}
+    for source in [findings, compressed]:
+        for key in ["risk_hints", "vulnerability_hints", "vulnerabilities"]:
+            value = source.get(key) if isinstance(source, dict) else None
+            if isinstance(value, list):
+                payload[key].extend(value)
+    return _collect_stage1_risk_hints(payload)
+
+
+def _build_stage_quality_counts(stage: AuditStage, findings: dict, formal_count: int | None = None) -> dict:
+    vulnerabilities = findings.get("vulnerabilities", []) if isinstance(findings, dict) else []
+    candidate_count = len(vulnerabilities) if isinstance(vulnerabilities, list) else 0
+    if stage.stage_num == 1:
+        candidate_count = 0
+        formal_count = 0
+    formal_count = max(0, int(formal_count or 0))
+    filtered_count = max(0, candidate_count - formal_count)
+    payload = {
+        "_candidate_vulnerability_count": candidate_count,
+        "_formal_vulnerability_count": formal_count,
+        "_filtered_vulnerability_count": filtered_count,
+    }
+    if 2 <= stage.stage_num <= 9 and filtered_count > 0:
+        payload["_quality_gate_note"] = "部分候选因缺少标题/类型/入口证据、缺少 file_path 与 endpoint，或与已有漏洞同根因去重，未进入正式漏洞列表。"
+    return payload
+
+
+def _build_stage_findings_preview(stage: AuditStage, formal_count: int | None = None) -> list | dict:
     findings = _coerce_stage_findings(stage.findings)
     compressed = stage.compressed_summary if isinstance(stage.compressed_summary, dict) else {}
     vulnerabilities = findings.get("vulnerabilities", [])
     vulnerability_count = len(vulnerabilities) if isinstance(vulnerabilities, list) else 0
+    if stage.stage_num == 1:
+        vulnerability_count = 0
 
     preview = {
         "stage_summary": compressed.get("stage_summary") or findings.get("stage_summary") or "",
         "_vulnerability_count": vulnerability_count,
     }
+    preview.update(_build_stage_quality_counts(stage, findings, formal_count))
     for key in ["parse_error", "raw_response", "_policy_note", "_policy_stats", "_salvaged", "skipped", "skip_reason"]:
         if key in findings:
             preview[key] = findings.get(key)
@@ -295,6 +333,10 @@ def _build_stage_findings_preview(stage: AuditStage) -> list | dict:
                 preview[key] = findings.get(key)
 
     if stage.stage_num == 1:
+        risk_hints = _stage1_risk_hints_from_findings(findings, compressed)
+        preview["risk_hints"] = risk_hints[:8]
+        preview["_risk_hint_count"] = len(risk_hints)
+        preview["vulnerabilities"] = []
         arch = findings.get("architecture_info") if isinstance(findings.get("architecture_info"), dict) else {}
         if not arch and isinstance(compressed.get("architecture_info"), dict):
             arch = compressed.get("architecture_info", {})
@@ -324,13 +366,22 @@ def _build_stage_findings_preview(stage: AuditStage) -> list | dict:
     return preview
 
 
-def _serialize_stage(stage: AuditStage, *, include_payloads: bool) -> dict:
+def _serialize_stage(stage: AuditStage, *, include_payloads: bool, formal_count: int | None = None) -> dict:
     if 1 <= stage.stage_num <= 9:
         stage_name = get_stage_name(stage.stage_num)
     else:
         stage_name = stage.stage_name
 
-    findings = _coerce_stage_findings(stage.findings) if include_payloads else _build_stage_findings_preview(stage)
+    findings = _coerce_stage_findings(stage.findings) if include_payloads else _build_stage_findings_preview(stage, formal_count)
+    if include_payloads and stage.stage_num == 1 and isinstance(findings, dict):
+        findings = dict(findings)
+        findings["risk_hints"] = _stage1_risk_hints_from_findings(
+            findings,
+            stage.compressed_summary if isinstance(stage.compressed_summary, dict) else {},
+        )
+        findings["vulnerabilities"] = []
+    if include_payloads and isinstance(findings, dict):
+        findings.update(_build_stage_quality_counts(stage, findings, formal_count))
     if include_payloads:
         debug_payload = _build_stage_debug_payload(stage)
         if debug_payload:
@@ -353,6 +404,19 @@ def _serialize_stage(stage: AuditStage, *, include_payloads: bool) -> dict:
     }
 
 
+async def _get_stage_formal_vuln_counts(db: AsyncSession, task_id: int) -> dict[int, int]:
+    result = await db.execute(
+        select(AuditStage.stage_num, func.count(Vulnerability.id))
+        .join(Vulnerability, Vulnerability.stage_id == AuditStage.id)
+        .where(
+            Vulnerability.task_id == task_id,
+            AuditStage.stage_num.between(2, 9),
+        )
+        .group_by(AuditStage.stage_num)
+    )
+    return {int(stage_num): int(count or 0) for stage_num, count in result.all()}
+
+
 @router.get("/{task_id}/stages", response_model=list[AuditStageOut])
 async def get_audit_stages(
     task_id: int,
@@ -363,7 +427,11 @@ async def get_audit_stages(
         select(AuditStage).where(AuditStage.task_id == task_id).order_by(AuditStage.stage_num)
     )
     stages = result.scalars().all()
-    return [_serialize_stage(stage, include_payloads=include_payloads) for stage in stages]
+    formal_counts = await _get_stage_formal_vuln_counts(db, task_id)
+    return [
+        _serialize_stage(stage, include_payloads=include_payloads, formal_count=formal_counts.get(stage.stage_num, 0))
+        for stage in stages
+    ]
 
 
 @router.get("/{task_id}/stages/{stage_num}", response_model=AuditStageOut)
@@ -374,7 +442,8 @@ async def get_audit_stage_detail(task_id: int, stage_num: int, db: AsyncSession 
     stage = result.scalar_one_or_none()
     if not stage:
         raise HTTPException(404, "审计阶段不存在")
-    return _serialize_stage(stage, include_payloads=True)
+    formal_counts = await _get_stage_formal_vuln_counts(db, task_id)
+    return _serialize_stage(stage, include_payloads=True, formal_count=formal_counts.get(stage.stage_num, 0))
 
 
 @router.get("/{task_id}/stages/{stage_num}/artifact")
@@ -413,7 +482,14 @@ async def get_audit_vulns(
     severity: str = None,
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(Vulnerability).where(Vulnerability.task_id == task_id)
+    query = (
+        select(Vulnerability)
+        .join(AuditStage, Vulnerability.stage_id == AuditStage.id)
+        .where(
+            Vulnerability.task_id == task_id,
+            AuditStage.stage_num.between(2, 9),
+        )
+    )
     if severity:
         query = query.where(Vulnerability.severity.in_(_severity_match_values(severity)))
     result = await db.execute(

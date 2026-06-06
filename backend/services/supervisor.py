@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, select
@@ -20,6 +21,10 @@ from prompts.supervisor_prompts import (
     AGENT_FOCUS_PREFIX,
 )
 from services.code_parser import get_or_build_project_cache
+from services.json_repair import (
+    decode_json_string_fragment as _decode_json_string_fragment,
+    extract_balanced_json_value as _extract_balanced_json_value,
+)
 from services.llm_client import call_llm_with_meta
 from services.audit_engine import (
     _accumulate_token_usage,
@@ -27,22 +32,18 @@ from services.audit_engine import (
     _coerce_stage_findings,
     _build_audit_memory,
     _build_prev_context,
-    _get_stage_retry_policy,
     _is_task_cancelled,
-    _merge_stage1_routes,
     _refresh_task_summary,
     _run_single_pass_stage,
     _run_stage1_multi_pass,
     _select_stage_chunks,
-    _store_vulnerabilities,
     _parse_structured_response,
-    _enforce_vulnerability_output_policy,
-    _hydrate_vulnerability_endpoints,
-    _build_stage_artifact_path,
     _summarize_pre_discovery,
 )
 
 logger = logging.getLogger(__name__)
+
+FALLBACK_MAX_AGENT_COUNT = 7
 
 
 def _add_task_degradation(task: AuditTask, code: str, message: str, phase: str) -> None:
@@ -81,6 +82,286 @@ def _safe_int(value, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _extract_json_string_field(text: str, field: str) -> str:
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*"((?:\\.|[^"\\])*)"', text, re.S)
+    if not match:
+        return ""
+    return _decode_json_string_fragment(match.group(1)).strip()
+
+
+def _extract_balanced_json_object(text: str, start_index: int) -> tuple[str, int]:
+    return _extract_balanced_json_value(text, start_index, "{", "}")
+
+
+def _extract_balanced_json_array(text: str, start_index: int) -> tuple[str, int, bool]:
+    array_text, next_index = _extract_balanced_json_value(text, start_index, "[", "]")
+    if array_text:
+        return array_text, next_index, True
+    return text[start_index:], len(text), False
+
+
+def _extract_json_array_objects(text: str, field: str) -> list[dict]:
+    marker_index = text.find(f'"{field}"')
+    if marker_index == -1:
+        return []
+    array_start = text.find("[", marker_index)
+    if array_start == -1:
+        return []
+
+    array_text, _, completed = _extract_balanced_json_array(text, array_start)
+    items: list[dict] = []
+    cursor = 1
+    while cursor < len(array_text):
+        object_start = array_text.find("{", cursor)
+        if object_start == -1:
+            break
+        object_text, next_index = _extract_balanced_json_object(array_text, object_start)
+        if not object_text:
+            break
+        try:
+            value = json.loads(object_text)
+        except json.JSONDecodeError:
+            cursor = next_index
+            continue
+        if isinstance(value, dict):
+            items.append(value)
+        cursor = next_index
+        if completed and cursor >= len(array_text) - 1:
+            break
+    return items
+
+
+def _extract_json_array_stage_nums(text: str, field: str) -> list[int]:
+    marker_index = text.find(f'"{field}"')
+    if marker_index == -1:
+        return []
+    array_start = text.find("[", marker_index)
+    if array_start == -1:
+        return []
+
+    array_text, _, _ = _extract_balanced_json_array(text, array_start)
+    stage_nums: list[int] = []
+    for match in re.finditer(r'"stage_num"\s*:\s*(\d+)', array_text):
+        stage_num = _safe_int(match.group(1))
+        if 2 <= stage_num <= 9 and stage_num not in stage_nums:
+            stage_nums.append(stage_num)
+    return stage_nums
+
+
+def _normalize_agent_specs(items: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    seen_stage_nums: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        stage_num = _safe_int(item.get("stage_num"))
+        if stage_num < 2 or stage_num > 9 or stage_num in seen_stage_nums:
+            continue
+        spec = dict(item)
+        spec["stage_num"] = stage_num
+        for key in ["focus_files", "focus_routes", "focus_functions", "focus_data_flows"]:
+            if not isinstance(spec.get(key), list):
+                spec[key] = []
+        normalized.append(spec)
+        seen_stage_nums.add(stage_num)
+
+    for index, item in enumerate(normalized, start=1):
+        item["priority"] = index
+    return normalized
+
+
+def _minimal_agent_spec(stage_num: int, *, reason: str, evidence: int = 0) -> dict:
+    focus_guidance = BASELINE_AGENT_GUIDANCE.get(stage_num)
+    if not focus_guidance:
+        spec_label = STAGE_SPECS.get(stage_num, f"Stage {stage_num}")
+        evidence_text = f"静态证据 {evidence} 条，" if evidence > 0 else ""
+        focus_guidance = (
+            f"Supervisor 规划响应被截断，已根据{evidence_text}阶段主题补入该 Agent。"
+            f"请聚焦 {spec_label}，只输出有明确代码证据、入口和可复现条件的结论。"
+        )
+    return {
+        "stage_num": stage_num,
+        "priority": 0,
+        "focus_guidance": focus_guidance,
+        "focus_files": [],
+        "focus_routes": [],
+        "_recovered_agent": True,
+        "_recovery_reason": reason,
+    }
+
+
+def _agent_plan_available_slots(selected: list[dict], max_agents: int | None) -> int:
+    if not max_agents:
+        return 100
+    selected_stage_nums = {_safe_int(item.get("stage_num")) for item in selected if isinstance(item, dict)}
+    missing_baseline_count = sum(1 for stage_num in BASELINE_AGENT_GUIDANCE if stage_num not in selected_stage_nums)
+    return max(0, int(max_agents) - len(selected) - missing_baseline_count)
+
+
+def _append_agent_if_budget(
+    selected: list[dict],
+    stage_num: int,
+    *,
+    max_agents: int | None,
+    reason: str,
+    evidence: int = 0,
+) -> None:
+    if stage_num < 2 or stage_num > 9:
+        return
+    selected_stage_nums = {_safe_int(item.get("stage_num")) for item in selected if isinstance(item, dict)}
+    if stage_num in selected_stage_nums:
+        return
+    if stage_num not in BASELINE_AGENT_GUIDANCE and _agent_plan_available_slots(selected, max_agents) <= 0:
+        return
+    selected.append(_minimal_agent_spec(stage_num, reason=reason, evidence=evidence))
+
+
+def _augment_salvaged_plan_with_evidence(
+    agent_plan: dict,
+    raw: str,
+    rule_hits: list,
+    source_sink_hints: list,
+    max_agents: int | None = None,
+) -> dict:
+    normalized = dict(agent_plan) if isinstance(agent_plan, dict) else {}
+    selected = [dict(item) for item in normalized.get("selected_agents", []) if isinstance(item, dict)]
+    stage_evidence = _build_stage_evidence_scores(rule_hits, source_sink_hints)
+
+    recovered_stage_nums: list[int] = []
+    for stage_num in _extract_json_array_stage_nums(str(raw or ""), "selected_agents"):
+        before = len(selected)
+        _append_agent_if_budget(
+            selected,
+            stage_num,
+            max_agents=max_agents,
+            reason="partial_selected_agents_fragment",
+            evidence=stage_evidence.get(stage_num, 0),
+        )
+        if len(selected) > before:
+            recovered_stage_nums.append(stage_num)
+
+    for stage_num in _select_fallback_stage_nums(stage_evidence, max_agents=max_agents):
+        if _agent_plan_available_slots(selected, max_agents) <= 0:
+            break
+        _append_agent_if_budget(
+            selected,
+            stage_num,
+            max_agents=max_agents,
+            reason="static_evidence_backfill",
+            evidence=stage_evidence.get(stage_num, 0),
+        )
+
+    for index, item in enumerate(selected, start=1):
+        item["priority"] = index
+
+    normalized["selected_agents"] = selected
+    if recovered_stage_nums:
+        normalized["_salvaged_partial_stage_nums"] = recovered_stage_nums
+    return normalized
+
+
+def _salvage_supervisor_plan(raw: str, rule_hits: list | None = None, source_sink_hints: list | None = None, max_agents: int | None = None) -> dict | None:
+    text = str(raw or "").strip().replace("\ufeff", "").replace("\u200b", "")
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    selected_agents = _normalize_agent_specs(_extract_json_array_objects(text, "selected_agents"))
+    if not selected_agents:
+        return None
+
+    skipped_agents = _normalize_agent_specs(_extract_json_array_objects(text, "skipped_agents"))
+    plan = {
+        "analysis_summary": _extract_json_string_field(text, "analysis_summary"),
+        "selected_agents": selected_agents,
+        "skipped_agents": skipped_agents,
+        "_salvaged": True,
+        "_salvage_reason": "planning_response_truncated",
+    }
+    return _augment_salvaged_plan_with_evidence(plan, raw, rule_hits or [], source_sink_hints or [], max_agents=max_agents)
+
+
+BASELINE_AGENT_GUIDANCE = {
+    7: "配置与依赖安全是基线审计阶段。即使规则命中较少，也要检查配置文件、环境变量模板、默认密钥、调试开关、CORS、部署文件和依赖清单，确认是否存在可由本项目暴露面触发的风险。",
+    9: "业务逻辑安全是基线审计阶段。即使规则命中较少，也要围绕状态变更、导入导出、创建/删除/更新、审批/订阅/通知等接口检查服务端约束、幂等性和越权业务流程。",
+}
+
+
+def _trim_agent_plan_to_budget(selected: list[dict], skipped: list[dict], max_agents: int | None) -> tuple[list[dict], list[dict]]:
+    if not max_agents or len(selected) <= int(max_agents):
+        return selected, skipped
+
+    required_stage_nums = {
+        _safe_int(item.get("stage_num"))
+        for item in selected
+        if _safe_int(item.get("stage_num")) in BASELINE_AGENT_GUIDANCE
+    }
+    non_baseline_slots = max(0, int(max_agents) - len(required_stage_nums))
+    kept_non_baseline: set[int] = set()
+    for item in selected:
+        stage_num = _safe_int(item.get("stage_num"))
+        if stage_num in BASELINE_AGENT_GUIDANCE or stage_num in kept_non_baseline:
+            continue
+        if len(kept_non_baseline) >= non_baseline_slots:
+            continue
+        kept_non_baseline.add(stage_num)
+
+    keep_stage_nums = required_stage_nums | kept_non_baseline
+    trimmed: list[dict] = []
+    for item in selected:
+        stage_num = _safe_int(item.get("stage_num"))
+        if stage_num in keep_stage_nums:
+            trimmed.append(item)
+            continue
+        skipped_item = dict(item)
+        skipped_item["skip_reason"] = "Skipped by agent budget after baseline stage enforcement"
+        skipped_item["_budget_trimmed"] = True
+        skipped.append(skipped_item)
+
+    return trimmed, skipped
+
+
+def _ensure_baseline_agents(agent_plan: dict, max_agents: int | None = None) -> dict:
+    """Force baseline stages that are easy to miss in evidence-driven planning."""
+    normalized = dict(agent_plan) if isinstance(agent_plan, dict) else {}
+    selected = [dict(item) for item in normalized.get("selected_agents", []) if isinstance(item, dict)]
+    skipped = [dict(item) for item in normalized.get("skipped_agents", []) if isinstance(item, dict)]
+    selected_stage_nums = {_safe_int(item.get("stage_num")) for item in selected}
+
+    for stage_num, guidance in BASELINE_AGENT_GUIDANCE.items():
+        if stage_num in selected_stage_nums:
+            continue
+        selected.append(
+            {
+                "stage_num": stage_num,
+                "priority": len(selected) + 1,
+                "focus_guidance": guidance,
+                "focus_files": [],
+                "focus_routes": [],
+                "_baseline_required": True,
+            }
+        )
+        selected_stage_nums.add(stage_num)
+
+    skipped = [
+        item
+        for item in skipped
+        if _safe_int(item.get("stage_num")) not in BASELINE_AGENT_GUIDANCE
+    ]
+    selected, skipped = _trim_agent_plan_to_budget(selected, skipped, max_agents)
+
+    for index, item in enumerate(selected, start=1):
+        item["priority"] = index
+
+    normalized["selected_agents"] = selected
+    normalized["skipped_agents"] = skipped
+    return normalized
 
 
 def _build_rerun_execution(stages: list[AuditStage], requested_stage_nums: list[int]) -> dict:
@@ -338,6 +619,7 @@ async def _load_audit_context(session, task_id: int):
     pre_discovery_summary = _summarize_pre_discovery(pre_discovery)
     if pre_discovery_summary:
         summary["pre_discovery"] = pre_discovery_summary
+    summary.pop("worker_failure", None)
     task.summary = summary
     task.status = "running"
     task.error_message = ""
@@ -511,15 +793,37 @@ async def _run_supervisor_planning(session, task, stages, llm_config, project, a
 
         agent_plan = _parse_structured_response(result["content"], result.get("meta"))
         if isinstance(agent_plan, dict) and agent_plan.get("parse_error"):
-            _add_task_degradation(
-                task,
-                "supervisor_planning_parse_error",
-                "Supervisor 规划响应解析失败，已使用默认审计计划继续执行。",
-                "planning",
+            salvaged_plan = _salvage_supervisor_plan(
+                result["content"],
+                rule_hits=rule_hits,
+                source_sink_hints=source_sink_hints,
+                max_agents=FALLBACK_MAX_AGENT_COUNT,
             )
-            agent_plan = _build_default_plan(rule_hits, source_sink_hints)
-            agent_plan["_fallback"] = True
-            agent_plan["_fallback_reason"] = "planning_parse_error"
+            if salvaged_plan:
+                _add_task_degradation(
+                    task,
+                    "supervisor_planning_salvaged",
+                    "Supervisor 规划响应被截断，已恢复可用 Agent 计划继续执行。",
+                    "planning",
+                )
+                agent_plan = salvaged_plan
+            else:
+                _add_task_degradation(
+                    task,
+                    "supervisor_planning_parse_error",
+                    "Supervisor 规划响应解析失败，已使用受限默认审计计划继续执行。",
+                    "planning",
+                )
+                agent_plan = _build_default_plan(
+                    rule_hits,
+                    source_sink_hints,
+                    max_agents=FALLBACK_MAX_AGENT_COUNT,
+                )
+                agent_plan["_fallback"] = True
+                agent_plan["_fallback_reason"] = "planning_parse_error"
+
+        if isinstance(agent_plan, dict):
+            agent_plan = _ensure_baseline_agents(agent_plan, max_agents=FALLBACK_MAX_AGENT_COUNT)
 
         plan_stage.findings = agent_plan if isinstance(agent_plan, dict) else {"raw": str(agent_plan)[:5000]}
         plan_stage.llm_response = result["content"][:10000]
@@ -544,10 +848,14 @@ async def _run_supervisor_planning(session, task, stages, llm_config, project, a
         )
         await session.commit()
         logger.warning("Supervisor planning failed, using default plan: %s", exc)
-        fallback_plan = _build_default_plan(rule_hits, source_sink_hints)
+        fallback_plan = _build_default_plan(
+            rule_hits,
+            source_sink_hints,
+            max_agents=FALLBACK_MAX_AGENT_COUNT,
+        )
         fallback_plan["_fallback"] = True
         fallback_plan["_fallback_reason"] = "planning_failed"
-        return fallback_plan
+        return _ensure_baseline_agents(fallback_plan, max_agents=FALLBACK_MAX_AGENT_COUNT)
 
 
 async def _run_supervisor_review(session, task, stages, llm_config, audit_memory, agent_plan, extra_findings: dict | None = None):
@@ -911,8 +1219,7 @@ def _summarize_source_sink_hints(hints: list) -> str:
     return "\n".join(lines) if lines else "No source-sink hints"
 
 
-def _build_default_plan(rule_hits: list, source_sink_hints: list) -> dict:
-    """Build a fallback agent plan from static evidence counts."""
+def _build_stage_evidence_scores(rule_hits: list, source_sink_hints: list) -> dict[int, int]:
     stage_evidence: dict[int, int] = {}
     for hit in rule_hits:
         if not isinstance(hit, dict):
@@ -924,24 +1231,75 @@ def _build_default_plan(rule_hits: list, source_sink_hints: list) -> dict:
             continue
         for sn in (hint.get("stage_nums") or []):
             stage_evidence[int(sn)] = stage_evidence.get(int(sn), 0) + 1
+    return stage_evidence
+
+
+def _select_fallback_stage_nums(stage_evidence: dict[int, int], max_agents: int | None = None) -> list[int]:
+    candidates = [
+        stage_num
+        for stage_num in range(2, 10)
+        if stage_evidence.get(stage_num, 0) > 0 or stage_num in BASELINE_AGENT_GUIDANCE
+    ]
+    if not candidates:
+        candidates = list(range(2, 10))
+
+    if max_agents and len(candidates) > max_agents:
+        required = [stage_num for stage_num in BASELINE_AGENT_GUIDANCE if stage_num in candidates]
+        slots = max(0, int(max_agents) - len(required))
+        ranked = sorted(
+            [stage_num for stage_num in candidates if stage_num not in required],
+            key=lambda stage_num: (-stage_evidence.get(stage_num, 0), stage_num),
+        )
+        selected_set = set(required + ranked[:slots])
+        candidates = [stage_num for stage_num in range(2, 10) if stage_num in selected_set]
+
+    return candidates
+
+
+def _build_default_plan(rule_hits: list, source_sink_hints: list, max_agents: int | None = None) -> dict:
+    """Build a fallback agent plan from static evidence counts."""
+    stage_evidence = _build_stage_evidence_scores(rule_hits, source_sink_hints)
+
+    if not any(stage_evidence.values()):
+        stage_nums = _select_fallback_stage_nums(stage_evidence, max_agents=max_agents)
+        selected = [
+            {
+                "stage_num": sn,
+                "priority": i + 1,
+                "focus_guidance": BASELINE_AGENT_GUIDANCE.get(sn, ""),
+                "focus_files": [],
+                "focus_routes": [],
+                **({"_baseline_required": True} if sn in BASELINE_AGENT_GUIDANCE else {}),
+            }
+            for i, sn in enumerate(stage_nums)
+        ]
+        skipped = [
+            {"stage_num": sn, "skip_reason": "Skipped by fallback agent budget"}
+            for sn in range(2, 10)
+            if sn not in stage_nums
+        ]
+        return _ensure_baseline_agents({"selected_agents": selected, "skipped_agents": skipped}, max_agents=max_agents)
 
     selected = []
     skipped = []
+    selected_stage_nums = set(_select_fallback_stage_nums(stage_evidence, max_agents=max_agents))
     for stage_num in range(2, 10):
         evidence = stage_evidence.get(stage_num, 0)
-        if evidence > 0:
+        if stage_num in selected_stage_nums:
             selected.append({
                 "stage_num": stage_num,
                 "priority": len(selected) + 1,
-                "focus_guidance": f"Audit based on {evidence} static evidence signals",
+                "focus_guidance": (
+                    f"Audit based on {evidence} static evidence signals"
+                    if evidence > 0
+                    else BASELINE_AGENT_GUIDANCE[stage_num]
+                ),
                 "focus_files": [],
                 "focus_routes": [],
+                **({"_baseline_required": True} if stage_num in BASELINE_AGENT_GUIDANCE and evidence <= 0 else {}),
             })
         else:
-            skipped.append({"stage_num": stage_num, "skip_reason": "No supporting static evidence"})
+            skip_reason = "Skipped by fallback agent budget" if evidence > 0 else "No supporting static evidence"
+            skipped.append({"stage_num": stage_num, "skip_reason": skip_reason})
 
-    if not selected:
-        selected = [{"stage_num": sn, "priority": i + 1, "focus_guidance": "", "focus_files": [], "focus_routes": []} for i, sn in enumerate(range(2, 10))]
-        skipped = []
-
-    return {"selected_agents": selected, "skipped_agents": skipped}
+    return _ensure_baseline_agents({"selected_agents": selected, "skipped_agents": skipped}, max_agents=max_agents)

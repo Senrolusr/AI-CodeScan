@@ -64,20 +64,6 @@ def _build_poc_counts(vulns) -> dict:
     return counts
 
 
-def _get_summary_severity_counts(task) -> dict | None:
-    summary = getattr(task, "summary", None) or {}
-    severity_stats = summary.get("severity_stats", {})
-    if not isinstance(severity_stats, dict):
-        return None
-    return {
-        "Critical": int(severity_stats.get("Critical", 0) or 0),
-        "High": int(severity_stats.get("High", 0) or 0),
-        "Medium": int(severity_stats.get("Medium", 0) or 0),
-        "Low": int(severity_stats.get("Low", 0) or 0),
-        "Info": int(severity_stats.get("Info", 0) or 0),
-    }
-
-
 def _get_scan_stats(task) -> dict:
     summary = getattr(task, "summary", None) or {}
     scan_stats = summary.get("scan_stats", {})
@@ -169,7 +155,7 @@ def _render_vulnerability(vuln, index: int) -> str:
     parts = [
         '<article class="finding">',
         '<div class="finding-head">',
-        f'<h3>{index}. {_esc(getattr(vuln, "title", "") or "未命名漏洞")}</h3>',
+        f'<h3>{index}. {_esc(getattr(vuln, "title", "") or "未命名发现")}</h3>',
         '<div class="badges">',
         _render_badge(_severity_label(severity), _severity_class(severity)),
         _render_badge(f"POC {_poc_status_label(poc_status)}", f"poc-{poc_status}"),
@@ -249,7 +235,7 @@ def _render_vulnerability_groups(vulns) -> str:
 
 
 def _build_html_content(project, task, stages, vulns) -> str:
-    severity_counts = _get_summary_severity_counts(task) or _build_severity_counts(vulns)
+    severity_counts = _build_severity_counts(vulns)
     poc_counts = _build_poc_counts(vulns)
     scan_stats = _get_scan_stats(task)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")

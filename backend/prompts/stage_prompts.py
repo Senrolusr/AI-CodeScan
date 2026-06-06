@@ -114,16 +114,19 @@ STAGE_PROMPTS = {
 - 识别外部集成点（第三方 API、消息队列、缓存、邮件、文件存储）。
 
 输出要求：
-- stage_summary 必须是 3-5 句直白的中文概述，讲清楚：这是什么项目、用了什么技术栈、前后端架构如何、数据库用什么、认证方式是什么。不要写 JSON 格式、不要罗列路由、不要写代码，只写人能直接读懂的中文描述。
+- stage_summary 必须是 2-3 句直白的中文概述，不超过 180 字，讲清楚：这是什么项目、用了什么技术栈、数据库用什么、认证方式是什么。不要罗列路由、不要写代码、不要展开漏洞背景。
 - stage_summary 必须放在 JSON 最前面（紧跟左花括号后），这样即使输出被截断也能保留。
 - architecture_info 必须尽量完整，除原有字段外，还需包含以下扩展字段（如果代码中有证据支持）：
   - middleware_chain: 中间件列表，每项包含 name、file_path、order（执行顺序）、scope（global/route）
   - database_models: ORM 模型列表，每项包含 model（模型名）、table（表名）、file_path、key_fields（关键字段名数组）
   - security_boundaries: 路由信任分类，包含 public_routes、authenticated_routes、admin_routes、unclassified_routes 四个路径数组
   - external_integrations: 外部集成列表，每项包含 type（如 SMTP/Redis/Kafka）、file_path、purpose（中文用途说明）
-- routes 需要保留 method、path、handler、file_path、auth、params、notes，每条 route 的 notes 必须用简短中文说明该路由的用途。
-- 如果路由数量超过 30 条，按入口暴露面和攻击面优先级排序，最关键的放前面。不重要的路由可以省略以控制输出长度。
-- vulnerabilities 默认返回空数组，除非本阶段已确认硬证据级问题。
+- routes 需要保留 method、path、handler、file_path、auth、params、notes，每条 route 的 notes 必须用简短中文说明该路由的用途，notes 不超过 40 字。
+- 每轮最多输出 12 条 routes，按入口暴露面和攻击面优先级排序，最关键的放前面。不重要的路由省略以控制输出长度；系统会用静态路由清单补齐完整路由库存。
+- 阶段一禁止输出正式漏洞结论，vulnerabilities 必须固定返回空数组。阶段一只负责攻击面和架构事实收集，不做最终漏洞定性。
+- 如果发现值得后续专项 Agent 复核的可疑点，写入 risk_hints 数组。risk_hints 是“未验证风险线索”，不是正式漏洞，不要使用 Critical/High 这类最终漏洞评级。
+- 每轮最多输出 3 条 risk_hints，每项建议包含 title、vuln_type、file_path、endpoint、description、confidence、suggested_stage_nums；title、vuln_type、description 必须使用中文，description 不超过 120 字。
+- 阶段一不要输出 poc_raw、code_snippet、fix_suggestion，也不要写“确认漏洞”“高危漏洞”等最终定性。
 - 整体输出必须控制在合理长度内，优先保证 JSON 完整闭合，宁可少列几条路由也不能让 JSON 截断。扩展字段如果代码证据不足以确认，可以省略该字段。
 {COMMON_RULES}
 """.strip(),

@@ -40,7 +40,14 @@ async def export_report(data: ReportExport, db: AsyncSession = Depends(get_db)):
     )
     stages = result.scalars().all()
 
-    result = await db.execute(select(Vulnerability).where(Vulnerability.task_id == data.task_id))
+    result = await db.execute(
+        select(Vulnerability)
+        .join(AuditStage, Vulnerability.stage_id == AuditStage.id)
+        .where(
+            Vulnerability.task_id == data.task_id,
+            AuditStage.stage_num.between(2, 9),
+        )
+    )
     vulns = result.scalars().all()
 
     report_dir = get_audit_report_dir(data.task_id)

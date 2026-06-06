@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import get_db
-from models import Vulnerability
+from models import AuditStage, Vulnerability
 from schemas import VulnerabilityOut
 from services.audit_engine import _severity_match_values, _severity_order_expr
 
@@ -16,7 +16,11 @@ async def list_vulnerabilities(
     limit: int = None,
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(Vulnerability)
+    query = (
+        select(Vulnerability)
+        .join(AuditStage, Vulnerability.stage_id == AuditStage.id)
+        .where(AuditStage.stage_num.between(2, 9))
+    )
     if task_id:
         query = query.where(Vulnerability.task_id == task_id)
     if severity:
@@ -30,7 +34,14 @@ async def list_vulnerabilities(
 
 @router.get("/{vuln_id}", response_model=VulnerabilityOut)
 async def get_vulnerability(vuln_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Vulnerability).where(Vulnerability.id == vuln_id))
+    result = await db.execute(
+        select(Vulnerability)
+        .join(AuditStage, Vulnerability.stage_id == AuditStage.id)
+        .where(
+            Vulnerability.id == vuln_id,
+            AuditStage.stage_num.between(2, 9),
+        )
+    )
     vuln = result.scalar_one_or_none()
     if not vuln:
         raise HTTPException(404, "漏洞不存在")

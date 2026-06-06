@@ -27,6 +27,7 @@ def mark_task_queued(task: AuditTask, stage_nums: list[int]) -> None:
     summary[QUEUE_PENDING_KEY] = True
     summary[QUEUE_ENQUEUED_AT_KEY] = datetime.now(timezone.utc).isoformat()
     summary[QUEUE_CLAIMED_AT_KEY] = None
+    summary.pop("worker_failure", None)
     task.summary = dict(summary)
     task.status = "pending"
     task.current_stage = 0
