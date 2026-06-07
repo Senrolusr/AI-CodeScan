@@ -16,6 +16,7 @@ venv/
 
 # Backend runtime data
 /backend/data/audit.db
+/backend/data/audit.db-*
 /backend/data/project_cache/
 /backend/data/stage_artifacts/
 /backend/uploads/

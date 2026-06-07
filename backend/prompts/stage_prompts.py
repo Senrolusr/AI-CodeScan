@@ -91,6 +91,7 @@ COMMON_RULES = """
 8. 输出要压缩但不能丢证据，优先保留最强证据、真实入口、关键代码片段和最小可复现 PoC。
 9. 误报自检：输出 vulnerabilities 之前，对每条漏洞逐项自问：(a) 外部输入是否确实可达该危险点？(b) 是否存在参数化查询、输入过滤、框架内置转义、中间件校验等防御代码？(c) PoC 是否可实际触发而非理论可行？任一项不满足则降低 severity 或移除该条漏洞。
 10. 每条漏洞必须标注 confidence 字段：high=完整触发链+代码确凿+PoC可复现，medium=证据存在但触发链不完整或需推理，low=仅静态线索或弱信号无确认数据流。confidence 用于帮助审计人员排优，请诚实评估。
+11. 仅当提示词出现【本阶段路由线索】且其中包含 route_id=rt_... 时，才输出顶层 route_coverage 数组；route_id 必须逐字复制输入中的 rt_...，不得用 endpoint/path 替代。每个列出的 route_id 都要回填 audited_no_finding、finding、skipped_with_reason、insufficient_context 或 not_applicable 及简短原因。若没有提供 route_id=rt_...，不要输出 route_coverage。
 """.strip()
 
 

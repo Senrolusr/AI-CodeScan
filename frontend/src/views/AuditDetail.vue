@@ -144,11 +144,38 @@ const rescanRecommendations = computed(() => {
     locale: locale.value,
   })
 })
+const routeCoverage = computed(() => {
+  const value = taskSummary.value.route_coverage
+  return value && typeof value === 'object' ? value : null
+})
+const hasRouteCoverageGaps = computed(() => !!routeCoverage.value?.has_route_gaps)
+const routeCoveragePercentValue = computed(() => {
+  const ratio = Number(routeCoverage.value?.coverage_ratio || 0)
+  return Math.max(0, Math.min(100, Math.round(ratio * 100)))
+})
+const routeCoverageMissingRoutes = computed(() => {
+  const routes = routeCoverage.value?.missing_routes
+  return Array.isArray(routes) ? routes.slice(0, 8) : []
+})
+const routeCoverageStageRows = computed(() => {
+  const rows = routeCoverage.value?.stage_coverage
+  if (!Array.isArray(rows)) return []
+  return rows
+    .filter(row => row && typeof row === 'object' && (row.focus_route_count || row.attested_route_count || row.missing_focus_route_count))
+    .slice(0, 8)
+})
 const reviewOutcome = computed(() => {
   const summaryOutcome = taskSummary.value.review_outcome
   if (summaryOutcome && typeof summaryOutcome === 'object') return summaryOutcome
   const stageOutcome = reviewStage.value?.findings?.review_closure
   return stageOutcome && typeof stageOutcome === 'object' ? stageOutcome : null
+})
+const isCompletedWithGaps = computed(() => {
+  if (task.value?.status !== 'completed') return false
+  const outcome = reviewOutcome.value
+  const status = String(outcome?.status || '')
+  const nextAction = String(outcome?.next_action || '')
+  return hasRouteCoverageGaps.value || status === 'manual_followup_required' || nextAction === 'manual_review'
 })
 const degradationNotes = computed(() => {
   const notes = taskSummary.value.degradation_notes
@@ -161,7 +188,7 @@ const workerFailure = computed(() => {
   const value = taskSummary.value.worker_failure
   return value && typeof value === 'object' ? value : null
 })
-const hasQualityNotice = computed(() => !!reviewOutcome.value || !!workerFailure.value || degradationNotes.value.length > 0)
+const hasQualityNotice = computed(() => !!reviewOutcome.value || !!workerFailure.value || degradationNotes.value.length > 0 || hasRouteCoverageGaps.value)
 const reviewNoticeClass = computed(() => {
   const outcome = reviewOutcome.value
   if (!outcome) return 'info-surface'
@@ -488,6 +515,7 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
         <div>
           <h2 style="margin: 0 0 4px">{{ task.name || t('auditDetailTitle', { id: task.id }) }}</h2>
           <el-tag :type="statusType(task.status)" effect="dark">{{ statusLabel(task.status) }}</el-tag>
+          <el-tag v-if="isCompletedWithGaps" type="warning" effect="plain" style="margin-left: 8px">{{ t('completedWithGaps') }}</el-tag>
           <span style="margin-left: 12px" class="text-muted">
             {{ t('projectWithDate', { projectId: task.project_id, createdAt: formatDateTime(task.created_at) }) }}
           </span>
@@ -551,6 +579,15 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
               <strong>{{ t('failedStages') }}：</strong>{{ reviewStageNumsText(reviewOutcome.failed_stage_nums) }}
             </div>
           </div>
+
+          <div v-if="hasRouteCoverageGaps && routeCoverage" class="warning-surface" style="padding: 10px 12px; line-height: 1.6">
+            <strong>{{ t('routeCoverage') }}：</strong>
+            {{ t('routeCoverageSummary', {
+              ratio: formatPercent(routeCoverage.coverage_ratio),
+              missing: routeCoverage.missing_route_count || 0,
+              total: routeCoverage.total_routes || 0,
+            }) }}
+          </div>
         </div>
       </el-card>
 
@@ -584,8 +621,9 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
         <div v-else-if="task.status === 'running'" class="text-muted">
           {{ t(PHASE_KEY_MAP[currentPhase]) }} {{ t('running') }}...
         </div>
-        <div v-else-if="task.status === 'completed'" style="color: #67C23A; font-size: 13px; font-weight: bold">
-          &#10003; {{ t('completed') }}
+        <div v-else-if="task.status === 'completed'" :style="{ color: isCompletedWithGaps ? '#E6A23C' : '#67C23A', fontSize: '13px', fontWeight: 'bold' }">
+          <span v-if="isCompletedWithGaps">&#9888; {{ t('completedWithGaps') }}</span>
+          <span v-else>&#10003; {{ t('completed') }}</span>
         </div>
         <div v-else-if="task.status === 'failed' || task.status === 'cancelled' || task.status === 'paused'" class="text-muted">
           {{ statusLabel(task.status) }}
@@ -593,6 +631,78 @@ const reviewRerunStageText = (nums) => nums.map(num => `Stage ${num}`).join(', '
       </el-card>
 
       <ScanOverview :stats="scanStats" :token-stats="tokenStats" show-token-usage />
+
+      <el-card v-if="routeCoverage" style="margin-bottom: 20px">
+        <template #header>
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap">
+            <span class="card-title">{{ t('routeCoverage') }}</span>
+            <el-tag size="small" :type="hasRouteCoverageGaps ? 'warning' : 'success'">
+              {{ hasRouteCoverageGaps ? t('coverageGaps') : t('completed') }}
+            </el-tag>
+          </div>
+        </template>
+
+        <div style="display: grid; gap: 12px">
+          <div>
+            <div style="display: flex; justify-content: space-between; gap: 12px; font-size: 13px; margin-bottom: 6px">
+              <span>{{ t('routeCoverageRatio') }}</span>
+              <strong>{{ formatPercent(routeCoverage.coverage_ratio) }}</strong>
+            </div>
+            <el-progress :percentage="routeCoveragePercentValue" :status="hasRouteCoverageGaps ? 'warning' : 'success'" />
+          </div>
+
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px">
+            <div style="padding: 10px 12px; border: 1px solid var(--border-default); border-radius: 8px; background: var(--bg-page)">
+              <div style="color: var(--text-muted); font-size: 12px">{{ t('routeCount') }}</div>
+              <strong>{{ routeCoverage.total_routes || 0 }}</strong>
+            </div>
+            <div style="padding: 10px 12px; border: 1px solid var(--border-default); border-radius: 8px; background: var(--bg-page)">
+              <div style="color: var(--text-muted); font-size: 12px">{{ t('auditedRoutes') }}</div>
+              <strong>{{ routeCoverage.audited_route_count || 0 }}</strong>
+            </div>
+            <div style="padding: 10px 12px; border: 1px solid var(--border-default); border-radius: 8px; background: var(--bg-page)">
+              <div style="color: var(--text-muted); font-size: 12px">{{ t('attestedRoutes') }}</div>
+              <strong>{{ routeCoverage.attested_route_count || 0 }}</strong>
+            </div>
+            <div style="padding: 10px 12px; border: 1px solid var(--border-default); border-radius: 8px; background: var(--bg-page)">
+              <div style="color: var(--text-muted); font-size: 12px">{{ t('missingRouteCount') }}</div>
+              <strong :style="{ color: hasRouteCoverageGaps ? '#E6A23C' : 'inherit' }">{{ routeCoverage.missing_route_count || 0 }}</strong>
+            </div>
+          </div>
+
+          <div v-if="routeCoverageMissingRoutes.length" style="display: grid; gap: 8px">
+            <div style="font-weight: 600; font-size: 13px">{{ t('missingRouteSamples') }}</div>
+            <div
+              v-for="route in routeCoverageMissingRoutes"
+              :key="route.route_id || `${route.method}-${route.path}`"
+              style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px; padding: 8px 10px; border: 1px solid var(--border-default); border-radius: 8px; background: var(--bg-page)"
+            >
+              <el-tag size="small" effect="plain">{{ route.method || 'UNKNOWN' }}</el-tag>
+              <strong style="word-break: break-all">{{ route.path || '--' }}</strong>
+              <span v-if="route.file_path" style="color: var(--text-muted); word-break: break-all">{{ route.file_path }}</span>
+            </div>
+            <div v-if="routeCoverage.unknown_missing_route_count" style="color: var(--text-muted); font-size: 12px">
+              {{ t('unknownRouteGaps', { count: routeCoverage.unknown_missing_route_count }) }}
+            </div>
+          </div>
+
+          <div v-if="routeCoverageStageRows.length" style="display: grid; gap: 8px">
+            <div style="font-weight: 600; font-size: 13px">{{ t('stageRouteCoverage') }}</div>
+            <div
+              v-for="row in routeCoverageStageRows"
+              :key="`route-stage-${row.stage_num}`"
+              style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px"
+            >
+              <strong>Stage {{ row.stage_num }}</strong>
+              <span v-if="row.stage_name" style="color: var(--text-muted)">{{ row.stage_name }}</span>
+              <el-tag size="small" effect="plain">{{ t('attestedRoutes') }}: {{ row.attested_route_count || 0 }}</el-tag>
+              <el-tag size="small" :type="row.missing_focus_route_count ? 'warning' : 'success'" effect="plain">
+                {{ t('focusRouteGaps') }}: {{ row.missing_focus_route_count || 0 }}
+              </el-tag>
+            </div>
+          </div>
+        </div>
+      </el-card>
 
       <el-card v-if="ruleHitsPreview.length" style="margin-bottom: 20px">
         <template #header>

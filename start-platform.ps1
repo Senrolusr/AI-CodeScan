@@ -4,6 +4,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = $utf8NoBom
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
 $repoRoot = $PSScriptRoot
 $backendDir = Join-Path $repoRoot "backend"
 $frontendDir = Join-Path $repoRoot "frontend"
@@ -107,12 +114,21 @@ function Start-BackendWindow {
     }
 
     Invoke-Step "Start backend http://127.0.0.1:$backendPort" {
+        $backendCommand = @"
+`$utf8NoBom = [System.Text.UTF8Encoding]::new(`$false)
+[Console]::InputEncoding = `$utf8NoBom
+[Console]::OutputEncoding = `$utf8NoBom
+`$OutputEncoding = `$utf8NoBom
+`$env:PYTHONUTF8 = '1'
+`$env:PYTHONIOENCODING = 'utf-8'
+python -m uvicorn main:app --host 127.0.0.1 --port $backendPort --reload
+"@
         Start-Process -FilePath "powershell.exe" -WorkingDirectory $backendDir -ArgumentList @(
             "-NoExit",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            "python -m uvicorn main:app --host 127.0.0.1 --port $backendPort --reload"
+            $backendCommand
         ) | Out-Null
     }
 }
@@ -129,12 +145,19 @@ function Start-FrontendWindow {
     }
 
     Invoke-Step "Start frontend http://127.0.0.1:$frontendPort" {
+        $frontendCommand = @"
+`$utf8NoBom = [System.Text.UTF8Encoding]::new(`$false)
+[Console]::InputEncoding = `$utf8NoBom
+[Console]::OutputEncoding = `$utf8NoBom
+`$OutputEncoding = `$utf8NoBom
+npm.cmd run dev -- --host 127.0.0.1 --port $frontendPort
+"@
         Start-Process -FilePath "powershell.exe" -WorkingDirectory $frontendDir -ArgumentList @(
             "-NoExit",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            "npm.cmd run dev -- --host 127.0.0.1 --port $frontendPort"
+            $frontendCommand
         ) | Out-Null
     }
 }

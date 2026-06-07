@@ -72,6 +72,48 @@ SEVERITY_ALIASES = {
 }
 VALID_SEVERITIES = {"Critical", "High", "Medium", "Low", "Info"}
 CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
+ROUTE_COVERAGE_AUDITED_STATUSES = {
+    "audited_no_finding",
+    "finding",
+    "confirmed_finding",
+    "skipped_with_reason",
+    "not_applicable",
+}
+ROUTE_COVERAGE_GAP_STATUSES = {
+    "insufficient_context",
+    "needs_followup",
+    "missing",
+}
+
+
+def _normalize_route_coverage_status(value) -> str:
+    status = str(value or "").strip().lower()
+    status = re.sub(r"[\s-]+", "_", status)
+    aliases = {
+        "audited": "audited_no_finding",
+        "covered": "audited_no_finding",
+        "reviewed": "audited_no_finding",
+        "no_finding": "audited_no_finding",
+        "has_finding": "finding",
+        "vulnerable": "finding",
+        "finding_confirmed": "confirmed_finding",
+        "confirmed": "confirmed_finding",
+        "skipped": "skipped_with_reason",
+        "not_enough_context": "insufficient_context",
+        "need_followup": "needs_followup",
+        "gap": "needs_followup",
+        "n/a": "not_applicable",
+        "na": "not_applicable",
+    }
+    return aliases.get(status, status or "audited_no_finding")
+
+
+def _is_route_coverage_status_audited(status) -> bool:
+    return _normalize_route_coverage_status(status) in ROUTE_COVERAGE_AUDITED_STATUSES
+
+
+def _is_route_coverage_status_gap(status) -> bool:
+    return _normalize_route_coverage_status(status) in ROUTE_COVERAGE_GAP_STATUSES
 
 
 def _normalize_severity(severity: str) -> str:
@@ -87,6 +129,122 @@ def _severity_match_values(severity: str) -> list[str]:
     normalized = _normalize_severity(severity)
     aliases = [k for k, v in SEVERITY_ALIASES.items() if v == normalized]
     return list(set([normalized] + aliases))
+
+
+def _normalize_route_method(value) -> str:
+    method = str(value or "UNKNOWN").strip().upper()
+    return method or "UNKNOWN"
+
+
+def _normalize_route_path(value) -> str:
+    path = str(value or "").strip()
+    if not path:
+        return ""
+    return re.sub(r"\s+", "", path)
+
+
+def _route_identity(route: dict | None) -> tuple[str, str, str, str]:
+    route = route if isinstance(route, dict) else {}
+    return (
+        _normalize_route_method(route.get("method")),
+        _normalize_route_path(route.get("path")),
+        str(route.get("handler", "") or "").strip(),
+        _normalize_match_path(str(route.get("file_path", "") or "").strip()),
+    )
+
+
+def _route_id(route: dict | None) -> str:
+    route = route if isinstance(route, dict) else {}
+    existing = str(route.get("route_id", "") or "").strip()
+    if existing:
+        return existing
+    method, path, handler, file_path = _route_identity(route)
+    raw = "|".join([method, path, handler, file_path])
+    return f"rt_{hashlib.sha1(raw.encode('utf-8', errors='ignore')).hexdigest()[:12]}"
+
+
+def _route_with_id(route: dict | None) -> dict:
+    normalized = dict(route) if isinstance(route, dict) else {}
+    normalized["route_id"] = _route_id(normalized)
+    normalized["method"] = _normalize_route_method(normalized.get("method"))
+    normalized["path"] = str(normalized.get("path", "") or "").strip()
+    return normalized
+
+
+def _extract_route_ids_from_lines(route_lines) -> list[str]:
+    if not isinstance(route_lines, list):
+        return []
+    route_ids: list[str] = []
+    seen: set[str] = set()
+    for line in route_lines:
+        for match in re.finditer(r"\broute_id=([A-Za-z0-9_-]+)", str(line or "")):
+            route_id = match.group(1).strip()
+            if route_id and route_id not in seen:
+                seen.add(route_id)
+                route_ids.append(route_id)
+    return route_ids
+
+
+def _merge_routes_by_id(*route_lists) -> list[dict]:
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+    for route_list in route_lists:
+        if not isinstance(route_list, list):
+            continue
+        for route in route_list:
+            if not isinstance(route, dict):
+                continue
+            normalized = _route_with_id(route)
+            route_id = normalized["route_id"]
+            if route_id not in merged:
+                merged[route_id] = normalized
+                order.append(route_id)
+                continue
+            merged[route_id] = {
+                **normalized,
+                **{key: value for key, value in merged[route_id].items() if value not in (None, "", [], {})},
+            }
+    return [merged[route_id] for route_id in order]
+
+
+def _normalize_route_coverage_item(item, stage_num: int | None = None) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    route_id = str(item.get("route_id", "") or "").strip()
+    route_payload = item.get("route") if isinstance(item.get("route"), dict) else item
+    if not route_id:
+        if not str(route_payload.get("path", "") or "").strip():
+            return None
+        route_id = _route_id(route_payload)
+    status = _normalize_route_coverage_status(item.get("status"))
+    normalized = {
+        "route_id": route_id,
+        "status": status,
+        "reason": str(item.get("reason", "") or item.get("notes", "") or "").strip()[:500],
+    }
+    if stage_num is not None:
+        normalized["stage_num"] = stage_num
+    for key in ["method", "path", "handler", "file_path", "auth"]:
+        value = item.get(key)
+        if not value and isinstance(route_payload, dict):
+            value = route_payload.get(key)
+        if value:
+            normalized[key] = value
+    return normalized
+
+
+def _extract_route_coverage_items(payload, stage_num: int | None = None) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    coverage = payload.get("route_coverage")
+    if not isinstance(coverage, list):
+        return []
+    result = []
+    for item in coverage:
+        normalized = _normalize_route_coverage_item(item, stage_num=stage_num)
+        if normalized:
+            result.append(normalized)
+    return result
 
 
 def _severity_order_expr(column):
@@ -361,21 +519,33 @@ def _build_stage_coverage_snapshot(compact_context: dict | None, selected_chunks
     compact_context = compact_context if isinstance(compact_context, dict) else {}
     focus_files = compact_context.get("focus_files", []) if isinstance(compact_context.get("focus_files"), list) else []
     focus_routes = compact_context.get("focus_routes", []) if isinstance(compact_context.get("focus_routes"), list) else []
+    visible_route_ids = _extract_route_ids_from_lines(compact_context.get("route_lines"))
+    visible_route_id_set = set(visible_route_ids)
+    normalized_focus_routes = [
+        _route_with_id(route)
+        for route in focus_routes[:32]
+        if isinstance(route, dict) and str(route.get("path", "") or "").strip()
+    ]
+    if visible_route_id_set:
+        normalized_focus_routes = [
+            route for route in normalized_focus_routes if route.get("route_id") in visible_route_id_set
+        ]
     return {
         "selected_chunk_count": len(selected_chunks),
         "focus_files": focus_files[:40],
         "focus_file_count": len(focus_files),
         "focus_routes": [
             {
+                "route_id": route.get("route_id", ""),
                 "method": str(route.get("method", "UNKNOWN") or "UNKNOWN").upper(),
                 "path": str(route.get("path", "") or "").strip(),
                 "handler": str(route.get("handler", "") or "").strip(),
                 "file_path": str(route.get("file_path", "") or "").strip(),
                 "auth": str(route.get("auth", "") or "").strip(),
             }
-            for route in focus_routes[:32]
-            if isinstance(route, dict) and str(route.get("path", "") or "").strip()
+            for route in normalized_focus_routes
         ],
+        "focus_route_ids": [route.get("route_id", "") for route in normalized_focus_routes if route.get("route_id")],
     }
 
 
@@ -391,6 +561,13 @@ def _attach_stage_runtime_summary(
     else:
         normalized = {"vulnerabilities": []}
     normalized["_stage_coverage"] = coverage_snapshot
+    route_coverage = _extract_route_coverage_items(normalized)
+    if route_coverage:
+        focus_ids = set(coverage_snapshot.get("focus_route_ids", []) if isinstance(coverage_snapshot.get("focus_route_ids"), list) else [])
+        attested_ids = {item.get("route_id") for item in route_coverage if item.get("route_id")}
+        normalized["_stage_coverage"]["attested_route_count"] = len(attested_ids)
+        normalized["_stage_coverage"]["missing_focus_route_ids"] = sorted(focus_ids - attested_ids)[:50]
+        normalized["_stage_coverage"]["route_coverage"] = route_coverage[:80]
     vulnerabilities = normalized.get("vulnerabilities", [])
     normalized["_vulnerability_count"] = len(vulnerabilities) if isinstance(vulnerabilities, list) else 0
     return normalized
@@ -464,6 +641,315 @@ def _summarize_pre_discovery(pre_discovery: dict | None) -> dict | None:
     return summary or None
 
 
+def _safe_positive_int(value, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _extract_architecture_routes(payload) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    architecture_info = payload.get("architecture_info")
+    if not isinstance(architecture_info, dict):
+        return []
+    routes = architecture_info.get("routes")
+    return routes if isinstance(routes, list) else []
+
+
+def _extract_stage_coverage_payload(stage: AuditStage) -> dict:
+    compressed = stage.compressed_summary if isinstance(stage.compressed_summary, dict) else {}
+    stage_coverage = compressed.get("_stage_coverage", {})
+    return stage_coverage if isinstance(stage_coverage, dict) else {}
+
+
+def _extract_stage_focus_routes(stage_coverage: dict) -> list[dict]:
+    focus_routes = stage_coverage.get("focus_routes") if isinstance(stage_coverage, dict) else []
+    if not isinstance(focus_routes, list):
+        return []
+    return [_route_with_id(route) for route in focus_routes if isinstance(route, dict) and str(route.get("path", "") or "").strip()]
+
+
+def _extract_stage_focus_route_ids(stage_coverage: dict) -> list[str]:
+    focus_ids = stage_coverage.get("focus_route_ids") if isinstance(stage_coverage, dict) else []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    if isinstance(focus_ids, list):
+        for route_id in focus_ids:
+            route_id = str(route_id or "").strip()
+            if route_id and route_id not in seen:
+                seen.add(route_id)
+                normalized.append(route_id)
+    for route in _extract_stage_focus_routes(stage_coverage):
+        route_id = str(route.get("route_id", "") or "").strip()
+        if route_id and route_id not in seen:
+            seen.add(route_id)
+            normalized.append(route_id)
+    return normalized
+
+
+def _extract_stage_route_coverage_items(stage: AuditStage) -> list[dict]:
+    findings = _coerce_stage_findings(stage.findings)
+    compressed = stage.compressed_summary if isinstance(stage.compressed_summary, dict) else {}
+    stage_coverage = _extract_stage_coverage_payload(stage)
+    items: list[dict] = []
+    seen: set[tuple] = set()
+    for source in [findings, compressed, stage_coverage]:
+        for item in _extract_route_coverage_items(source, stage_num=stage.stage_num):
+            key = (
+                item.get("route_id"),
+                item.get("stage_num"),
+                item.get("status"),
+                item.get("reason"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+    return items
+
+
+def _public_route_fields(route: dict | None) -> dict:
+    route = _route_with_id(route)
+    result = {
+        "route_id": route.get("route_id", ""),
+        "method": _normalize_route_method(route.get("method")),
+        "path": str(route.get("path", "") or "").strip(),
+        "handler": str(route.get("handler", "") or "").strip(),
+        "file_path": str(route.get("file_path", "") or "").strip(),
+    }
+    auth = str(route.get("auth", "") or "").strip()
+    if auth:
+        result["auth"] = auth
+    return result
+
+
+def _route_match_path(path: str) -> str:
+    normalized = _normalize_route_path(path).lower().replace("\\", "/")
+    normalized = normalized.split("?", 1)[0]
+    normalized = re.sub(r"/:[^/]+", "/{id}", normalized)
+    normalized = re.sub(r"/<[^/]+>", "/{id}", normalized)
+    normalized = re.sub(r"/\{[^/]+\}", "/{id}", normalized)
+    normalized = re.sub(r"/\d+(?=/|$)", "/{id}", normalized)
+    normalized = re.sub(r"/[0-9a-f-]{8,}(?=/|$)", "/{id}", normalized)
+    normalized = re.sub(r"/+", "/", normalized).strip()
+    return normalized
+
+
+def _route_endpoint_keys(route: dict) -> set[str]:
+    method = _normalize_route_method(route.get("method"))
+    path = _route_match_path(str(route.get("path", "") or ""))
+    if not path:
+        return set()
+    return {f"{method} {path}", f"ANY {path}", f"UNKNOWN {path}", path}
+
+
+def _vulnerability_endpoint_keys(endpoint: str) -> set[str]:
+    endpoint = str(endpoint or "").strip()
+    if not endpoint:
+        return set()
+    anchor = _normalize_endpoint_anchor(endpoint)
+    if not anchor:
+        return set()
+    keys = {anchor}
+    if " " in anchor:
+        _, path = anchor.split(" ", 1)
+        path = _route_match_path(path)
+        if path:
+            keys.add(path)
+            keys.add(f"ANY {path}")
+            keys.add(f"UNKNOWN {path}")
+    return keys
+
+
+def _status_summary_for_route(statuses: list[str]) -> str:
+    normalized = [_normalize_route_coverage_status(status) for status in statuses if status]
+    if any(status == "confirmed_finding" for status in normalized):
+        return "confirmed_finding"
+    if any(status == "finding" for status in normalized):
+        return "finding"
+    if any(status == "audited_no_finding" for status in normalized):
+        return "audited_no_finding"
+    if any(status == "not_applicable" for status in normalized):
+        return "not_applicable"
+    if any(status == "skipped_with_reason" for status in normalized):
+        return "skipped_with_reason"
+    if any(_is_route_coverage_status_gap(status) for status in normalized):
+        return "needs_followup"
+    return "missing"
+
+
+def _build_task_route_coverage_summary(
+    stages: list[AuditStage],
+    *,
+    static_routes: list | None = None,
+    scan_stats: dict | None = None,
+    vulns: list[Vulnerability] | None = None,
+) -> dict | None:
+    scan_stats = scan_stats if isinstance(scan_stats, dict) else {}
+    route_sources: list[list] = [static_routes if isinstance(static_routes, list) else []]
+    coverage_items_by_stage: dict[int, list[dict]] = {}
+    stage_coverage_rows: list[dict] = []
+
+    for stage in stages:
+        findings = _coerce_stage_findings(stage.findings)
+        compressed = stage.compressed_summary if isinstance(stage.compressed_summary, dict) else {}
+        stage_coverage = _extract_stage_coverage_payload(stage)
+        route_sources.extend([
+            _extract_architecture_routes(findings),
+            _extract_architecture_routes(compressed),
+            _extract_stage_focus_routes(stage_coverage),
+        ])
+        if 2 <= int(stage.stage_num or 0) <= 9:
+            coverage_items = _extract_stage_route_coverage_items(stage)
+            coverage_items_by_stage[stage.stage_num] = coverage_items
+            route_sources.append([item for item in coverage_items if str(item.get("path", "") or "").strip()])
+
+    canonical_routes = _merge_routes_by_id(*route_sources)
+    canonical_routes.sort(key=lambda item: (-_route_priority_score(item), item.get("path", ""), item.get("method", ""), item.get("handler", "")))
+    route_by_id = {_route_id(route): _public_route_fields(route) for route in canonical_routes}
+    canonical_ids = set(route_by_id.keys())
+
+    coverage_by_route: dict[str, dict] = {}
+    status_counts: dict[str, int] = {}
+    model_attested_route_ids: set[str] = set()
+
+    for stage in stages:
+        stage_num = int(stage.stage_num or 0)
+        if not 2 <= stage_num <= 9:
+            continue
+        stage_coverage = _extract_stage_coverage_payload(stage)
+        focus_ids = _extract_stage_focus_route_ids(stage_coverage)
+        coverage_items = coverage_items_by_stage.get(stage_num, [])
+        attested_ids: set[str] = set()
+        audited_ids: set[str] = set()
+
+        for item in coverage_items:
+            route_id = str(item.get("route_id", "") or "").strip()
+            if not route_id:
+                continue
+            status = _normalize_route_coverage_status(item.get("status"))
+            status_counts[status] = status_counts.get(status, 0) + 1
+            attested_ids.add(route_id)
+            model_attested_route_ids.add(route_id)
+            if _is_route_coverage_status_audited(status):
+                audited_ids.add(route_id)
+            record = coverage_by_route.setdefault(
+                route_id,
+                {"statuses": [], "stage_nums": [], "reasons": []},
+            )
+            if status not in record["statuses"]:
+                record["statuses"].append(status)
+            if stage_num not in record["stage_nums"]:
+                record["stage_nums"].append(stage_num)
+            reason = str(item.get("reason", "") or "").strip()
+            if reason and reason not in record["reasons"]:
+                record["reasons"].append(reason[:240])
+            if route_id not in route_by_id and str(item.get("path", "") or "").strip():
+                route_by_id[route_id] = _public_route_fields(item)
+                canonical_ids.add(route_id)
+
+        missing_focus_ids = [
+            route_id
+            for route_id in focus_ids
+            if route_id not in audited_ids
+        ]
+        stage_coverage_rows.append(
+            {
+                "stage_num": stage_num,
+                "stage_name": str(stage.stage_name or ""),
+                "focus_route_count": len(focus_ids),
+                "attested_route_count": len(attested_ids),
+                "audited_route_count": len(audited_ids),
+                "missing_focus_route_count": len(missing_focus_ids),
+                "missing_focus_route_ids": missing_focus_ids[:30],
+            }
+        )
+
+    route_by_endpoint: dict[str, str] = {}
+    for route_id, route in route_by_id.items():
+        for key in _route_endpoint_keys(route):
+            route_by_endpoint.setdefault(key, route_id)
+
+    stage_num_by_id = {getattr(stage, "id", None): int(stage.stage_num or 0) for stage in stages}
+    for vuln in vulns or []:
+        endpoint = str(getattr(vuln, "endpoint", "") or "").strip()
+        matched_route_id = None
+        for key in _vulnerability_endpoint_keys(endpoint):
+            matched_route_id = route_by_endpoint.get(key)
+            if matched_route_id:
+                break
+        if not matched_route_id:
+            continue
+        stage_num = stage_num_by_id.get(getattr(vuln, "stage_id", None))
+        record = coverage_by_route.setdefault(matched_route_id, {"statuses": [], "stage_nums": [], "reasons": []})
+        if "finding" not in record["statuses"]:
+            record["statuses"].append("finding")
+        if stage_num and stage_num not in record["stage_nums"]:
+            record["stage_nums"].append(stage_num)
+        if "formal vulnerability recorded" not in record["reasons"]:
+            record["reasons"].append("formal vulnerability recorded")
+
+    canonical_ids = set(route_by_id.keys())
+    attested_ids = {route_id for route_id in model_attested_route_ids if route_id in canonical_ids}
+    audited_ids = {
+        route_id
+        for route_id, record in coverage_by_route.items()
+        if route_id in canonical_ids and any(_is_route_coverage_status_audited(status) for status in record.get("statuses", []))
+    }
+    finding_ids = {
+        route_id
+        for route_id, record in coverage_by_route.items()
+        if route_id in canonical_ids and any(_normalize_route_coverage_status(status) in {"finding", "confirmed_finding"} for status in record.get("statuses", []))
+    }
+    missing_known_ids = sorted(
+        [route_id for route_id in canonical_ids if route_id not in audited_ids],
+        key=lambda route_id: (
+            -_route_priority_score(route_by_id.get(route_id, {})),
+            route_by_id.get(route_id, {}).get("path", ""),
+            route_by_id.get(route_id, {}).get("method", ""),
+        ),
+    )
+
+    known_route_count = len(canonical_ids)
+    scanned_route_count = _safe_positive_int(scan_stats.get("route_count"), 0)
+    total_routes = max(known_route_count, scanned_route_count)
+    if total_routes <= 0 and not stage_coverage_rows:
+        return None
+
+    audited_route_count = len(audited_ids)
+    missing_route_count = max(total_routes - audited_route_count, 0)
+    unknown_missing_route_count = max(0, missing_route_count - len(missing_known_ids))
+    coverage_ratio = (audited_route_count / total_routes) if total_routes else 1.0
+    focus_gap_count = sum(row["missing_focus_route_count"] for row in stage_coverage_rows)
+
+    missing_routes = []
+    for route_id in missing_known_ids[:40]:
+        route = dict(route_by_id.get(route_id, {}))
+        record = coverage_by_route.get(route_id, {})
+        route["status"] = _status_summary_for_route(record.get("statuses", []))
+        route["stage_nums"] = sorted(record.get("stage_nums", []))[:8]
+        missing_routes.append(route)
+
+    return {
+        "total_routes": total_routes,
+        "known_route_count": known_route_count,
+        "audited_route_count": audited_route_count,
+        "attested_route_count": len(attested_ids),
+        "finding_route_count": len(finding_ids),
+        "missing_route_count": missing_route_count,
+        "unknown_missing_route_count": unknown_missing_route_count,
+        "coverage_ratio": round(coverage_ratio, 4),
+        "has_route_gaps": missing_route_count > 0 or focus_gap_count > 0,
+        "focus_gap_count": focus_gap_count,
+        "status_counts": status_counts,
+        "stage_coverage": stage_coverage_rows,
+        "missing_routes": missing_routes,
+    }
+
+
 def _accumulate_token_usage(task: AuditTask, meta: dict | None) -> None:
     """将单次 LLM 调用的 token 用量累计到 task.summary。"""
     if not isinstance(meta, dict):
@@ -490,6 +976,7 @@ async def _refresh_task_summary(
     scan_stats: dict | None = None,
     rule_hits: list | None = None,
     pre_discovery: dict | None = None,
+    static_routes: list | None = None,
 ) -> None:
     summary = task.summary if isinstance(task.summary, dict) else {}
     if isinstance(scan_stats, dict):
@@ -517,12 +1004,15 @@ async def _refresh_task_summary(
         "candidate_diff_stats",
     ]:
         summary.pop(stale_key, None)
+    summary["total_vulnerabilities"] = len(vulns)
+    summary["formal_vulnerability_count"] = len(vulns)
     summary["severity_stats"] = _build_task_severity_stats(vulns)
     summary["rescan_recommendations"] = _build_task_rescan_recommendations(vulns, effective_scan_stats)
-    stage1_result = await session.execute(
-        select(AuditStage).where(AuditStage.task_id == task.id, AuditStage.stage_num == 1)
+    stage_result = await session.execute(
+        select(AuditStage).where(AuditStage.task_id == task.id).order_by(AuditStage.stage_num)
     )
-    stage1 = stage1_result.scalar_one_or_none()
+    task_stages = list(stage_result.scalars().all())
+    stage1 = next((stage for stage in task_stages if stage.stage_num == 1), None)
     stage1_compressed = stage1.compressed_summary if stage1 and isinstance(stage1.compressed_summary, dict) else {}
     stage1_coverage = stage1_compressed.get("coverage", {}) if isinstance(stage1_compressed.get("coverage"), dict) else {}
     if stage1_coverage:
@@ -538,6 +1028,16 @@ async def _refresh_task_summary(
             "scanned_chunk_count": scanned_chunks,
             "audit_scope_chunk_count": int(stage1_coverage.get("audit_scope_chunk_count") or stage1_coverage.get("total_chunk_count") or 0),
         }
+    route_coverage_summary = _build_task_route_coverage_summary(
+        task_stages,
+        static_routes=static_routes,
+        scan_stats=effective_scan_stats,
+        vulns=vulns,
+    )
+    if route_coverage_summary:
+        summary["route_coverage"] = route_coverage_summary
+    else:
+        summary.pop("route_coverage", None)
     task.summary = dict(summary)
 
 
@@ -6169,11 +6669,16 @@ def _build_stage_user_prompt(stage, project, stage_prompt: str, code_text: str, 
         project_tree_summary,
     ]
 
-    if stage.stage_num == 1 and static_routes:
-        route_lines = route_lines_override if isinstance(route_lines_override, list) else _format_static_route_lines(static_routes[:80], total_count=len(static_routes))
+    route_lines: list[str] = []
+    if isinstance(route_lines_override, list):
+        route_lines = route_lines_override
+    elif stage.stage_num == 1 and static_routes:
+        route_lines = _format_static_route_lines(static_routes[:80], total_count=len(static_routes))
+    if route_lines and (stage.stage_num == 1 or isinstance(route_lines_override, list)):
+        route_section_title = "【静态提取路由线索】" if stage.stage_num == 1 else "【本阶段路由线索】"
         sections.extend([
             "",
-            "【静态提取路由线索】",
+            route_section_title,
             route_intro,
             _truncate_text("\n".join(route_lines), route_text_limit),
         ])
@@ -6290,9 +6795,10 @@ def _summarize_focus_files(focus_files: list[str], covered_paths: list[str]) -> 
 def _format_static_route_lines(routes: list[dict], total_count: int | None = None) -> list[str]:
     route_lines = []
     for route in routes:
+        route = _route_with_id(route)
         params = ",".join(route.get("params", [])) if isinstance(route.get("params"), list) else ""
         route_lines.append(
-            f"- {route.get('method', 'UNKNOWN')} {route.get('path', '')} | "
+            f"- route_id={route.get('route_id', '')} | {route.get('method', 'UNKNOWN')} {route.get('path', '')} | "
             f"handler={route.get('handler', 'Unknown')} | file={route.get('file_path', '')} | "
             f"auth={route.get('auth', 'Unknown')} | params={params}"
         )
@@ -6952,7 +7458,7 @@ def _build_stage_focus_compact_context(
     focus_file_limit = 32 if stage.stage_num == 6 else 40
     focus_files = _merge_unique_items([], [chunk.get("file_path", "") for chunk in selected_chunks if chunk.get("file_path")])[:focus_file_limit]
     topic_keywords = _get_stage_topic_keywords(stage.stage_num)
-    focus_routes = _select_stage_focus_routes(stage.stage_num, static_routes, audit_memory, focus_files)
+    focus_routes = [_route_with_id(route) for route in _select_stage_focus_routes(stage.stage_num, static_routes, audit_memory, focus_files)]
     route_lines = _format_static_route_lines(focus_routes, total_count=len(focus_routes))
     evidence_files = audit_memory.get("evidence_files", []) if isinstance(audit_memory.get("evidence_files"), list) else []
     route_inventory = audit_memory.get("route_inventory", []) if isinstance(audit_memory.get("route_inventory"), list) else []
@@ -6968,6 +7474,12 @@ def _build_stage_focus_compact_context(
         f"本轮重点文件数：{len(focus_files)}。",
         f"前序证据文件数：{len(evidence_files)}，路由库存数：{len(route_inventory)}，漏洞提示数：{len(vulnerability_hints)}。",
     ]
+    if focus_routes:
+        guidance.append(
+            "本轮列出的每个 route_id 都必须在 route_coverage 数组中逐条回填。"
+            "status 只能使用 audited_no_finding、finding、skipped_with_reason、insufficient_context 或 not_applicable；"
+            "有漏洞时 status=finding，并确保 vulnerabilities[].endpoint 对应真实路由。"
+        )
     if stage_rule_hits:
         guidance.append(f"规则预筛命中数：{len(stage_rule_hits)}，优先核查这些线索，再扩展到相邻调用链。")
     if stage_source_sink_hints:

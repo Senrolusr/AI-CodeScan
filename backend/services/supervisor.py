@@ -288,6 +288,7 @@ def _salvage_supervisor_plan(raw: str, rule_hits: list | None = None, source_sin
 
 
 BASELINE_AGENT_GUIDANCE = {
+    2: "RCE 与危险执行是基线审计阶段。即使规则命中较少，也要抽查命令执行、脚本执行、模板执行、反序列化、插件/告警规则执行、表达式求值和外部进程调用链，确认是否存在用户可控输入进入危险执行点。",
     7: "配置与依赖安全是基线审计阶段。即使规则命中较少，也要检查配置文件、环境变量模板、默认密钥、调试开关、CORS、部署文件和依赖清单，确认是否存在可由本项目暴露面触发的风险。",
     9: "业务逻辑安全是基线审计阶段。即使规则命中较少，也要围绕状态变更、导入导出、创建/删除/更新、审批/订阅/通知等接口检查服务端约束、幂等性和越权业务流程。",
 }
@@ -474,11 +475,16 @@ def _finalize_review_result(review: dict, stages: list[AuditStage]) -> dict:
         next_action = "monitor"
         status_summary = "审核完成，但仍存在覆盖缺口或待人工关注项。"
 
+    rerun_requested_stage_nums = (
+        rerun_execution.get("requested_stage_nums", [])
+        if rerun_execution
+        else normalized["rerun_agents"]
+    )
     normalized["review_closure"] = {
         "status": closure_status,
         "next_action": next_action,
         "status_summary": status_summary,
-        "requested_stage_nums": normalized["rerun_agents"],
+        "requested_stage_nums": rerun_requested_stage_nums,
         "executed_stage_nums": rerun_execution.get("executed_stage_nums", []) if rerun_execution else [],
         "failed_stage_nums": rerun_execution.get("failed_stage_nums", []) if rerun_execution else [],
         "unresolved_stage_nums": unresolved_stage_nums,
@@ -712,7 +718,14 @@ async def run_multi_agent_audit(task_id: int):
             task.status = "completed"
             task.current_stage = task.total_stages or 9
             task.completed_at = datetime.now(timezone.utc)
-            await _refresh_task_summary(session, task, scan_stats=scan_stats, rule_hits=rule_hits, pre_discovery=pre_discovery)
+            await _refresh_task_summary(
+                session,
+                task,
+                scan_stats=scan_stats,
+                rule_hits=rule_hits,
+                pre_discovery=pre_discovery,
+                static_routes=static_routes,
+            )
             await session.commit()
             logger.info("Multi-agent task %s completed", task_id)
 
