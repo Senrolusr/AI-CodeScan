@@ -6,6 +6,17 @@ Thumbs.db
 *.tmp
 .idea/
 
+# Local environment / secrets
+.env
+.env.*
+/backend/.env
+/backend/.env.*
+/frontend/.env
+/frontend/.env.*
+!.env.example
+!/backend/.env.example
+!/frontend/.env.example
+
 # Python
 __pycache__/
 *.py[cod]
@@ -19,10 +30,14 @@ venv/
 /backend/data/audit.db-*
 /backend/data/project_cache/
 /backend/data/stage_artifacts/
+/backend/services/data/project_cache/
 /backend/uploads/
 /backend/reports/
+!/backend/data/
 !/backend/data/.gitkeep
+!/backend/uploads/
 !/backend/uploads/.gitkeep
+!/backend/reports/
 !/backend/reports/.gitkeep
 
 # Frontend build output
@@ -32,7 +47,9 @@ venv/
 
 # Root export / reports
 /reports/
+!/reports/
 !/reports/.gitkeep
+/test_logs/
 
 # Logs
 *.log

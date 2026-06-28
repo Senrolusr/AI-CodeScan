@@ -15,6 +15,10 @@ STAGE_SPECS = {
     9: "业务逻辑安全审计",
 }
 
+# Supervisor 特殊阶段（stage_num < 0）：router 建表与 service 运行时 fallback 共用，避免名字 drift
+SUPERVISOR_PLAN_STAGE_NAME = "Supervisor 规划"
+SUPERVISOR_REVIEW_STAGE_NAME = "Supervisor 审核"
+
 
 SYSTEM_BASE = """
 You are a senior code-audit assistant for a staged AI security review workflow.

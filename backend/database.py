@@ -3,11 +3,15 @@ from sqlalchemy.orm import DeclarativeBase
 import os
 from sqlalchemy import text
 
-DB_DIR = os.path.join(os.path.dirname(__file__), "data")
+from services.config import get_settings
+
+_settings = get_settings()
+
+DB_DIR = _settings.data_dir or os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "audit.db")
 
-DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
+DATABASE_URL = _settings.db_url or f"sqlite+aiosqlite:///{DB_PATH}"
 
 engine = create_async_engine(DATABASE_URL, echo=False, connect_args={"check_same_thread": False, "timeout": 30})
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -71,6 +75,48 @@ async def _run_migrations(conn):
         text("CREATE INDEX IF NOT EXISTS ix_vulnerabilities_dedupe_key ON vulnerabilities (dedupe_key)")
     )
 
+    # M5：人工复核状态字段（additive，旧数据默认 unreviewed/open）
+    if "review_status" not in vuln_column_names:
+        await conn.execute(
+            text("ALTER TABLE vulnerabilities ADD COLUMN review_status VARCHAR(30) DEFAULT 'unreviewed'")
+        )
+    if "status" not in vuln_column_names:
+        await conn.execute(
+            text("ALTER TABLE vulnerabilities ADD COLUMN status VARCHAR(20) DEFAULT 'open'")
+        )
+    if "review_note" not in vuln_column_names:
+        await conn.execute(text("ALTER TABLE vulnerabilities ADD COLUMN review_note TEXT DEFAULT ''"))
+    if "reviewed_at" not in vuln_column_names:
+        await conn.execute(text("ALTER TABLE vulnerabilities ADD COLUMN reviewed_at DATETIME"))
+    if "reviewer" not in vuln_column_names:
+        await conn.execute(text("ALTER TABLE vulnerabilities ADD COLUMN reviewer VARCHAR(100) DEFAULT ''"))
+    if "cwe" not in vuln_column_names:
+        await conn.execute(text("ALTER TABLE vulnerabilities ADD COLUMN cwe VARCHAR(20) DEFAULT ''"))
+    await conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_vulnerabilities_task_review ON vulnerabilities (task_id, review_status)")
+    )
+
+    # M4a：route_id 关联字段（additive，旧数据默认空）
+    if "route_id" not in vuln_column_names:
+        await conn.execute(
+            text("ALTER TABLE vulnerabilities ADD COLUMN route_id VARCHAR(32) DEFAULT ''")
+        )
+    if "route_method" not in vuln_column_names:
+        await conn.execute(
+            text("ALTER TABLE vulnerabilities ADD COLUMN route_method VARCHAR(16) DEFAULT ''")
+        )
+    if "route_path" not in vuln_column_names:
+        await conn.execute(
+            text("ALTER TABLE vulnerabilities ADD COLUMN route_path VARCHAR(512) DEFAULT ''")
+        )
+    if "route_handler" not in vuln_column_names:
+        await conn.execute(
+            text("ALTER TABLE vulnerabilities ADD COLUMN route_handler VARCHAR(256) DEFAULT ''")
+        )
+    await conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_vulnerabilities_route_id ON vulnerabilities (route_id)")
+    )
+
     await conn.execute(
         text(
             """
@@ -121,3 +167,17 @@ async def _run_migrations(conn):
         await conn.execute(
             text("ALTER TABLE audit_stages ADD COLUMN agent_role VARCHAR(50) DEFAULT ''")
         )
+
+    # M2 运行时状态表：表由 create_all 自动创建；这里补事件流查询所需的复合索引。
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_audit_events_task_id_id "
+            "ON audit_events (task_id, id)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_audit_runs_task_status "
+            "ON audit_runs (task_id, status)"
+        )
+    )

@@ -98,7 +98,6 @@ import {
   FolderOpened,
   Link,
   Plus,
-  Printer,
   Search,
   Setting,
   Upload,
@@ -171,7 +170,6 @@ app.component('Fold', Fold)
 app.component('FolderOpened', FolderOpened)
 app.component('Link', Link)
 app.component('Plus', Plus)
-app.component('Printer', Printer)
 app.component('Search', Search)
 app.component('Setting', Setting)
 app.component('Upload', Upload)

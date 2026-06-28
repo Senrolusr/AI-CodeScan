@@ -48,7 +48,7 @@ const categoryLabel = (category) => {
 const normalizeTestResult = (payload, success) => ({
   success,
   strict_success: Boolean(payload?.strict_success),
-  message: payload?.message || '',
+  message: payload?.message || payload?.detail || '',
   model: payload?.model || '-',
   preferred_mode: payload?.preferred_mode || '-',
   successful_mode: payload?.successful_mode || '',
@@ -117,11 +117,12 @@ const handleTest = async (row) => {
     const strictText = res.data.strict_success ? t('strictProbePassedSuffix') : t('strictProbeFailedSuffix')
     ElMessage.success(t('connectivityModeOk', { mode: successMode, strictText }))
   } catch (e) {
-    const rawDetail = e.response?.data?.detail
+    const errData = e.response?.data || {}
+    const rawDetail = e.details || errData.details || errData.detail
     if (rawDetail && typeof rawDetail === 'object') {
       testResult.value = normalizeTestResult(rawDetail, false)
       testDialogVisible.value = true
-      ElMessage.error(rawDetail.detail || rawDetail.message || t('connectivityFailed'))
+      ElMessage.error(rawDetail.detail || rawDetail.message || e.friendlyMessage || t('connectivityFailed'))
     } else {
       ElMessage.error(e.friendlyMessage || t('connectivityFailed'))
     }

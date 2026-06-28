@@ -1,13 +1,17 @@
 <script setup>
-import { ref, computed } from 'vue'
-import { useRoute } from 'vue-router'
+import { ref, reactive, computed, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { useI18n } from './i18n'
 import { useTheme } from './composables/useTheme'
+import { useAuthStore } from './stores/auth'
 
 const route = useRoute()
+const router = useRouter()
 const isCollapse = ref(false)
 const { locale, t, setLocale } = useI18n()
 const { isDark, toggleTheme } = useTheme()
+const auth = useAuthStore()
 
 const menuItems = [
   { index: '/', icon: 'DataAnalysis', titleKey: 'dashboard' },
@@ -29,10 +33,54 @@ const routeTitle = computed(() => {
   }
   return t(map[route.name] || 'home')
 })
+
+// M6：进入受保护页时拉取用户信息（token 已由守卫校验存在）
+onMounted(() => {
+  if (auth.isAuthenticated) auth.fetchMe()
+})
+
+async function handleLogout() {
+  await auth.logout()
+  router.push({ name: 'Login' })
+}
+
+// M6：修改密码
+const pwdDialog = ref(false)
+const pwdForm = reactive({ oldPassword: '', newPassword: '', confirmPassword: '' })
+const pwdLoading = ref(false)
+
+function openChangePassword() {
+  pwdForm.oldPassword = ''
+  pwdForm.newPassword = ''
+  pwdForm.confirmPassword = ''
+  pwdDialog.value = true
+}
+
+async function submitChangePassword() {
+  if (pwdForm.newPassword.length < 6) {
+    ElMessage.warning(t('passwordTooShort'))
+    return
+  }
+  if (pwdForm.newPassword !== pwdForm.confirmPassword) {
+    ElMessage.warning(t('passwordMismatch'))
+    return
+  }
+  pwdLoading.value = true
+  try {
+    await auth.changePassword(pwdForm.oldPassword, pwdForm.newPassword)
+    ElMessage.success(t('passwordChanged'))
+    pwdDialog.value = false
+  } catch (error) {
+    ElMessage.error(error.friendlyMessage || t('loginFailed'))
+  } finally {
+    pwdLoading.value = false
+  }
+}
 </script>
 
 <template>
-  <el-container style="height: 100vh">
+  <router-view v-if="route.name === 'Login'" />
+  <el-container v-else style="height: 100vh">
     <el-aside :width="isCollapse ? '64px' : '220px'" class="app-sidebar">
       <div class="app-sidebar-logo">
         <span v-if="!isCollapse" style="font-size: 16px; font-weight: bold; white-space: nowrap">
@@ -78,12 +126,34 @@ const routeTitle = computed(() => {
           <el-button size="small" @click="toggleTheme" :title="isDark ? 'Light mode' : 'Dark mode'">
             {{ isDark ? '☀️' : '🌙' }}
           </el-button>
+          <el-divider direction="vertical" />
+          <span v-if="auth.user" class="app-user">{{ auth.user.username }}</span>
+          <el-button size="small" @click="openChangePassword">{{ t('changePassword') }}</el-button>
+          <el-button size="small" type="danger" plain @click="handleLogout">{{ t('logout') }}</el-button>
         </div>
       </el-header>
       <el-main class="app-main">
         <router-view />
       </el-main>
     </el-container>
+
+    <el-dialog v-model="pwdDialog" :title="t('changePassword')" width="420px">
+      <el-form label-width="110px">
+        <el-form-item :label="t('oldPassword')">
+          <el-input v-model="pwdForm.oldPassword" type="password" show-password />
+        </el-form-item>
+        <el-form-item :label="t('newPassword')">
+          <el-input v-model="pwdForm.newPassword" type="password" show-password />
+        </el-form-item>
+        <el-form-item :label="t('confirmPassword')">
+          <el-input v-model="pwdForm.confirmPassword" type="password" show-password />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="pwdDialog = false">{{ t('cancel') }}</el-button>
+        <el-button type="primary" :loading="pwdLoading" @click="submitChangePassword">{{ t('save') }}</el-button>
+      </template>
+    </el-dialog>
   </el-container>
 </template>
 
@@ -118,6 +188,10 @@ html.dark .app-sidebar-logo {
   align-items: center;
   justify-content: space-between;
   background: var(--bg-header);
+}
+.app-user {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
 }
 .app-main {
   background: var(--bg-page);

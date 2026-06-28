@@ -8,6 +8,13 @@ import { usePolling } from '../composables/usePolling'
 import ScanOverview from '../components/ScanOverview.vue'
 import { normalizeScanStats } from '../utils/scanStats'
 import { collectRiskHints, riskHintMeta } from '../utils/riskHints'
+import {
+  coverageNoteOf,
+  coverageRatioOf,
+  deriveCoverage,
+  routeGapSummaryOf,
+  routesOf,
+} from '../utils/stageOne'
 
 const props = defineProps({ id: [String, Number] })
 const router = useRouter()
@@ -27,13 +34,9 @@ const polling = usePolling({
   fetchFn: async () => { await loadBase(); await loadArtifact() },
 })
 
-const stageOneCoverage = computed(() => stageOneStage.value?.compressed_summary?.coverage || {})
-const stageOneCoverageRatio = computed(() => {
-  const total = Number(stageOneCoverage.value.audit_scope_chunk_count || stageOneCoverage.value.total_chunk_count || 0)
-  const scanned = Number(stageOneCoverage.value.scanned_chunk_count || 0)
-  return scanned / Math.max(total || 1, 1)
-})
-const stageOneCoverageNote = computed(() => stageOneCoverage.value.audit_scope_note || t('auditScopeCoverageNote'))
+const stageOneCoverage = computed(() => deriveCoverage(stageOneStage.value))
+const stageOneCoverageRatio = computed(() => coverageRatioOf(stageOneCoverage.value))
+const stageOneCoverageNote = computed(() => coverageNoteOf(stageOneCoverage.value, t('auditScopeCoverageNote')))
 const stageOneArchitecture = computed(() => stageOneStage.value?.findings?.architecture_info || {})
 const stageOneSummary = computed(() => stageOneStage.value?.findings?.stage_summary || '')
 const stageOneEntryPoints = computed(() => {
@@ -57,7 +60,7 @@ const stageOneRiskHints = computed(() => collectRiskHints(
   stageOneStage.value?.compressed_summary,
   artifact.value?.payload?.merged_response_preview,
 ))
-const stageOneRoutes = computed(() => Array.isArray(stageOneStage.value?.findings?.architecture_info?.routes) ? stageOneStage.value.findings.architecture_info.routes : [])
+const stageOneRoutes = computed(() => routesOf(stageOneStage.value))
 const taskSummary = computed(() => {
   const summary = task.value?.summary
   return summary && typeof summary === 'object' ? summary : {}
@@ -96,7 +99,7 @@ const displayedStageOnePasses = computed(() => {
   return stageOnePasses.value.slice(-3)
 })
 const hiddenStageOnePassCount = computed(() => Math.max(stageOnePasses.value.length - displayedStageOnePasses.value.length, 0))
-const routeGapSummary = computed(() => artifact.value?.payload?.route_gap_summary || { static_route_count: 0, confirmed_route_count: 0, missing_route_count: 0, missing_route_samples: [] })
+const routeGapSummary = computed(() => routeGapSummaryOf(artifact.value))
 const missingRouteSamples = computed(() => Array.isArray(routeGapSummary.value?.missing_route_samples) ? routeGapSummary.value.missing_route_samples : [])
 const projectSummaryClass = computed(() => stageOneSummary.value ? 'stage-one-summary' : 'stage-one-summary is-empty')
 

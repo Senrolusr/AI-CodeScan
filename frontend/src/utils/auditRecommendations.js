@@ -1,8 +1,6 @@
+import { normalizeSeverity } from '../i18n'
+
 const DEFAULT_SEVERITY_STATS = { Critical: 0, High: 0, Medium: 0, Low: 0, Info: 0 }
-
-const _severityAlias = { '严重': 'Critical', '高危': 'High', '高': 'High', '中危': 'Medium', '中': 'Medium', '低危': 'Low', '低': 'Low', '提示': 'Info', '信息': 'Info', critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low', info: 'Info' }
-
-function _normalizeSeverity(s) { return _severityAlias[s] || (s in DEFAULT_SEVERITY_STATS ? s : null) }
 
 const TEXT = {
   criticalOrHigh: {
@@ -58,7 +56,7 @@ function resolveText(locale = 'zh', key) {
 export function buildSeverityStats(vulns = []) {
   const stats = { ...DEFAULT_SEVERITY_STATS }
   for (const vuln of vulns || []) {
-    const key = _normalizeSeverity(vuln?.severity)
+    const key = normalizeSeverity(vuln?.severity)
     if (key) stats[key] += 1
   }
   return stats
@@ -75,8 +73,7 @@ export function buildTaskRescanRecommendations({ vulns = [], scanStats = {}, loc
     recommendations.push(resolveText(locale, 'compactedFiles'))
   }
   if (
-    scanStats.truncated_files
-    || scanStats.truncated_by_audit_file_count
+    scanStats.truncated_by_audit_file_count
     || scanStats.truncated_by_code_chunks
     || scanStats.truncated_by_total_chars
   ) {

@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from database import get_db
+from errors import ApiError
 from models import AuditTask, Vulnerability, AuditStage, Project
 from schemas import ReportExport
 from services.audit_cleanup import get_audit_report_dir
@@ -30,7 +31,7 @@ async def export_report(data: ReportExport, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(AuditTask).where(AuditTask.id == data.task_id))
     task = result.scalar_one_or_none()
     if not task:
-        raise HTTPException(404, "审计任务不存在")
+        raise ApiError("AUDIT_NOT_FOUND", "审计任务不存在", status_code=404)
 
     result = await db.execute(select(Project).where(Project.id == task.project_id))
     project = result.scalar_one_or_none()

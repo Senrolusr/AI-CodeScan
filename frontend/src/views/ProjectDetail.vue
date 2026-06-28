@@ -8,6 +8,8 @@ import {
   getLlmConfigs,
   getProject,
   getProjectFile,
+  getProjectRoutes,
+  getProjectRuleHits,
   rebuildProjectCache,
 } from '../api'
 import FileTree from '../components/FileTree.vue'
@@ -15,6 +17,7 @@ import { useI18n } from '../i18n'
 import { buildProjectCacheRecommendations } from '../utils/auditRecommendations'
 import { useAuditDeletion } from '../composables/useAuditDeletion'
 import { isAuditDeleteBlocked } from '../utils/auditTaskState'
+import { isPartialScan } from '../utils/scanStats'
 
 const props = defineProps({ id: [String, Number] })
 const router = useRouter()
@@ -33,6 +36,9 @@ const selectedLlmConfig = ref(null)
 const auditName = ref('')
 const creatingAudit = ref(false)
 const existingAudits = ref([])
+
+const projectRoutes = ref([])
+const projectRuleHits = ref([])
 
 const cacheSummary = computed(() => {
   const value = project.value?.cache_summary
@@ -82,7 +88,23 @@ const loadProject = async () => {
   }
 }
 
-onMounted(loadProject)
+const loadProjectIndex = async () => {
+  try {
+    const [routesRes, hitsRes] = await Promise.all([
+      getProjectRoutes(props.id),
+      getProjectRuleHits(props.id),
+    ])
+    projectRoutes.value = routesRes.data || []
+    projectRuleHits.value = hitsRes.data || []
+  } catch {
+    // 索引可能尚未构建（旧项目 / 上传前），静默处理
+  }
+}
+
+onMounted(async () => {
+  await loadProject()
+  loadProjectIndex()
+})
 
 const { removeAudit } = useAuditDeletion(loadProject)
 
@@ -147,6 +169,7 @@ const handleRebuildCache = async () => {
     const res = await rebuildProjectCache(props.id)
     ElMessage.success(res.data?.message || t('rebuildCacheSuccess'))
     await loadProject()
+    await loadProjectIndex()
   } catch (e) {
     ElMessage.error(e.friendlyMessage || t('rebuildCacheFailed'))
   } finally {
@@ -209,7 +232,7 @@ const handleRebuildCache = async () => {
           </el-descriptions-item>
         </el-descriptions>
         <div
-          v-if="cacheScanStats.partial_audit || cacheScanStats.truncated_by_audit_file_count || cacheScanStats.truncated_by_code_chunks || cacheScanStats.truncated_by_total_chars"
+          v-if="isPartialScan(cacheScanStats)"
           class="warning-notice"
         >
           <div>{{ t('cachePartialNotice') }}</div>
@@ -236,6 +259,39 @@ const handleRebuildCache = async () => {
             <strong style="margin-right: 8px">{{ index + 1 }}.</strong>{{ item }}
           </div>
         </div>
+      </el-card>
+
+      <el-card style="margin-bottom: 20px">
+        <template #header>
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px">
+            <span class="card-title">{{ t('projectRoutes') }}</span>
+            <el-tag size="small" type="info">{{ projectRoutes.length }}</el-tag>
+          </div>
+        </template>
+        <el-table v-if="projectRoutes.length" :data="projectRoutes" stripe size="small" max-height="420">
+          <el-table-column prop="method" :label="t('method')" width="90" />
+          <el-table-column prop="path" :label="t('path')" min-width="200" show-overflow-tooltip />
+          <el-table-column prop="handler" :label="t('handler')" min-width="140" show-overflow-tooltip />
+          <el-table-column prop="file_path" :label="t('file')" min-width="180" show-overflow-tooltip />
+        </el-table>
+        <el-empty v-else :description="t('noProjectRoutes')" :image-size="60" />
+      </el-card>
+
+      <el-card style="margin-bottom: 20px">
+        <template #header>
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px">
+            <span class="card-title">{{ t('projectRuleHits') }}</span>
+            <el-tag size="small" type="info">{{ projectRuleHits.length }}</el-tag>
+          </div>
+        </template>
+        <el-table v-if="projectRuleHits.length" :data="projectRuleHits" stripe size="small" max-height="420">
+          <el-table-column prop="label" :label="t('ruleLabel')" width="110" show-overflow-tooltip />
+          <el-table-column prop="title" :label="t('title')" min-width="160" show-overflow-tooltip />
+          <el-table-column prop="file_path" :label="t('file')" min-width="180" show-overflow-tooltip />
+          <el-table-column prop="risk_score" :label="t('riskScore')" width="90" />
+          <el-table-column prop="weighted_score" :label="t('weightedScore')" width="100" />
+        </el-table>
+        <el-empty v-else :description="t('noProjectRuleHits')" :image-size="60" />
       </el-card>
 
       <el-card v-if="existingAudits.length" style="margin-bottom: 20px">

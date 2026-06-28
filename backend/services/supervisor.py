@@ -12,7 +12,7 @@ from sqlalchemy import delete, select
 
 from database import async_session
 from models import AuditStage, AuditTask, LlmConfig, Project, Vulnerability
-from prompts.stage_prompts import get_stage_prompt, STAGE_SPECS
+from prompts.stage_prompts import SUPERVISOR_PLAN_STAGE_NAME, SUPERVISOR_REVIEW_STAGE_NAME, get_stage_name, get_stage_prompt, STAGE_SPECS
 from prompts.supervisor_prompts import (
     SUPERVISOR_PLANNING_SYSTEM,
     SUPERVISOR_PLANNING_USER,
@@ -21,19 +21,29 @@ from prompts.supervisor_prompts import (
     AGENT_FOCUS_PREFIX,
 )
 from services.code_parser import get_or_build_project_cache
+from services.project_index import sync_project_index
+from services import audit_runtime as rt
+from services.vulnerability_review import (
+    clear_stashed_review_state as _clear_stashed_review_state,
+    snapshot_review_state as _snapshot_review_state,
+    stash_review_state as _stash_review_state,
+)
 from services.json_repair import (
     decode_json_string_fragment as _decode_json_string_fragment,
     extract_balanced_json_value as _extract_balanced_json_value,
 )
 from services.llm_client import call_llm_with_meta
+from services.ai_engine.severity import SEVERITY_ORDER
+from services.ai_engine.stage_schema import validate_stage_output
 from services.audit_engine import (
     _accumulate_token_usage,
     _apply_stage_payload,
     _coerce_stage_findings,
     _build_audit_memory,
     _build_prev_context,
-    _is_task_cancelled,
+    _is_task_stopping,
     _refresh_task_summary,
+    _run_missing_route_followup,
     _run_single_pass_stage,
     _run_stage1_multi_pass,
     _select_stage_chunks,
@@ -43,7 +53,49 @@ from services.audit_engine import (
 
 logger = logging.getLogger(__name__)
 
-FALLBACK_MAX_AGENT_COUNT = 7
+FALLBACK_MAX_AGENT_COUNT = 9
+
+
+async def _record_agent_meta(session, task_id: int, agent_role: str, result, *, stage_num: int | None = None, error: str | None = None, subtask_id: int | None = None) -> None:
+    """把一次 LLM 调用的 meta（token/latency/finish_reason）落成一条 AuditAgentRun。
+
+    ``result`` 为 None 或失败时按 failed 记录。仅做影子写入，失败不阻断审计。
+    """
+    status = "completed"
+    prompt_tokens = None
+    completion_tokens = None
+    latency_ms = None
+    finish_reason = ""
+    if result is None:
+        status = "failed"
+    else:
+        meta = result.get("meta") if isinstance(result, dict) else None
+        success = result.get("success") if isinstance(result, dict) else False
+        if not success:
+            status = "failed"
+            error = error or (result.get("error", {}) or {}).get("message", "")
+        if isinstance(meta, dict):
+            usage = meta.get("usage") or {}
+            prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+            completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+            latency_ms = meta.get("latency_ms")
+            finish_reason = meta.get("finish_reason") or ""
+    try:
+        await rt.record_agent_run(
+            session,
+            task_id=task_id,
+            agent_role=agent_role,
+            status=status,
+            stage_num=stage_num,
+            subtask_id=subtask_id,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency_ms=latency_ms,
+            finish_reason=finish_reason,
+            error_message=error,
+        )
+    except Exception:  # noqa: BLE001 - 影子写入，失败不得阻断审计主流程
+        logger.exception("record_agent_meta failed (task=%s role=%s stage=%s)", task_id, agent_role, stage_num)
 
 
 def _add_task_degradation(task: AuditTask, code: str, message: str, phase: str) -> None:
@@ -64,6 +116,147 @@ def _add_task_degradation(task: AuditTask, code: str, message: str, phase: str) 
     summary["degraded"] = True
     summary["degradation_notes"] = notes[-20:]
     task.summary = summary
+
+
+def _planned_sub_agent_stage_nums(agent_plan: dict | None) -> list[int]:
+    if not isinstance(agent_plan, dict):
+        return []
+    stage_nums: list[int] = []
+    seen: set[int] = set()
+    for spec in agent_plan.get("selected_agents") or []:
+        if not isinstance(spec, dict):
+            continue
+        stage_num = _safe_int(spec.get("stage_num"))
+        if 2 <= stage_num <= 9 and stage_num not in seen:
+            stage_nums.append(stage_num)
+            seen.add(stage_num)
+    return stage_nums
+
+
+def _explainable_skipped_stage_nums(agent_plan: dict | None) -> set[int]:
+    if not isinstance(agent_plan, dict):
+        return set()
+    stage_nums: set[int] = set()
+    for spec in agent_plan.get("skipped_agents") or []:
+        if not isinstance(spec, dict):
+            continue
+        stage_num = _safe_int(spec.get("stage_num"))
+        reason = str(spec.get("skip_reason") or spec.get("reason") or "").strip()
+        if 2 <= stage_num <= 9 and reason:
+            stage_nums.add(stage_num)
+    return stage_nums
+
+
+def _build_orchestration_guard(agent_plan: dict | None, stages: list[AuditStage]) -> dict:
+    planned_stage_nums = _planned_sub_agent_stage_nums(agent_plan)
+    explainable_skips = _explainable_skipped_stage_nums(agent_plan)
+    stage_map = {
+        _safe_int(getattr(stage, "stage_num", None)): stage
+        for stage in stages or []
+        if 2 <= _safe_int(getattr(stage, "stage_num", None)) <= 9
+    }
+
+    completed_stage_nums: list[int] = []
+    failed_stage_nums: list[int] = []
+    missing_stage_nums: list[int] = []
+    pending_stage_nums: list[int] = []
+    running_stage_nums: list[int] = []
+    skipped_stage_nums: list[int] = []
+    unresolved_stage_nums: list[int] = []
+    stage_statuses: dict[str, str] = {}
+
+    for stage_num in planned_stage_nums:
+        stage = stage_map.get(stage_num)
+        if not stage:
+            missing_stage_nums.append(stage_num)
+            unresolved_stage_nums.append(stage_num)
+            stage_statuses[str(stage_num)] = "missing"
+            continue
+
+        status = str(getattr(stage, "status", "") or "pending").strip().lower()
+        stage_statuses[str(stage_num)] = status
+        if status == "completed":
+            completed_stage_nums.append(stage_num)
+        elif status == "failed":
+            failed_stage_nums.append(stage_num)
+            unresolved_stage_nums.append(stage_num)
+        elif status == "running":
+            running_stage_nums.append(stage_num)
+            unresolved_stage_nums.append(stage_num)
+        elif status == "skipped":
+            skipped_stage_nums.append(stage_num)
+            if stage_num not in explainable_skips:
+                unresolved_stage_nums.append(stage_num)
+        elif status in {"pending", ""}:
+            pending_stage_nums.append(stage_num)
+            unresolved_stage_nums.append(stage_num)
+        else:
+            unresolved_stage_nums.append(stage_num)
+
+    status = "ok"
+    if not planned_stage_nums or unresolved_stage_nums:
+        status = "blocked"
+
+    if not planned_stage_nums:
+        message = "阶段三没有可校验的并行审计计划，已阻止进入复核。"
+    elif unresolved_stage_nums:
+        stage_list = ", ".join(f"Stage {num}" for num in unresolved_stage_nums)
+        message = f"阶段三并行审计未收敛，已阻止进入复核：{stage_list}。"
+    else:
+        message = "阶段三并行审计已收敛，可以进入复核。"
+
+    return {
+        "status": status,
+        "planned_stage_nums": planned_stage_nums,
+        "completed_stage_nums": completed_stage_nums,
+        "failed_stage_nums": failed_stage_nums,
+        "missing_stage_nums": missing_stage_nums,
+        "pending_stage_nums": pending_stage_nums,
+        "running_stage_nums": running_stage_nums,
+        "skipped_stage_nums": skipped_stage_nums,
+        "unresolved_stage_nums": sorted(set(unresolved_stage_nums)),
+        "stage_statuses": stage_statuses,
+        "message": message,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _persist_orchestration_guard(task: AuditTask, guard: dict) -> None:
+    summary = dict(task.summary) if isinstance(task.summary, dict) else {}
+    summary["orchestration_guard"] = guard
+    task.summary = summary
+
+
+async def _assert_sub_agent_phase_converged(session, task: AuditTask, agent_plan: dict | None, stages: list[AuditStage]) -> None:
+    guard = _build_orchestration_guard(agent_plan, stages)
+    _persist_orchestration_guard(task, guard)
+    if guard.get("status") == "ok":
+        await session.commit()
+        return
+
+    message = str(guard.get("message") or "阶段三并行审计未收敛，已阻止进入复核。")
+    _add_task_degradation(
+        task,
+        "sub_agent_phase_not_converged",
+        message,
+        "sub_agent",
+    )
+    _persist_orchestration_guard(task, guard)
+    await rt.emit_event(
+        session,
+        task_id=task.id,
+        event_type=rt.EVENT_STAGE_FAILED,
+        payload={
+            "phase": "sub_agents",
+            "message": message,
+            "planned_stage_nums": guard.get("planned_stage_nums", []),
+            "unresolved_stage_nums": guard.get("unresolved_stage_nums", []),
+            "failed_stage_nums": guard.get("failed_stage_nums", []),
+            "missing_stage_nums": guard.get("missing_stage_nums", []),
+        },
+    )
+    await session.commit()
+    raise RuntimeError(message)
 
 
 def _normalize_rerun_stage_nums(rerun_agents: list) -> list[int]:
@@ -170,6 +363,58 @@ def _normalize_agent_specs(items: list[dict]) -> list[dict]:
     for index, item in enumerate(normalized, start=1):
         item["priority"] = index
     return normalized
+
+
+# §10.3 确定性合并时从 LLM 输出叠加到确定性候选 stage 的 focus 字段集合。
+_FOCUS_KEYS = ("focus_guidance", "focus_files", "focus_routes", "focus_functions", "focus_data_flows")
+
+
+def _merge_plan_with_llm_focus(deterministic_plan: dict, llm_plan: dict | None) -> dict:
+    """§10.3 确定性主导合并：``deterministic_plan`` 锁定 **which stages**（stage_num 集合 +
+    baseline + 证据排期），``llm_plan`` 仅贡献 focus 增强——按 stage_num 匹配叠加到对应
+    候选 stage，绝不增删 stage。
+
+    容忍 LLM 漂移：无论 LLM 返回旧格式 ``selected_agents``（带 stage_num）还是 focus-only
+    结构，都按 stage_num 取 focus 字段叠加；LLM 自行增删的 stage 一律忽略（which stages
+    由后端掌控，符合 §17.1「执行计划由后端决定」）。LLM 缺失某 stage 的 focus 时保留
+    确定性默认 focus_guidance。
+    """
+    merged = dict(deterministic_plan) if isinstance(deterministic_plan, dict) else {"selected_agents": [], "skipped_agents": []}
+    selected = [dict(item) for item in merged.get("selected_agents", []) if isinstance(item, dict)]
+    skipped = [dict(item) for item in merged.get("skipped_agents", []) if isinstance(item, dict)]
+
+    llm_focus_by_stage: dict[int, dict] = {}
+    llm_analysis = ""
+    if isinstance(llm_plan, dict):
+        llm_analysis = str(llm_plan.get("analysis_summary") or "")
+        for item in llm_plan.get("selected_agents", []):
+            if not isinstance(item, dict):
+                continue
+            stage_num = _safe_int(item.get("stage_num"))
+            if 2 <= stage_num <= 9:
+                llm_focus_by_stage[stage_num] = item
+
+    for agent in selected:
+        stage_num = _safe_int(agent.get("stage_num"))
+        focus = llm_focus_by_stage.get(stage_num)
+        if not focus:
+            continue
+        for key in _FOCUS_KEYS:
+            value = focus.get(key)
+            if key == "focus_guidance":
+                if isinstance(value, str) and value.strip():
+                    agent[key] = value.strip()
+            elif isinstance(value, list) and value:
+                agent[key] = list(value)
+
+    if llm_analysis.strip():
+        merged["analysis_summary"] = llm_analysis.strip()
+    elif "analysis_summary" not in merged:
+        merged["analysis_summary"] = ""
+
+    merged["selected_agents"] = selected
+    merged["skipped_agents"] = skipped
+    return merged
 
 
 def _minimal_agent_spec(stage_num: int, *, reason: str, evidence: int = 0) -> dict:
@@ -304,10 +549,21 @@ def _trim_agent_plan_to_budget(selected: list[dict], skipped: list[dict], max_ag
         if _safe_int(item.get("stage_num")) in BASELINE_AGENT_GUIDANCE
     }
     non_baseline_slots = max(0, int(max_agents) - len(required_stage_nums))
+    non_baseline_candidates = [
+        item for item in selected
+        if _safe_int(item.get("stage_num")) not in BASELINE_AGENT_GUIDANCE
+    ]
+    non_baseline_candidates.sort(
+        key=lambda item: (
+            -_safe_int(item.get("evidence")),
+            _safe_int(item.get("priority"), 999),
+            _safe_int(item.get("stage_num")),
+        )
+    )
     kept_non_baseline: set[int] = set()
-    for item in selected:
+    for item in non_baseline_candidates:
         stage_num = _safe_int(item.get("stage_num"))
-        if stage_num in BASELINE_AGENT_GUIDANCE or stage_num in kept_non_baseline:
+        if stage_num in kept_non_baseline:
             continue
         if len(kept_non_baseline) >= non_baseline_slots:
             continue
@@ -321,7 +577,10 @@ def _trim_agent_plan_to_budget(selected: list[dict], skipped: list[dict], max_ag
             trimmed.append(item)
             continue
         skipped_item = dict(item)
-        skipped_item["skip_reason"] = "Skipped by agent budget after baseline stage enforcement"
+        skipped_item["skip_reason"] = (
+            f"Skipped by agent budget after baseline stage enforcement "
+            f"(max_agents={int(max_agents)}, baseline={sorted(BASELINE_AGENT_GUIDANCE)})"
+        )
         skipped_item["_budget_trimmed"] = True
         skipped.append(skipped_item)
 
@@ -522,10 +781,27 @@ async def _run_supervisor_review_closure(
     agent_plan,
 ):
     audit_memory = _build_audit_memory(list(stages))
+    await rt.emit_event(session, task_id=task.id, event_type=rt.EVENT_REVIEW_STARTED, payload={"role": "supervisor_review"}, stage_num=-2)
     review = await _run_supervisor_review(session, task, stages, llm_config, audit_memory, agent_plan)
     rerun_stage_nums = _normalize_rerun_stage_nums(review.get("rerun_agents"))
     if review.get("request_rerun") and rerun_stage_nums:
+        await rt.emit_event(
+            session,
+            task_id=task.id,
+            event_type=rt.EVENT_RERUN_REQUESTED,
+            payload={"stage_nums": rerun_stage_nums, "role": "supervisor_review"},
+            stage_num=-2,
+        )
+        # M5：重跑删除前快照已有复核状态，重插时 carry-forward（按 dedupe_key）
+        _stash_review_state(task, await _snapshot_review_state(session, task.id))
         await _reset_agent_stages_for_rerun(session, task.id, stages, rerun_stage_nums)
+        await rt.emit_event(
+            session,
+            task_id=task.id,
+            event_type=rt.EVENT_STAGE_RESET_FOR_RERUN,
+            payload={"stage_nums": rerun_stage_nums},
+            stage_num=-2,
+        )
         rerun_plan = {"selected_agents": [{"stage_num": stage_num} for stage_num in rerun_stage_nums], "skipped_agents": []}
         await _execute_sub_agents(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, rerun_plan)
         stages = await _reload_task_stages(session, task.id)
@@ -540,6 +816,13 @@ async def _run_supervisor_review_closure(
             agent_plan,
             extra_findings={"rerun_execution": rerun_execution},
         )
+    await rt.emit_event(
+        session,
+        task_id=task.id,
+        event_type=rt.EVENT_REVIEW_COMPLETED,
+        payload={"request_rerun": bool(review.get("request_rerun")), "rerun_stage_nums": rerun_stage_nums},
+        stage_num=-2,
+    )
     return review, stages
 
 
@@ -572,8 +855,12 @@ async def _reset_agent_stages_for_rerun(session, task_id: int, stages: list[Audi
 
 
 async def _reload_task_stages(session, task_id: int) -> list[AuditStage]:
+    await session.flush()
     result = await session.execute(
-        select(AuditStage).where(AuditStage.task_id == task_id).order_by(AuditStage.stage_num)
+        select(AuditStage)
+        .where(AuditStage.task_id == task_id)
+        .order_by(AuditStage.stage_num)
+        .execution_options(populate_existing=True)
     )
     return result.scalars().all()
 
@@ -611,25 +898,26 @@ async def _load_audit_context(session, task_id: int):
 
     project_cache = get_or_build_project_cache(project.id, project.upload_path, project.file_tree or [])
 
-    if await _is_task_cancelled(session, task_id):
+    if await _is_task_stopping(session, task_id):
         return None
 
     scan_stats = project_cache.get("scan_stats", {})
-    rule_hits = project_cache.get("rule_hits", [])
+    rule_hits = project_cache.get("rule_hits", [])  # ctx（L689）仍需；summary.rule_hits_preview 已移除（前端改读 project_rule_hits 表）
     pre_discovery = project_cache.get("pre_discovery")
     summary = dict(task.summary) if isinstance(task.summary, dict) else {}
     if isinstance(scan_stats, dict):
         summary["scan_stats"] = scan_stats
-    if isinstance(rule_hits, list):
-        summary["rule_hits_preview"] = rule_hits[:20]
     pre_discovery_summary = _summarize_pre_discovery(pre_discovery)
     if pre_discovery_summary:
         summary["pre_discovery"] = pre_discovery_summary
     summary.pop("worker_failure", None)
+    summary.pop("orchestration_guard", None)
     task.summary = summary
     task.status = "running"
     task.error_message = ""
     task.completed_at = None
+    # M4b：把项目缓存里的 static_routes / rule_hits 影子写入结构化表（与本次状态变更同事务）。
+    await sync_project_index(session, project.id, project_cache)
     await session.commit()
 
     return {
@@ -671,33 +959,63 @@ async def run_multi_agent_audit(task_id: int):
         pre_discovery = ctx["pre_discovery"]
 
         try:
+            current_run = await rt.get_current_run(session, task_id)
+            run_id = current_run.id if current_run else None
+        except Exception:  # noqa: BLE001 - 事件流为辅助观测，不得阻断审计
+            run_id = None
+
+        try:
+
             # Phase 1: architecture agent (Stage 1)
             _set_task_phase(task, 1)
             await session.commit()
+            await rt.emit_event(session, task_id=task_id, event_type=rt.EVENT_PHASE_CHANGED, payload={"phase": 1, "name": "architecture"}, run_id=run_id)
+            await session.commit()
             await _run_phase1_architecture(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, pre_discovery)
-            if await _is_task_cancelled(session, task_id):
+            if await _is_task_stopping(session, task_id):
                 return
 
             # Phase 2: supervisor planning
             _set_task_phase(task, 2)
             await session.commit()
+            await rt.emit_event(session, task_id=task_id, event_type=rt.EVENT_PHASE_CHANGED, payload={"phase": 2, "name": "supervisor_plan"}, run_id=run_id)
+            await session.commit()
             audit_memory = _build_audit_memory(list(stages))
             agent_plan = await _run_supervisor_planning(session, task, stages, llm_config, project, audit_memory, rule_hits, source_sink_hints)
 
-            if await _is_task_cancelled(session, task_id):
+            if await _is_task_stopping(session, task_id):
                 return
 
             # Phase 3: sub-agents in parallel
             _set_task_phase(task, 3)
             await session.commit()
+            await rt.emit_event(session, task_id=task_id, event_type=rt.EVENT_PHASE_CHANGED, payload={"phase": 3, "name": "sub_agents"}, run_id=run_id)
+            await session.commit()
             await _execute_sub_agents(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, agent_plan)
             stages = await _reload_task_stages(session, task.id)
 
-            if await _is_task_cancelled(session, task_id):
+            if await _is_task_stopping(session, task_id):
                 return
+            await _assert_sub_agent_phase_converged(session, task, agent_plan, stages)
+            route_followup = await _run_missing_route_followup(
+                session,
+                task,
+                stages,
+                llm_config,
+                project,
+                code_chunks,
+                static_routes,
+                scan_stats,
+                pre_discovery,
+                source_sink_hints,
+            )
+            if route_followup.get("triggered"):
+                stages = await _reload_task_stages(session, task.id)
 
             # Phase 4: supervisor review
             _set_task_phase(task, 4)
+            await session.commit()
+            await rt.emit_event(session, task_id=task_id, event_type=rt.EVENT_PHASE_CHANGED, payload={"phase": 4, "name": "supervisor_review"}, run_id=run_id)
             await session.commit()
             review, stages = await _run_supervisor_review_closure(
                 session,
@@ -712,7 +1030,7 @@ async def run_multi_agent_audit(task_id: int):
                 agent_plan,
             )
 
-            if await _is_task_cancelled(session, task_id):
+            if await _is_task_stopping(session, task_id):
                 return
 
             task.status = "completed"
@@ -722,12 +1040,15 @@ async def run_multi_agent_audit(task_id: int):
                 session,
                 task,
                 scan_stats=scan_stats,
-                rule_hits=rule_hits,
                 pre_discovery=pre_discovery,
                 static_routes=static_routes,
             )
+            if run_id:
+                await rt.complete_run(session, run_id)
+            await rt.emit_event(session, task_id=task_id, event_type=rt.EVENT_RUN_COMPLETED, payload={}, run_id=run_id)
             await session.commit()
             logger.info("Multi-agent task %s completed", task_id)
+            _clear_stashed_review_state(task)
 
         except Exception as exc:
             logger.error("Multi-agent task %s failed: %s", task_id, exc)
@@ -745,7 +1066,17 @@ async def run_multi_agent_audit(task_id: int):
                 if stage.status == "running":
                     stage.status = "failed"
                     stage.completed_at = failed_at
+            if run_id:
+                await rt.fail_run(session, run_id, str(exc)[:500])
+            await rt.emit_event(
+                session,
+                task_id=task_id,
+                event_type=rt.EVENT_RUN_FAILED,
+                payload={"message": str(exc)[:500]},
+                run_id=run_id,
+            )
             await session.commit()
+            _clear_stashed_review_state(task)
 
 
 async def _run_phase1_architecture(session, task, stages, llm_config, project, code_chunks, static_routes, rule_hits, source_sink_hints, pre_discovery=None):
@@ -758,6 +1089,9 @@ async def _run_phase1_architecture(session, task, stages, llm_config, project, c
     stage.status = "running"
     stage.started_at = datetime.now(timezone.utc)
     task.current_stage = 1
+    await session.commit()
+    await rt.emit_event(session, task_id=task.id, event_type=rt.EVENT_STAGE_STARTED, payload={"stage_name": "architecture"}, stage_num=1)
+    subtask = await rt.start_subtask(session, task_id=task.id, stage_num=1, role="architecture")
     await session.commit()
 
     audit_memory = _build_audit_memory(list(stages), current_stage_num=1)
@@ -774,8 +1108,12 @@ async def _run_phase1_architecture(session, task, stages, llm_config, project, c
         )
         await _apply_stage_payload(stage, stage_payload, session=session, task=task, static_routes=static_routes, audit_memory=audit_memory)
         stage.status = "completed"
+        await rt.complete_subtask(session, subtask.id if subtask else None)
+        await rt.emit_event(session, task_id=task.id, event_type=rt.EVENT_STAGE_COMPLETED, payload={"stage_name": "architecture"}, stage_num=1)
     except Exception:
         stage.status = "failed"
+        await rt.fail_subtask(session, subtask.id if subtask else None, "architecture 阶段失败")
+        await rt.emit_event(session, task_id=task.id, event_type=rt.EVENT_STAGE_FAILED, payload={"stage_name": "architecture"}, stage_num=1)
         logger.exception("Phase 1 failed for task %s", task.id)
     stage.completed_at = datetime.now(timezone.utc)
     await session.commit()
@@ -786,7 +1124,7 @@ async def _run_supervisor_planning(session, task, stages, llm_config, project, a
     stage_map = {s.stage_num: s for s in stages}
     plan_stage = stage_map.get(-1)
     if not plan_stage:
-        plan_stage = AuditStage(task_id=task.id, stage_num=-1, stage_name="审计规划", agent_role="supervisor_plan", status="pending")
+        plan_stage = AuditStage(task_id=task.id, stage_num=-1, stage_name=SUPERVISOR_PLAN_STAGE_NAME, agent_role="supervisor_plan", status="pending")
         session.add(plan_stage)
         await session.commit()
         await session.refresh(plan_stage)
@@ -794,8 +1132,28 @@ async def _run_supervisor_planning(session, task, stages, llm_config, project, a
     plan_stage.status = "running"
     plan_stage.started_at = datetime.now(timezone.utc)
     await session.commit()
+    await rt.emit_event(session, task_id=task.id, event_type=rt.EVENT_AGENT_STARTED, payload={"role": "supervisor_plan"}, stage_num=-1)
+    subtask = await rt.start_subtask(session, task_id=task.id, stage_num=-1, role="supervisor_plan")
+    await session.commit()
 
-    planning_context = _build_planning_context(project, audit_memory, rule_hits, source_sink_hints)
+    # §10.3 确定性主导：先用证据驱动的确定性 planner 锁定「执行哪些阶段」（stage_num 集合 +
+    # baseline 2/7/9 + 证据排期）。LLM 规划降级为「聚焦增强」——只为候选 stage 补 focus 字段，
+    # 不增删 stage（which stages 由后端掌控，符合 §17.1「执行计划由后端决定，不让模型跳过
+    # 必须执行的阶段」）。
+    deterministic_plan = _build_default_plan(
+        rule_hits,
+        source_sink_hints,
+        max_agents=FALLBACK_MAX_AGENT_COUNT,
+    )
+    deterministic_plan["_deterministic"] = True
+
+    planning_context = _build_planning_context(
+        project,
+        audit_memory,
+        rule_hits,
+        source_sink_hints,
+        candidate_agents=deterministic_plan.get("selected_agents", []),
+    )
     user_prompt = SUPERVISOR_PLANNING_USER.format(**planning_context)
 
     try:
@@ -804,8 +1162,8 @@ async def _run_supervisor_planning(session, task, stages, llm_config, project, a
         if not result["success"]:
             raise RuntimeError(f"Supervisor planning failed: {result['error']['message']}")
 
-        agent_plan = _parse_structured_response(result["content"], result.get("meta"))
-        if isinstance(agent_plan, dict) and agent_plan.get("parse_error"):
+        llm_plan = _parse_structured_response(result["content"], result.get("meta"))
+        if isinstance(llm_plan, dict) and llm_plan.get("parse_error"):
             salvaged_plan = _salvage_supervisor_plan(
                 result["content"],
                 rule_hits=rule_hits,
@@ -816,32 +1174,36 @@ async def _run_supervisor_planning(session, task, stages, llm_config, project, a
                 _add_task_degradation(
                     task,
                     "supervisor_planning_salvaged",
-                    "Supervisor 规划响应被截断，已恢复可用 Agent 计划继续执行。",
+                    "Supervisor 规划响应被截断，已恢复可用 focus 增强并合并到确定性计划。",
                     "planning",
                 )
-                agent_plan = salvaged_plan
+                llm_plan = salvaged_plan
             else:
                 _add_task_degradation(
                     task,
                     "supervisor_planning_parse_error",
-                    "Supervisor 规划响应解析失败，已使用受限默认审计计划继续执行。",
+                    "Supervisor 规划响应解析失败，已使用纯确定性审计计划继续执行。",
                     "planning",
                 )
-                agent_plan = _build_default_plan(
-                    rule_hits,
-                    source_sink_hints,
-                    max_agents=FALLBACK_MAX_AGENT_COUNT,
-                )
-                agent_plan["_fallback"] = True
-                agent_plan["_fallback_reason"] = "planning_parse_error"
+                llm_plan = {}
 
-        if isinstance(agent_plan, dict):
-            agent_plan = _ensure_baseline_agents(agent_plan, max_agents=FALLBACK_MAX_AGENT_COUNT)
+        # §10.3 后端合并：确定性 plan 锁定 which stages，LLM 仅叠加 focus 字段到匹配 stage
+        # （LLM 增删 stage 一律忽略）。
+        agent_plan = _merge_plan_with_llm_focus(deterministic_plan, llm_plan)
+        agent_plan = _ensure_baseline_agents(agent_plan, max_agents=FALLBACK_MAX_AGENT_COUNT)
+        # §10.2 schema quality gate：校验 plan 结构。仅检测+记 note，不替换归一化
+        # （执行型数据，须保留 priority/_baseline_required 等全部字段供 _execute_sub_agents 使用）。
+        _validated, _err = validate_stage_output("plan", agent_plan)
+        if _err:
+            _add_task_degradation(task, "plan_output_schema_validation_failed", f"Supervisor 规划输出 schema 校验失败：{_err[:120]}", "planning")
 
         plan_stage.findings = agent_plan if isinstance(agent_plan, dict) else {"raw": str(agent_plan)[:5000]}
         plan_stage.llm_response = result["content"][:10000]
         plan_stage.status = "completed"
         plan_stage.completed_at = datetime.now(timezone.utc)
+        await rt.complete_subtask(session, subtask.id if subtask else None)
+        await _record_agent_meta(session, task.id, "supervisor_plan", result, stage_num=-1, error=None, subtask_id=subtask.id if subtask else None)
+        await rt.emit_event(session, task_id=task.id, event_type=rt.EVENT_AGENT_COMPLETED, payload={"role": "supervisor_plan"}, stage_num=-1)
 
         summary = task.summary if isinstance(task.summary, dict) else {}
         summary["agent_plan"] = agent_plan if isinstance(agent_plan, dict) else {}
@@ -853,22 +1215,22 @@ async def _run_supervisor_planning(session, task, stages, llm_config, project, a
         plan_stage.status = "failed"
         plan_stage.completed_at = datetime.now(timezone.utc)
         plan_stage.llm_response = str(exc)[:2000]
+        await rt.fail_subtask(session, subtask.id if subtask else None, f"supervisor_plan 失败：{exc}"[:2000])
+        await _record_agent_meta(session, task.id, "supervisor_plan", None, stage_num=-1, error=str(exc), subtask_id=subtask.id if subtask else None)
+        await rt.emit_event(session, task_id=task.id, event_type=rt.EVENT_AGENT_FAILED, payload={"role": "supervisor_plan", "message": str(exc)[:300]}, stage_num=-1)
         _add_task_degradation(
             task,
             "supervisor_planning_failed",
-            "Supervisor 规划失败，已使用默认审计计划继续执行。",
+            "Supervisor 规划失败，已使用纯确定性审计计划继续执行。",
             "planning",
         )
         await session.commit()
-        logger.warning("Supervisor planning failed, using default plan: %s", exc)
-        fallback_plan = _build_default_plan(
-            rule_hits,
-            source_sink_hints,
-            max_agents=FALLBACK_MAX_AGENT_COUNT,
-        )
+        logger.warning("Supervisor planning failed, using deterministic plan: %s", exc)
+        # LLM 全失败 → 纯确定性 plan（已含 baseline + 证据排期），不依赖 LLM 的阶段取舍。
+        fallback_plan = _ensure_baseline_agents(deterministic_plan, max_agents=FALLBACK_MAX_AGENT_COUNT)
         fallback_plan["_fallback"] = True
         fallback_plan["_fallback_reason"] = "planning_failed"
-        return _ensure_baseline_agents(fallback_plan, max_agents=FALLBACK_MAX_AGENT_COUNT)
+        return fallback_plan
 
 
 async def _run_supervisor_review(session, task, stages, llm_config, audit_memory, agent_plan, extra_findings: dict | None = None):
@@ -876,13 +1238,16 @@ async def _run_supervisor_review(session, task, stages, llm_config, audit_memory
     stage_map = {s.stage_num: s for s in stages}
     review_stage = stage_map.get(-2)
     if not review_stage:
-        review_stage = AuditStage(task_id=task.id, stage_num=-2, stage_name="审核复核", agent_role="supervisor_review", status="pending")
+        review_stage = AuditStage(task_id=task.id, stage_num=-2, stage_name=SUPERVISOR_REVIEW_STAGE_NAME, agent_role="supervisor_review", status="pending")
         session.add(review_stage)
         await session.commit()
         await session.refresh(review_stage)
 
     review_stage.status = "running"
     review_stage.started_at = datetime.now(timezone.utc)
+    await session.commit()
+    await rt.emit_event(session, task_id=task.id, event_type=rt.EVENT_AGENT_STARTED, payload={"role": "supervisor_review"}, stage_num=-2)
+    subtask = await rt.start_subtask(session, task_id=task.id, stage_num=-2, role="supervisor_review")
     await session.commit()
 
     review_context = _build_review_context(audit_memory, agent_plan, stages)
@@ -907,10 +1272,19 @@ async def _run_supervisor_review(session, task, stages, llm_config, audit_memory
             # Feed rerun execution back into the review payload for frontend visibility.
             review.update(extra_findings)
         review = _finalize_review_result(review if isinstance(review, dict) else {}, stages)
+        if isinstance(review, dict):
+            # §10.2 schema quality gate：校验 review 结构。仅检测+记 note，不替换归一化
+            # （须保留 review_closure 等字段供 summary.review_outcome 与前端使用）。
+            _validated, _err = validate_stage_output("review", review)
+            if _err:
+                _add_task_degradation(task, "review_output_schema_validation_failed", f"Supervisor 复核输出 schema 校验失败：{_err[:120]}", "review")
         review_stage.findings = review if isinstance(review, dict) else {"raw": str(review)[:5000]}
         review_stage.llm_response = result["content"][:10000]
         review_stage.status = "completed"
         review_stage.completed_at = datetime.now(timezone.utc)
+        await rt.complete_subtask(session, subtask.id if subtask else None)
+        await _record_agent_meta(session, task.id, "supervisor_review", result, stage_num=-2, error=None, subtask_id=subtask.id if subtask else None)
+        await rt.emit_event(session, task_id=task.id, event_type=rt.EVENT_AGENT_COMPLETED, payload={"role": "supervisor_review"}, stage_num=-2)
         summary = dict(task.summary) if isinstance(task.summary, dict) else {}
         summary["review_outcome"] = review.get("review_closure", {}) if isinstance(review, dict) else {}
         task.summary = summary
@@ -921,6 +1295,9 @@ async def _run_supervisor_review(session, task, stages, llm_config, audit_memory
         review_stage.status = "failed"
         review_stage.completed_at = datetime.now(timezone.utc)
         review_stage.llm_response = str(exc)[:2000]
+        await rt.fail_subtask(session, subtask.id if subtask else None, f"supervisor_review 失败：{exc}"[:2000])
+        await _record_agent_meta(session, task.id, "supervisor_review", None, stage_num=-2, error=str(exc), subtask_id=subtask.id if subtask else None)
+        await rt.emit_event(session, task_id=task.id, event_type=rt.EVENT_AGENT_FAILED, payload={"role": "supervisor_review", "message": str(exc)[:300]}, stage_num=-2)
         _add_task_degradation(
             task,
             "supervisor_review_failed",
@@ -949,17 +1326,77 @@ async def _execute_sub_agents(session, task, stages, llm_config, project, code_c
     if not selected:
         selected = _build_default_plan(rule_hits, source_sink_hints).get("selected_agents", [])
 
+    normalized_selected: list[dict] = []
+    seen_selected_stage_nums: set[int] = set()
+    for spec in selected:
+        if not isinstance(spec, dict):
+            continue
+        try:
+            stage_num = int(spec.get("stage_num", 0))
+        except (TypeError, ValueError):
+            continue
+        if stage_num < 2 or stage_num > 9 or stage_num in seen_selected_stage_nums:
+            continue
+        normalized = dict(spec)
+        normalized["stage_num"] = stage_num
+        normalized_selected.append(normalized)
+        seen_selected_stage_nums.add(stage_num)
+    selected = normalized_selected
+    if not selected:
+        message = "Phase 3 did not receive any executable sub-agent stages from the planner."
+        _add_task_degradation(
+            task,
+            "sub_agent_phase_empty_plan",
+            "阶段三没有收到任何可执行的子 Agent 阶段，任务已停止以避免直接进入复核造成假完成。",
+            "sub_agent",
+        )
+        await rt.emit_event(
+            session,
+            task_id=task.id,
+            event_type=rt.EVENT_STAGE_FAILED,
+            payload={"phase": "sub_agents", "message": message},
+        )
+        await session.commit()
+        raise RuntimeError(message)
+
     stage_map = {s.stage_num: s for s in stages}
+    missing_stage_nums = [
+        int(spec["stage_num"])
+        for spec in selected
+        if int(spec["stage_num"]) not in stage_map
+    ]
+    for stage_num in missing_stage_nums:
+        stage = AuditStage(
+            task_id=task.id,
+            stage_num=stage_num,
+            stage_name=get_stage_name(stage_num),
+            status="pending",
+        )
+        session.add(stage)
+        stages.append(stage)
+        stage_map[stage_num] = stage
+        _add_task_degradation(
+            task,
+            f"sub_agent_stage_{stage_num}_record_recovered",
+            f"阶段三执行前发现 Stage {stage_num} 记录缺失，已自动补齐后继续执行。",
+            "sub_agent",
+        )
+    # Release any phase/event writes held by the parent session before child
+    # agent sessions start concurrent SQLite writes.
+    await session.commit()
+
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_AGENTS)
 
     async def run_one_agent(agent_spec: dict):
         stage_num = int(agent_spec.get("stage_num", 0))
         if stage_num < 2 or stage_num > 9:
-            return
+            return {"stage_num": stage_num, "status": "ignored"}
 
         stage = stage_map.get(stage_num)
-        if not stage or stage.status == "completed":
-            return
+        if not stage:
+            return {"stage_num": stage_num, "status": "missing_stage"}
+        if stage.status == "completed":
+            return {"stage_num": stage_num, "status": "already_completed"}
 
         async with semaphore:
             async with async_session() as agent_session:
@@ -968,7 +1405,7 @@ async def _execute_sub_agents(session, task, stages, llm_config, project, code_c
                 )
                 agent_task = result.scalar_one_or_none()
                 if not agent_task:
-                    return
+                    return {"stage_num": stage_num, "status": "missing_task"}
 
                 result = await agent_session.execute(
                     select(AuditStage).where(
@@ -977,16 +1414,27 @@ async def _execute_sub_agents(session, task, stages, llm_config, project, code_c
                     )
                 )
                 agent_stage = result.scalar_one_or_none()
-                if not agent_stage or agent_stage.status == "completed":
-                    return
+                if not agent_stage:
+                    agent_stage = AuditStage(
+                        task_id=task.id,
+                        stage_num=stage_num,
+                        stage_name=get_stage_name(stage_num),
+                        status="pending",
+                    )
+                    agent_session.add(agent_stage)
+                    await agent_session.flush()
+                if agent_stage.status == "completed":
+                    return {"stage_num": stage_num, "status": "already_completed"}
 
-                if await _is_task_cancelled(agent_session, task.id):
-                    return
+                if await _is_task_stopping(agent_session, task.id):
+                    return {"stage_num": stage_num, "status": "stopping"}
 
                 agent_stage.agent_role = "sub_agent"
                 agent_stage.status = "running"
                 agent_stage.started_at = datetime.now(timezone.utc)
-                agent_task.current_stage = stage_num
+                await agent_session.commit()
+                await rt.emit_event(agent_session, task_id=task.id, event_type=rt.EVENT_STAGE_STARTED, payload={"role": "sub_agent"}, stage_num=stage_num)
+                subtask = await rt.start_subtask(agent_session, task_id=task.id, stage_num=stage_num, role="sub_agent")
                 await agent_session.commit()
 
                 audit_memory = _build_audit_memory(list(stages), current_stage_num=stage_num)
@@ -1016,6 +1464,7 @@ async def _execute_sub_agents(session, task, stages, llm_config, project, code_c
                     audit_memory=audit_memory, source_sink_hints=source_sink_hints,
                     focus_files=focus_files, focus_functions=focus_functions,
                 )
+                agent_started = datetime.now(timezone.utc)
                 try:
                     stage_payload = await _run_single_pass_stage(
                         agent_session, agent_task, agent_stage, llm_config, project,
@@ -1023,35 +1472,124 @@ async def _execute_sub_agents(session, task, stages, llm_config, project, code_c
                         code_chunks, static_routes, prev_context, audit_memory,
                         rule_hits, source_sink_hints,
                         supervisor_focus=supervisor_focus if supervisor_focus else None,
+                        forced_routes=focus_routes if isinstance(focus_routes, list) else None,
                     )
                     await _apply_stage_payload(agent_stage, stage_payload, session=agent_session, task=agent_task, static_routes=static_routes, audit_memory=audit_memory)
                     agent_stage.status = "completed"
+                    await rt.complete_subtask(agent_session, subtask.id if subtask else None)
+                    await rt.record_agent_run(
+                        agent_session,
+                        task_id=task.id,
+                        agent_role="sub_agent",
+                        status="completed",
+                        stage_num=stage_num,
+                        subtask_id=subtask.id if subtask else None,
+                        latency_ms=int((datetime.now(timezone.utc) - agent_started).total_seconds() * 1000),
+                        started_at=agent_started,
+                        completed_at=datetime.now(timezone.utc),
+                    )
+                    await rt.emit_event(agent_session, task_id=task.id, event_type=rt.EVENT_STAGE_COMPLETED, payload={"role": "sub_agent"}, stage_num=stage_num)
+                    result_status = "completed"
                 except Exception as exc:
                     agent_stage.status = "failed"
+                    await rt.fail_subtask(agent_session, subtask.id if subtask else None, f"sub_agent Stage {stage_num} 失败：{exc}"[:2000])
+                    await rt.record_agent_run(
+                        agent_session,
+                        task_id=task.id,
+                        agent_role="sub_agent",
+                        status="failed",
+                        stage_num=stage_num,
+                        subtask_id=subtask.id if subtask else None,
+                        latency_ms=int((datetime.now(timezone.utc) - agent_started).total_seconds() * 1000),
+                        error_message=str(exc),
+                        started_at=agent_started,
+                        completed_at=datetime.now(timezone.utc),
+                    )
+                    await rt.emit_event(agent_session, task_id=task.id, event_type=rt.EVENT_STAGE_FAILED, payload={"role": "sub_agent", "message": str(exc)[:300]}, stage_num=stage_num)
                     _add_task_degradation(
                         agent_task,
                         f"sub_agent_stage_{stage_num}_failed",
-                        f"子 Agent Stage {stage_num} 执行失败，已保留该阶段失败状态并继续复核。",
+                        f"子 Agent Stage {stage_num} 执行失败，已保留该阶段失败状态并阻止进入复核。",
                         "sub_agent",
                     )
                     logger.exception("Sub-agent stage %s failed for task %s", stage_num, task.id)
+                    result_status = "failed"
                 agent_stage.completed_at = datetime.now(timezone.utc)
                 await agent_session.commit()
                 logger.info("Task %s sub-agent stage %s completed", task.id, stage_num)
+                return {"stage_num": stage_num, "status": result_status}
 
     tasks = [run_one_agent(spec) for spec in selected]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    unexpected_errors = [result for result in results if isinstance(result, Exception)]
+    if unexpected_errors:
+        message = f"Phase 3 sub-agent scheduling failed before execution: {unexpected_errors[0]}"
+        _add_task_degradation(
+            task,
+            "sub_agent_phase_scheduling_failed",
+            "阶段三子 Agent 调度在进入实际审计前失败，任务已停止以避免直接进入复核造成假完成。",
+            "sub_agent",
+        )
+        await rt.emit_event(
+            session,
+            task_id=task.id,
+            event_type=rt.EVENT_STAGE_FAILED,
+            payload={"phase": "sub_agents", "message": str(unexpected_errors[0])[:500]},
+        )
+        await session.commit()
+        raise RuntimeError(message)
+
+    outcome_by_stage = {
+        int(result.get("stage_num")): str(result.get("status") or "")
+        for result in results
+        if isinstance(result, dict) and result.get("stage_num") is not None
+    }
 
     for s in stages:
         await session.refresh(s)
     await session.refresh(task)
+
+    if await _is_task_stopping(session, task.id):
+        return
+
+    planned_stage_nums = [int(spec["stage_num"]) for spec in selected]
+    executed_stage_nums = [
+        stage.stage_num
+        for stage in stages
+        if stage.stage_num in planned_stage_nums and stage.status in {"completed", "failed", "running"}
+    ]
+    already_completed_stage_nums = [
+        stage_num
+        for stage_num in planned_stage_nums
+        if outcome_by_stage.get(stage_num) == "already_completed"
+    ]
+    if planned_stage_nums and not executed_stage_nums and len(already_completed_stage_nums) != len(planned_stage_nums):
+        message = (
+            "Phase 3 did not start any planned sub-agent stages. "
+            f"planned={planned_stage_nums}, outcomes={outcome_by_stage}"
+        )
+        _add_task_degradation(
+            task,
+            "sub_agent_phase_not_started",
+            "阶段三没有任何子 Agent 真正启动，任务已停止以避免直接进入复核造成假完成。",
+            "sub_agent",
+        )
+        await rt.emit_event(
+            session,
+            task_id=task.id,
+            event_type=rt.EVENT_STAGE_FAILED,
+            payload={"phase": "sub_agents", "planned_stage_nums": planned_stage_nums, "outcomes": outcome_by_stage},
+        )
+        await session.commit()
+        raise RuntimeError(message)
 
     for stage in stages:
         if 2 <= stage.stage_num <= 9 and stage.status == "failed":
             _add_task_degradation(
                 task,
                 f"sub_agent_stage_{stage.stage_num}_failed",
-                f"子 Agent Stage {stage.stage_num} 执行失败，已保留该阶段失败状态并继续复核。",
+                f"子 Agent Stage {stage.stage_num} 执行失败，已保留该阶段失败状态并阻止进入复核。",
                 "sub_agent",
             )
 
@@ -1063,11 +1601,30 @@ async def _execute_sub_agents(session, task, stages, llm_config, project, code_c
             stage.status = "skipped"
             stage.agent_role = "skipped_sub_agent"
             stage.findings = {"skipped": True, "skip_reason": skip_spec.get("skip_reason", "")}
+            await rt.emit_event(
+                session,
+                task_id=task.id,
+                event_type=rt.EVENT_STAGE_SKIPPED,
+                payload={"role": "sub_agent", "reason": skip_spec.get("skip_reason", "")},
+                stage_num=stage_num,
+            )
+            await rt.start_subtask(
+                session,
+                task_id=task.id,
+                stage_num=stage_num,
+                role="sub_agent",
+                status="skipped",
+                reason=str(skip_spec.get("skip_reason", "")),
+            )
     await session.commit()
 
 
-def _build_planning_context(project, audit_memory: dict, rule_hits: list, source_sink_hints: list) -> dict:
-    """Build the supervisor planning prompt context."""
+def _build_planning_context(project, audit_memory: dict, rule_hits: list, source_sink_hints: list, candidate_agents: list | None = None) -> dict:
+    """Build the supervisor planning prompt context.
+
+    §10.3：``candidate_agents`` 是后端确定性 planner 已选定的候选阶段（``_build_default_plan``
+    产出），喂给 LLM 作为「必须为其补充聚焦信息」的阶段清单——LLM 不再自由决定执行哪些阶段。
+    """
     arch_info = audit_memory.get("architecture_info", {}) if isinstance(audit_memory, dict) else {}
     if not isinstance(arch_info, dict):
         arch_info = {}
@@ -1086,6 +1643,19 @@ def _build_planning_context(project, audit_memory: dict, rule_hits: list, source
         hint_count = len([h for h in source_sink_hints if isinstance(h, dict) and stage_num in (h.get("stage_nums") or [])])
         agent_specs_lines.append(f"- Stage {stage_num}: {spec} (rule hits={hit_count}, source-sink hints={hint_count})")
 
+    # §10.3 候选阶段清单：后端已选定，LLM 只为其补 focus。
+    candidate_lines = []
+    for agent in candidate_agents or []:
+        if not isinstance(agent, dict):
+            continue
+        stage_num = _safe_int(agent.get("stage_num"))
+        spec = STAGE_SPECS.get(stage_num, f"Stage {stage_num}")
+        guidance = str(agent.get("focus_guidance") or "")[:200]
+        files = agent.get("focus_files") or []
+        files_str = ", ".join(str(f) for f in files[:5]) if isinstance(files, list) else ""
+        candidate_lines.append(f"- Stage {stage_num}（{spec}）：证据已命中，必须执行。默认聚焦：{guidance}；参考文件：{files_str}")
+    candidate_stages = "\n".join(candidate_lines) if candidate_lines else "（无候选阶段，将由 baseline 兜底）"
+
     return {
         "tech_stack": getattr(project, "tech_stack", "") or "Unknown",
         "file_count": len(evidence_files),
@@ -1095,6 +1665,7 @@ def _build_planning_context(project, audit_memory: dict, rule_hits: list, source
         "rule_hits_summary": rule_hits_summary,
         "source_sink_summary": source_sink_summary,
         "agent_specs": "\n".join(agent_specs_lines),
+        "candidate_stages": candidate_stages,
     }
 
 
@@ -1167,7 +1738,7 @@ def _build_review_context(audit_memory: dict, agent_plan: dict, stages) -> dict:
     stage_summaries = []
     executed = []
     total_vulns = 0
-    severity_dist = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
+    severity_dist = {sev: 0 for sev in SEVERITY_ORDER}
 
     for stage in stages:
         findings = _coerce_stage_findings(stage.findings)
@@ -1279,6 +1850,7 @@ def _build_default_plan(rule_hits: list, source_sink_hints: list, max_agents: in
             {
                 "stage_num": sn,
                 "priority": i + 1,
+                "evidence": stage_evidence.get(sn, 0),
                 "focus_guidance": BASELINE_AGENT_GUIDANCE.get(sn, ""),
                 "focus_files": [],
                 "focus_routes": [],
@@ -1302,6 +1874,7 @@ def _build_default_plan(rule_hits: list, source_sink_hints: list, max_agents: in
             selected.append({
                 "stage_num": stage_num,
                 "priority": len(selected) + 1,
+                "evidence": evidence,
                 "focus_guidance": (
                     f"Audit based on {evidence} static evidence signals"
                     if evidence > 0

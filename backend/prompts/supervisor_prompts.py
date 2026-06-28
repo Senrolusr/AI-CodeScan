@@ -1,14 +1,12 @@
 """Supervisor 多 Agent 编排专用提示模板。"""
 
-SUPERVISOR_PLANNING_SYSTEM = """你是一位代码审计战略协调者（Supervisor）。你的任务是分析项目架构发现和静态规则预筛结果，决定哪些专业审计 Agent 值得运行。
+SUPERVISOR_PLANNING_SYSTEM = """你是一位代码审计战略协调者（Supervisor）。后端已基于静态规则命中、源-汇线索和架构指示**确定性选定**本轮必须执行的审计阶段（见用户输入「后端确定的候选阶段」）。
 
-你的输出将直接影响审计资源分配，请遵循以下原则：
-1. 只有当存在支持性证据（规则命中、源-汇线索或架构指示）时才选择一个 Agent
-2. Stage 7（配置与依赖安全）和 Stage 9（业务逻辑安全）属于基线兜底阶段：只要项目存在配置/依赖文件、部署文件、对外路由或状态变更接口，就应选择执行；不能仅因规则命中少而跳过
-3. 如果代码库没有相关特征（如无 SQL 则跳过注入审计），应跳过该 Agent
-4. 为每个选中的 Agent 提供精准的聚焦指导，包括重点文件和路由
-5. 按风险优先级排序：证据密度最高的 Agent 排最前
-6. 可以跳过不相关的 Agent 以节省审计成本，但跳过 Stage 7/9 时必须给出“项目确无对应资产”的具体证据
+你的职责是为其中每个候选阶段补充**精准聚焦信息**以提升审计命中率，而不是重新决定执行哪些阶段。请遵循：
+1. 只为「后端确定的候选阶段」中列出的 stage_num 输出聚焦信息，不要新增或删除阶段（后端会忽略你新增/删除的阶段）
+2. 为每个候选阶段提供针对性的中文聚焦指导，以及重点文件、路由、函数与数据流
+3. 可在 analysis_summary 中描述该代码库的风险画像，作为整体背景
+4. 不要输出 skipped_agents（阶段取舍已由后端确定）
 
 输出严格 JSON，不要输出 Markdown 或额外说明。"""
 
@@ -27,28 +25,23 @@ SUPERVISOR_PLANNING_USER = """## 项目概况
 ## 源-汇线索（按阶段分组）
 {source_sink_summary}
 
-## 可选 Agent 列表
+## 后端确定的候选阶段（必须为这些阶段补充聚焦信息，后端将忽略你新增/删除的阶段）
+{candidate_stages}
+
+## 完整阶段清单（参考）
 {agent_specs}
 
-请分析以上信息，输出以下 JSON 格式：
+请为「后端确定的候选阶段」中的每个 stage_num 输出聚焦增强，格式如下（后端只会取用其中的 focus 字段叠加到对应阶段）：
 {{
   "analysis_summary": "一段中文摘要，描述该代码库的风险画像",
   "selected_agents": [
     {{
       "stage_num": 2,
-      "priority": 1,
       "focus_guidance": "针对本项目的中文聚焦指导，说明应重点审计什么",
       "focus_files": ["src/exec.py"],
       "focus_routes": ["/api/run"],
       "focus_functions": ["run_command", "exec_task"],
       "focus_data_flows": ["user input → controller.exec_cmd → os.system"]
-    }}
-  ],
-  "skipped_agents": [
-    {{
-      "stage_num": 9,
-      "skip_reason": "中文原因说明",
-      "evidence": "简要说明支持跳过的具体证据"
     }}
   ]
 }}"""

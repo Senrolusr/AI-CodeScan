@@ -12,7 +12,7 @@ const stats = ref({ project_count: 0, audit_count: 0, vuln_count: 0, critical_co
 const recentAudits = ref([])
 const recentVulns = ref([])
 const loading = ref(true)
-const { t, statusLabel, severityLabel, severityColor, statusType, formatDateTime } = useI18n()
+const { t, statusLabel, severityLabel, severityColor, statusType } = useI18n()
 
 const loadDashboard = async () => {
   try {

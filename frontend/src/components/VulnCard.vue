@@ -1,6 +1,6 @@
 <script setup>
 import { useI18n } from '../i18n'
-import { localizeVulnerabilityLabel } from '../utils/vulnerabilityLabels'
+import { localizeVulnerabilityLabel, reviewStatusLabel, reviewStatusTagType } from '../utils/vulnerabilityLabels'
 
 defineProps({ vuln: Object })
 const emit = defineEmits(['click'])
@@ -9,6 +9,8 @@ const {
   severityLabel,
   severityColor,
   pocTagType,
+  confidenceTagType,
+  confidenceLabel,
   t,
 } = useI18n()
 </script>
@@ -33,11 +35,18 @@ const {
         {{ vuln.poc_validation_status === 'valid' ? t('pocValid') : vuln.poc_validation_status === 'invalid' ? t('pocInvalid') : t('pocUnknown') }}
       </el-tag>
       <el-tag
+        v-if="vuln.review_status && vuln.review_status !== 'unreviewed'"
+        size="small"
+        :type="reviewStatusTagType(vuln.review_status)"
+      >
+        {{ reviewStatusLabel(vuln.review_status, locale) }}
+      </el-tag>
+      <el-tag
         v-if="vuln.confidence"
         size="small"
-        :type="vuln.confidence === 'high' ? 'danger' : vuln.confidence === 'medium' ? 'warning' : 'info'"
+        :type="confidenceTagType(vuln.confidence)"
       >
-        {{ vuln.confidence === 'high' ? t('confidenceHigh') : vuln.confidence === 'medium' ? t('confidenceMedium') : t('confidenceLow') }}
+        {{ confidenceLabel(vuln.confidence) }}
       </el-tag>
     </div>
     <div

@@ -1,10 +1,15 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { getVuln } from '../api'
+import { getVuln, updateVulnReview } from '../api'
 import { useI18n } from '../i18n'
-import { localizeVulnerabilityLabel } from '../utils/vulnerabilityLabels'
+import {
+  localizeVulnerabilityLabel,
+  reviewStatusLabel,
+  reviewStatusTagType,
+  vulnLifecycleLabel,
+} from '../utils/vulnerabilityLabels'
 
 const props = defineProps({ id: [String, Number] })
 const router = useRouter()
@@ -14,21 +19,73 @@ const {
   severityLabel,
   severityColor,
   pocTagType,
+  confidenceTagType,
+  confidenceLabel,
+  formatDateTime,
 } = useI18n()
 
 const vuln = ref(null)
 const loading = ref(true)
+const saving = ref(false)
+
+// 复核表单：review_status / status / review_note。
+// reviewer 由后端按登录用户写入，前端不采集（见 L248 保存后只读展示）。
+const reviewForm = ref({
+  review_status: 'unreviewed',
+  status: 'open',
+  review_note: '',
+})
+
+const reviewOptions = computed(() => [
+  { value: 'unreviewed', label: reviewStatusLabel('unreviewed', locale.value) },
+  { value: 'confirmed', label: reviewStatusLabel('confirmed', locale.value) },
+  { value: 'rejected', label: reviewStatusLabel('rejected', locale.value) },
+  { value: 'needs_review', label: reviewStatusLabel('needs_review', locale.value) },
+])
+
+const lifecycleOptions = computed(() => [
+  { value: 'open', label: vulnLifecycleLabel('open', locale.value) },
+  { value: 'accepted_risk', label: vulnLifecycleLabel('accepted_risk', locale.value) },
+  { value: 'fixed', label: vulnLifecycleLabel('fixed', locale.value) },
+])
+
+const hydrateReviewForm = (data) => {
+  if (!data) return
+  reviewForm.value.review_status = data.review_status || 'unreviewed'
+  reviewForm.value.status = data.status || 'open'
+  reviewForm.value.review_note = data.review_note || ''
+}
 
 onMounted(async () => {
   try {
     const res = await getVuln(props.id)
     vuln.value = res.data
+    hydrateReviewForm(res.data)
   } catch {
     ElMessage.error(t('vulnerabilityNotFound'))
   } finally {
     loading.value = false
   }
 })
+
+const saveReview = async () => {
+  if (!vuln.value) return
+  saving.value = true
+  try {
+    const payload = {
+      review_status: reviewForm.value.review_status,
+      status: reviewForm.value.status,
+      review_note: reviewForm.value.review_note,
+    }
+    const res = await updateVulnReview(vuln.value.id, payload)
+    vuln.value = res.data
+    ElMessage.success(t('reviewSaveSuccess'))
+  } catch (err) {
+    ElMessage.error(err?.friendlyMessage || t('reviewSaveFailed'))
+  } finally {
+    saving.value = false
+  }
+}
 </script>
 
 <template>
@@ -47,11 +104,17 @@ onMounted(async () => {
               {{ vuln.poc_validation_status === 'valid' ? t('pocValid') : vuln.poc_validation_status === 'invalid' ? t('pocInvalid') : t('pocUnknown') }}
             </el-tag>
             <el-tag
+              v-if="vuln.review_status && vuln.review_status !== 'unreviewed'"
+              :type="reviewStatusTagType(vuln.review_status)"
+            >
+              {{ reviewStatusLabel(vuln.review_status, locale) }}
+            </el-tag>
+            <el-tag
               v-if="vuln.confidence"
               size="small"
-              :type="vuln.confidence === 'high' ? 'danger' : vuln.confidence === 'medium' ? 'warning' : 'info'"
+              :type="confidenceTagType(vuln.confidence)"
             >
-              {{ vuln.confidence === 'high' ? t('confidenceHigh') : vuln.confidence === 'medium' ? t('confidenceMedium') : t('confidenceLow') }}
+              {{ confidenceLabel(vuln.confidence) }}
             </el-tag>
           </div>
         </div>
@@ -123,15 +186,65 @@ onMounted(async () => {
                 <code v-if="vuln.endpoint">{{ vuln.endpoint }}</code>
                 <span v-else class="text-muted">{{ t('notAvailable') }}</span>
               </el-descriptions-item>
+              <el-descriptions-item v-if="vuln.route_id" :label="t('relatedRoute')">
+                <code>{{ vuln.route_method }} {{ vuln.route_path }}</code>
+                <div v-if="vuln.route_handler" style="font-size: 12px; color: var(--text-muted); margin-top: 2px">{{ vuln.route_handler }}</div>
+              </el-descriptions-item>
               <el-descriptions-item :label="t('confidence')">
                 <el-tag
                   size="small"
-                  :type="vuln.confidence === 'high' ? 'danger' : vuln.confidence === 'medium' ? 'warning' : 'info'"
+                  :type="confidenceTagType(vuln.confidence)"
                 >
-                  {{ vuln.confidence === 'high' ? t('confidenceHigh') : vuln.confidence === 'medium' ? t('confidenceMedium') : t('confidenceLow') }}
+                  {{ confidenceLabel(vuln.confidence) }}
                 </el-tag>
               </el-descriptions-item>
             </el-descriptions>
+          </el-card>
+
+          <el-card shadow="hover" style="margin-top: 16px">
+            <template #header><span style="font-weight: bold">{{ t('manualReview') }}</span></template>
+            <el-form label-position="top" size="small">
+              <el-form-item :label="t('reviewConclusionLabel')">
+                <el-select v-model="reviewForm.review_status" style="width: 100%">
+                  <el-option
+                    v-for="opt in reviewOptions"
+                    :key="opt.value"
+                    :label="opt.label"
+                    :value="opt.value"
+                  />
+                </el-select>
+              </el-form-item>
+              <el-form-item :label="t('reviewLifecycle')">
+                <el-select v-model="reviewForm.status" style="width: 100%">
+                  <el-option
+                    v-for="opt in lifecycleOptions"
+                    :key="opt.value"
+                    :label="opt.label"
+                    :value="opt.value"
+                  />
+                </el-select>
+              </el-form-item>
+              <el-form-item :label="t('reviewNote')">
+                <el-input
+                  v-model="reviewForm.review_note"
+                  type="textarea"
+                  :rows="3"
+                  :placeholder="t('reviewNotePlaceholder')"
+                />
+              </el-form-item>
+              <el-form-item>
+                <el-button type="primary" :loading="saving" style="width: 100%" @click="saveReview">
+                  {{ t('save') }}
+                </el-button>
+              </el-form-item>
+            </el-form>
+            <div v-if="vuln.reviewed_at" style="margin-top: 8px; color: var(--text-muted); font-size: 12px; line-height: 1.6">
+              <div>{{ t('reviewedAt') }}：{{ formatDateTime(vuln.reviewed_at) }}</div>
+              <div v-if="vuln.reviewer">{{ t('reviewer') }}：{{ vuln.reviewer }}</div>
+            </div>
+            <div v-if="reviewForm.review_status === 'rejected'" style="margin-top: 8px; color: var(--text-danger); font-size: 12px; line-height: 1.6">
+              {{ t('rejectExcludedHint') }}
+            </div>
           </el-card>
         </el-col>
       </el-row>

@@ -1,3 +1,4 @@
+import asyncio
 import re
 import time
 
@@ -5,12 +6,28 @@ import httpx
 from openai import AsyncOpenAI
 
 from models import LlmConfig
-from services.config import DEFAULT_LLM_TIMEOUT_SECONDS
+from services.config import (
+    DEFAULT_LLM_TIMEOUT_SECONDS,
+    LLM_MAX_RETRIES,
+    LLM_RETRY_BASE_DELAY_SECONDS,
+)
+from services.secret_crypto import resolve_stored_api_key
+
+# 可重试的瞬时错误类别（§4.8 重试策略）。永久错误（鉴权 / 模型 / 客户端 4xx）
+# 立即失败，不浪费重试配额与审计时长。
+RETRYABLE_ERROR_CATEGORIES = {"timeout", "rate_limit", "server_error", "network"}
+# 线性退避上限，避免单次重试间隔过长拖慢审计。
+LLM_RETRY_DELAY_CAP_SECONDS = 10.0
+
+
+def _resolve_api_key(config: LlmConfig) -> str:
+    """解析存储的 api_key：解密 enc: 密文 + 处理 ${ENV_VAR} 引用 + 兼容旧明文。"""
+    return resolve_stored_api_key(config.api_key)
 
 
 def _build_client(config: LlmConfig) -> AsyncOpenAI:
     return AsyncOpenAI(
-        api_key=config.api_key,
+        api_key=_resolve_api_key(config),
         base_url=(config.base_url or "").rstrip("/"),
         timeout=DEFAULT_LLM_TIMEOUT_SECONDS,
     )
@@ -70,7 +87,7 @@ async def _create_response_via_http(
         "max_output_tokens": _resolve_completion_limit(config),
     }
     headers = {
-        "Authorization": f"Bearer {config.api_key}",
+        "Authorization": f"Bearer {_resolve_api_key(config)}",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=DEFAULT_LLM_TIMEOUT_SECONDS) as client:
@@ -188,30 +205,82 @@ async def _call_with_mode(
     }
 
 
-async def call_llm_with_meta(config: LlmConfig, system_prompt: str, user_prompt: str) -> dict:
-    last_error = None
-    api_mode = _get_api_mode(config)
+def _classify_call_error(exc: Exception) -> str:
+    """把调用路径异常归类为稳定类别，供重试决策用（§4.8 上游错误分类）。
 
-    for attempt in range(2):
+    优先看 HTTP 状态码（精确）：429→限流、5xx→上游错误均可重试；401/403→鉴权、
+    404→模型、其余 4xx→客户端错误均立即失败。无状态码（连接拒绝 / DNS / 读超时等
+    网络层）回退到**原始**消息匹配（``_format_exception_message`` 会本地化、抹掉
+    英文关键词，故分类必须读 ``str(exc)`` 原文 + 异常类名），默认按瞬时 ``network``
+    处理，宁可多一次重试也不误杀。
+    """
+    status_code = _extract_status_code(exc)
+    if isinstance(status_code, int):
+        if status_code == 429:
+            return "rate_limit"
+        if status_code >= 500:
+            return "server_error"
+        if status_code in (401, 403):
+            return "auth"
+        if status_code == 404:
+            return "model"
+        return "client_error"  # 其余 4xx：请求永久非法，重试无意义
+
+    raw = str(exc) or ""
+    combined = f"{raw} {exc.__class__.__name__}".lower()
+    if "timeout" in combined or "timed out" in combined or "超时" in raw:
+        return "timeout"
+    if "blocked" in combined:
+        return "blocked"
+    if (
+        "unauthorized" in combined
+        or "invalid api key" in combined
+        or "authentication" in combined
+        or "认证失败" in raw
+    ):
+        return "auth"
+    if "not found" in combined and "model" in combined:
+        return "model"
+    # 连接拒绝 / DNS / 读错误等网络层瞬时故障
+    return "network"
+
+
+def _retry_delay_seconds(failed_attempt: int) -> float:
+    """线性退避：第 failed_attempt 次失败后等待 base*failed_attempt，封顶 LLM_RETRY_DELAY_CAP_SECONDS。"""
+    return min(LLM_RETRY_BASE_DELAY_SECONDS * max(1, failed_attempt), LLM_RETRY_DELAY_CAP_SECONDS)
+
+
+async def call_llm_with_meta(config: LlmConfig, system_prompt: str, user_prompt: str) -> dict:
+    api_mode = _get_api_mode(config)
+    last_error = None
+    max_attempts = 1 + max(0, LLM_MAX_RETRIES)
+
+    # 初始 1 次 + 至多 LLM_MAX_RETRIES 次重试。瞬时错误（timeout/限流/5xx/网络）退避后重试，
+    # 永久错误（鉴权/模型/客户端 4xx）立即返回，不浪费审计时长。
+    for attempt in range(max_attempts):
         try:
             result = await _call_with_mode(config, system_prompt, user_prompt, api_mode)
             result["meta"]["attempt"] = attempt + 1
             return result
         except Exception as exc:
-            error_message = _format_exception_message(exc)
+            category = _classify_call_error(exc)
             last_error = {
-                "message": error_message,
+                "message": _format_exception_message(exc),
+                "category": category,
                 "latency_ms": None,
                 "attempt": attempt + 1,
             }
-            if "超时" not in error_message and "timeout" not in error_message.lower():
-                break
+            if category not in RETRYABLE_ERROR_CATEGORIES:
+                break  # 永久错误：重试无意义，立即失败
+            if attempt + 1 < max_attempts:
+                await asyncio.sleep(_retry_delay_seconds(attempt + 1))  # 最后一轮失败后不再睡
 
     return {
         "success": False,
         "content": "",
         "error": last_error or {
             "message": "未知模型错误",
+            "category": "unknown",
             "latency_ms": None,
             "attempt": 1,
         },
@@ -253,6 +322,10 @@ def _classify_error(error_text: str) -> str:
 
 
 def _extract_status_code(exc: Exception) -> int | None:
+    # openai SDK 异常直接暴露 status_code；httpx/openai 的 HTTPStatusError 在 .response.status_code。
+    direct = getattr(exc, "status_code", None)
+    if isinstance(direct, int):
+        return direct
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
     if isinstance(status_code, int):
@@ -335,8 +408,8 @@ async def _run_test_probe(config: LlmConfig, api_mode: str) -> dict:
                 },
                 {"role": "user", "content": "Reply with pong"},
             ],
-            temperature=0,
-            max_tokens=16,
+            temperature=config.temperature if config.temperature is not None else 0.1,
+            max_tokens=128,
         )
         content = (response.choices[0].message.content or "").strip()
         model = response.model or config.model_name
@@ -394,17 +467,26 @@ async def test_llm_connection(config: LlmConfig) -> dict:
     strict_successful_mode = None
 
     for api_mode in [preferred_mode, fallback_mode]:
-        try:
-            result = await _run_test_probe(config, api_mode)
-            attempts.append(result)
-            if result["success"] and successful_mode is None:
-                successful_mode = api_mode
-            if result["strict_success"] and strict_successful_mode is None:
-                strict_successful_mode = api_mode
-            if result["success"]:
-                break
-        except Exception as exc:
-            attempts.append(_build_attempt_from_exception(config, api_mode, exc))
+        for attempt_num in range(1, 3):
+            try:
+                result = await _run_test_probe(config, api_mode)
+                result["attempt"] = attempt_num
+                attempts.append(result)
+                if result["success"] and successful_mode is None:
+                    successful_mode = api_mode
+                if result["strict_success"] and strict_successful_mode is None:
+                    strict_successful_mode = api_mode
+                if result["success"]:
+                    break
+            except Exception as exc:
+                attempt = _build_attempt_from_exception(config, api_mode, exc)
+                attempt["attempt"] = attempt_num
+                attempts.append(attempt)
+                if attempt["category"] not in RETRYABLE_ERROR_CATEGORIES or attempt_num >= 2:
+                    break
+                await asyncio.sleep(_retry_delay_seconds(attempt_num))
+        if successful_mode is not None:
+            break
 
     success = successful_mode is not None
     strict_success = strict_successful_mode is not None

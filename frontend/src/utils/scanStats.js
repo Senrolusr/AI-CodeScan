@@ -17,6 +17,16 @@ export const DEFAULT_SCAN_STATS = {
   partial_audit: false,
 }
 
+export function isPartialScan(stats = {}) {
+  return Boolean(
+    stats.partial_audit
+    || stats.truncated_by_audit_file_count
+    || stats.truncated_by_code_chunks
+    || stats.truncated_by_total_chars
+    || stats.oversized_files_compacted
+  )
+}
+
 export function normalizeScanStats(value, { routeCountFallback = 0, ruleHitFallback = 0 } = {}) {
   const source = value && typeof value === 'object' ? value : {}
   const normalized = {
@@ -28,13 +38,7 @@ export function normalizeScanStats(value, { routeCountFallback = 0, ruleHitFallb
   normalized.files_selected_for_audit = normalized.files_selected_for_audit || normalized.files_considered_for_chunks || 0
   normalized.route_count = normalized.route_count || routeCountFallback || 0
   normalized.rule_hit_count = normalized.rule_hit_count || ruleHitFallback || 0
-  normalized.partial_audit = Boolean(
-    normalized.partial_audit
-    || normalized.truncated_by_audit_file_count
-    || normalized.truncated_by_code_chunks
-    || normalized.truncated_by_total_chars
-    || normalized.oversized_files_compacted
-  )
+  normalized.partial_audit = isPartialScan(normalized)
 
   return normalized
 }

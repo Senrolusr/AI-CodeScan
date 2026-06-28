@@ -6,14 +6,28 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import get_db
-from models import AuditTask, Project
+from errors import ApiError
+from models import AuditTask, Project, ProjectFile, ProjectRoute, ProjectRuleHit, ProjectSourceSinkHint
 from services.audit_cleanup import delete_audit_task_records
 from services.code_parser import clear_project_cache, load_project_cache, parse_project, warm_project_cache
+from services.project_index import sync_project_index
+from schemas import ProjectFileOut, ProjectRouteOut, ProjectRuleHitOut, ProjectSourceSinkHintOut
+from services.config import (
+    MAX_COMPRESSION_RATIO,
+    MAX_EXTRACTED_BYTES,
+    MAX_EXTRACTED_FILE_COUNT,
+    MAX_MEMBER_FILE_BYTES,
+    MAX_UPLOAD_BYTES,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 BACKEND_ROOT = os.path.dirname(os.path.dirname(__file__))
 UPLOADS_DIR = os.path.join(BACKEND_ROOT, "uploads")
+
+# 解压时跳过的噪声条目（macOS 资源 fork 等）。
+_NOISE_MEMBER_PREFIXES = ("__MACOSX/",)
+_NOISE_MEMBER_NAMES = {".DS_Store", "Thumbs.db"}
 
 
 def _build_cache_summary(project: Project) -> dict:
@@ -37,11 +51,19 @@ def _build_cache_summary(project: Project) -> dict:
 
 
 async def _save_upload_file(upload: UploadFile, destination: str, chunk_size: int = 1024 * 1024):
+    """流式落盘上传文件，并强制上传体积上限（防超大上传打满磁盘）。"""
+    written = 0
     with open(destination, "wb") as f:
         while True:
             chunk = await upload.read(chunk_size)
             if not chunk:
                 break
+            written += len(chunk)
+            if written > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    400,
+                    f"上传文件超过最大允许体积 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB",
+                )
             f.write(chunk)
 
 
@@ -56,21 +78,87 @@ def _normalize_zip_member_name(name: str) -> str:
     return normalized
 
 
+def _is_noise_member(name: str) -> bool:
+    base = name.rsplit("/", 1)[-1]
+    return base in _NOISE_MEMBER_NAMES or any(name.startswith(p) for p in _NOISE_MEMBER_PREFIXES)
+
+
 def _safe_extract_zip(zip_path: str, target_dir: str):
+    """安全解压：防 ZIP Slip、限制文件数量 / 单文件大小 / 总解压大小 / 压缩比（防 zip bomb）。"""
     target_root = os.path.abspath(target_dir)
+    zip_size = os.path.getsize(zip_path)
+    total_extracted = 0
+    file_count = 0
+
     with zipfile.ZipFile(zip_path, "r") as zf:
-        for member in zf.infolist():
+        members = zf.infolist()
+        # 文件数量上限（先按声明计数，过滤噪声）。
+        kept_members = [m for m in members if not _is_noise_member(_normalize_zip_member_name_safe(m.filename))]
+        if len(kept_members) > MAX_EXTRACTED_FILE_COUNT:
+            raise HTTPException(
+                400,
+                f"ZIP 文件数量 {len(kept_members)} 超过上限 {MAX_EXTRACTED_FILE_COUNT}",
+            )
+
+        for member in members:
             normalized_name = _normalize_zip_member_name(member.filename)
+            if _is_noise_member(normalized_name):
+                continue
+
             member_path = os.path.abspath(os.path.join(target_dir, normalized_name))
             if not member_path.startswith(target_root + os.sep) and member_path != target_root:
                 raise HTTPException(400, f"ZIP 包含非法路径：{member.filename}")
+
             if member.is_dir():
                 os.makedirs(member_path, exist_ok=True)
                 continue
 
+            # 用 zip 头里声明的大小提前做容量/压缩比校验，避免真正写出 zip bomb。
+            declared_size = getattr(member, "file_size", 0) or 0
+            compress_size = getattr(member, "compress_size", 0) or 0
+            if declared_size > MAX_MEMBER_FILE_BYTES:
+                raise HTTPException(
+                    400,
+                    f"ZIP 单文件过大（{normalized_name}：{declared_size} 字节）",
+                )
+            if compress_size > 0 and declared_size / compress_size > MAX_COMPRESSION_RATIO:
+                raise HTTPException(
+                    400,
+                    f"ZIP 压缩比异常（{normalized_name}：{declared_size}/{compress_size}），疑似 zip bomb",
+                )
+            if total_extracted + declared_size > MAX_EXTRACTED_BYTES:
+                raise HTTPException(
+                    400,
+                    f"ZIP 解压后总大小超过上限 {MAX_EXTRACTED_BYTES // (1024 * 1024)}MB",
+                )
+
+            file_count += 1
             os.makedirs(os.path.dirname(member_path), exist_ok=True)
+            written = 0
             with zf.open(member, "r") as src, open(member_path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+                while True:
+                    buf = src.read(1024 * 1024)
+                    if not buf:
+                        break
+                    written += len(buf)
+                    # 写出阶段再次校验真实大小（防止头部撒谎的恶意包）。
+                    if written > MAX_MEMBER_FILE_BYTES:
+                        raise HTTPException(400, f"ZIP 单文件实际大小超限：{normalized_name}")
+                    dst.write(buf)
+            total_extracted += written
+            if total_extracted > MAX_EXTRACTED_BYTES:
+                raise HTTPException(
+                    400,
+                    f"ZIP 解压后总大小超过上限 {MAX_EXTRACTED_BYTES // (1024 * 1024)}MB",
+                )
+
+
+def _normalize_zip_member_name_safe(name: str) -> str:
+    """仅用于统计过滤的路径归一化；遇到非法路径不抛异常（统一交给解压阶段校验）。"""
+    try:
+        return _normalize_zip_member_name(name)
+    except HTTPException:
+        return name
 
 
 @router.post("/upload")
@@ -112,7 +200,10 @@ async def upload_project(
         project.tech_stack = tech_stack
         await db.commit()
         await db.refresh(project)
-        warm_project_cache(project.id, project_dir, file_tree)
+        cache_payload = warm_project_cache(project.id, project_dir, file_tree)
+        # M4b：把静态路由 / 规则命中影子写入结构化表（与项目落库同事务）。
+        await sync_project_index(db, project.id, cache_payload)
+        await db.commit()
         return {"id": project.id, "name": project.name, "tech_stack": tech_stack}
     except zipfile.BadZipFile:
         shutil.rmtree(project_dir, ignore_errors=True)
@@ -155,7 +246,7 @@ async def get_project(project_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Project).where(Project.id == project_id))
     project = result.scalar_one_or_none()
     if not project:
-        raise HTTPException(404, "项目不存在")
+        raise ApiError("PROJECT_NOT_FOUND", "项目不存在", status_code=404)
     cache_summary = _build_cache_summary(project)
     return {
         "id": project.id,
@@ -173,7 +264,7 @@ async def rebuild_project_cache(project_id: int, db: AsyncSession = Depends(get_
     result = await db.execute(select(Project).where(Project.id == project_id))
     project = result.scalar_one_or_none()
     if not project:
-        raise HTTPException(404, "项目不存在")
+        raise ApiError("PROJECT_NOT_FOUND", "项目不存在", status_code=404)
     if not project.upload_path or not os.path.isdir(project.upload_path):
         raise HTTPException(400, "项目源码目录不存在")
 
@@ -188,6 +279,9 @@ async def rebuild_project_cache(project_id: int, db: AsyncSession = Depends(get_
 
     clear_project_cache(project.id)
     cache_payload = warm_project_cache(project.id, project.upload_path, file_tree)
+    # M4b：把重建后的静态路由 / 规则命中影子写入结构化表。
+    await sync_project_index(db, project.id, cache_payload)
+    await db.commit()
 
     return {
         "id": project.id,
@@ -198,6 +292,68 @@ async def rebuild_project_cache(project_id: int, db: AsyncSession = Depends(get_
         "rule_hit_count": len(cache_payload.get("rule_hits", []) or []),
         "message": "项目缓存已重建",
     }
+
+
+async def _project_exists(db: AsyncSession, project_id: int) -> bool:
+    result = await db.execute(select(Project.id).where(Project.id == project_id))
+    return result.scalar_one_or_none() is not None
+
+
+@router.get("/{project_id}/routes")
+async def list_project_routes(project_id: int, db: AsyncSession = Depends(get_db)):
+    if not await _project_exists(db, project_id):
+        raise ApiError("PROJECT_NOT_FOUND", "项目不存在", status_code=404)
+    result = await db.execute(
+        select(ProjectRoute)
+        .where(ProjectRoute.project_id == project_id)
+        .order_by(ProjectRoute.path)
+    )
+    return [ProjectRouteOut.model_validate(r).model_dump() for r in result.scalars().all()]
+
+
+@router.get("/{project_id}/rule-hits")
+async def list_project_rule_hits(project_id: int, db: AsyncSession = Depends(get_db)):
+    if not await _project_exists(db, project_id):
+        raise ApiError("PROJECT_NOT_FOUND", "项目不存在", status_code=404)
+    result = await db.execute(
+        select(ProjectRuleHit)
+        .where(ProjectRuleHit.project_id == project_id)
+        .order_by(ProjectRuleHit.weighted_score.desc())
+    )
+    return [ProjectRuleHitOut.model_validate(r).model_dump() for r in result.scalars().all()]
+
+
+@router.get("/{project_id}/source-sink-hints")
+async def list_project_source_sink_hints(project_id: int, db: AsyncSession = Depends(get_db)):
+    """M4b 三联之 source-sink 线索（§12.2 行1087：与 routes/rule-hits 并列）。
+
+    按 risk_score 降序，供前端项目页独立消费。
+    """
+    if not await _project_exists(db, project_id):
+        raise ApiError("PROJECT_NOT_FOUND", "项目不存在", status_code=404)
+    result = await db.execute(
+        select(ProjectSourceSinkHint)
+        .where(ProjectSourceSinkHint.project_id == project_id)
+        .order_by(ProjectSourceSinkHint.risk_score.desc())
+    )
+    return [ProjectSourceSinkHintOut.model_validate(r).model_dump() for r in result.scalars().all()]
+
+
+@router.get("/{project_id}/files")
+async def list_project_files(project_id: int, db: AsyncSession = Depends(get_db)):
+    """§9.3 项目源文件结构化索引（与 routes/rule-hits/source-sink-hints 并列）。
+
+    每源文件一行：path/size/extension/role/risk_score/content_hash。
+    按 risk_score 降序、path 升序，供前端项目页独立消费（高风险文件前置）。
+    """
+    if not await _project_exists(db, project_id):
+        raise ApiError("PROJECT_NOT_FOUND", "项目不存在", status_code=404)
+    result = await db.execute(
+        select(ProjectFile)
+        .where(ProjectFile.project_id == project_id)
+        .order_by(ProjectFile.risk_score.desc(), ProjectFile.path.asc())
+    )
+    return [ProjectFileOut.model_validate(r).model_dump() for r in result.scalars().all()]
 
 
 @router.get("/{project_id}/file")
@@ -211,7 +367,7 @@ async def get_project_file(
     result = await db.execute(select(Project).where(Project.id == project_id))
     project = result.scalar_one_or_none()
     if not project:
-        raise HTTPException(404, "项目不存在")
+        raise ApiError("PROJECT_NOT_FOUND", "项目不存在", status_code=404)
 
     project_root = os.path.abspath(project.upload_path)
     full_path = os.path.abspath(os.path.join(project_root, path))
@@ -244,7 +400,7 @@ async def delete_project(project_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Project).where(Project.id == project_id))
     project = result.scalar_one_or_none()
     if not project:
-        raise HTTPException(404, "项目不存在")
+        raise ApiError("PROJECT_NOT_FOUND", "项目不存在", status_code=404)
 
     result = await db.execute(select(AuditTask).where(AuditTask.project_id == project_id))
     audit_tasks = result.scalars().all()

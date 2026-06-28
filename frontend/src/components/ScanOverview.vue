@@ -1,7 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import { useI18n } from '../i18n'
-import { normalizeScanStats } from '../utils/scanStats'
+import { isPartialScan, normalizeScanStats } from '../utils/scanStats'
 
 const props = defineProps({
   stats: { type: Object, default: () => ({}) },
@@ -19,12 +19,7 @@ const scanStats = computed(() => normalizeScanStats(props.stats, {
   ruleHitFallback: props.ruleHitFallback,
 }))
 const shouldShowTokenUsage = computed(() => props.showTokenUsage && props.tokenStats)
-const shouldShowWarning = computed(() => props.showWarnings && (
-  scanStats.value.partial_audit
-  || scanStats.value.truncated_by_audit_file_count
-  || scanStats.value.truncated_by_code_chunks
-  || scanStats.value.truncated_by_total_chars
-))
+const shouldShowWarning = computed(() => props.showWarnings && isPartialScan(scanStats.value))
 </script>
 
 <template>

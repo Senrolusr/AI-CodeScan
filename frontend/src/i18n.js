@@ -134,10 +134,16 @@ const zhMessages = {
   exportFailed: '导出失败',
   auditTaskNotFound: '审计任务不存在',
   retry: '重试',
+  pause: '暂停',
+  resume: '恢复',
   auditCancelled: '审计已取消',
   cancelFailed: '取消失败',
   retryStarted: '已开始重试',
   retryFailed: '重试失败',
+  pauseStarted: '已请求暂停',
+  pauseFailed: '暂停失败',
+  resumeStarted: '已开始恢复',
+  resumeFailed: '恢复失败',
   vulnerabilityNotFound: '漏洞不存在',
   backToAudit: '返回审计',
   details: '详情',
@@ -146,6 +152,7 @@ const zhMessages = {
   fixSuggestion: '修复建议',
   lines: '行号',
   endpoint: '接口',
+  relatedRoute: '关联路由',
   pocStatus: 'POC 状态',
   pocValidationNote: 'POC 校验说明',
   pocValid: 'POC 已通过',
@@ -157,6 +164,38 @@ const zhMessages = {
   completed: '已完成',
   failed: '失败',
   cancelled: '已取消',
+  time: '时间',
+  runActivity: '运行活动',
+  diagnosticNotStarted: '未开始',
+  diagnosticStarting: '启动中',
+  diagnosticRunning: '执行中',
+  diagnosticWaiting: '等待中',
+  diagnosticStalled: '疑似卡住',
+  diagnosticBlocked: '已阻塞',
+  currentStage: '当前阶段',
+  agentRole: 'Agent 角色',
+  lastProgress: '最近进展',
+  silenceTime: '静默时间',
+  latestEvent: '最近事件',
+  activeAgent: '活跃 Agent',
+  runId: '运行 ID',
+  agentAttempts: 'Agent 尝试',
+  orchestrationGuard: '编排守卫',
+  stageMatrixWorkbench: '阶段矩阵',
+  stageMatrixSubtitle: '汇总每个阶段的计划、执行、Agent 尝试、漏洞和路由覆盖。',
+  planState: '计划状态',
+  notPlanned: '未计划',
+  blockedReason: '阻塞原因',
+  plannedStages: '计划阶段',
+  completedStages: '完成阶段',
+  missingStages: '缺失阶段',
+  secondsShort: '{count} 秒',
+  minutesShort: '{count} 分钟',
+  hoursShort: '{count} 小时',
+  noEvents: '暂无运行事件',
+  loadMore: '加载更多',
+  loadFailed: '加载失败',
+  streamDegraded: '实时连接已断开，改用轮询',
   skipped: '已跳过',
   testPassed: '通过',
   latency: '延迟',
@@ -387,6 +426,38 @@ const zhMessages = {
   confidenceHigh: '高',
   confidenceMedium: '中',
   confidenceLow: '低',
+  manualReview: '人工复核',
+  reviewConclusionLabel: '复核结论',
+  reviewLifecycle: '生命周期',
+  reviewNote: '复核备注',
+  reviewNotePlaceholder: '补充复核说明（可选）',
+  reviewer: '复核人',
+  reviewedAt: '复核时间',
+  reviewSaveSuccess: '复核已保存',
+  reviewSaveFailed: '保存复核失败',
+  reviewFilterAll: '全部',
+  rejectExcludedHint: '标记为“误报”的漏洞将从审计报告中排除。',
+  projectRoutes: '项目静态路由',
+  projectRuleHits: '项目规则命中',
+  noProjectRoutes: '暂无静态路由',
+  noProjectRuleHits: '暂无规则命中',
+  riskScore: '风险分',
+  weightedScore: '加权分',
+  ruleLabel: '标签',
+  loginTitle: '请登录',
+  login: '登录',
+  logout: '登出',
+  username: '用户名',
+  password: '密码',
+  loginFillWarning: '请输入用户名和密码',
+  loginFailed: '登录失败',
+  changePassword: '修改密码',
+  oldPassword: '原密码',
+  newPassword: '新密码',
+  confirmPassword: '确认新密码',
+  passwordTooShort: '新密码至少 6 位',
+  passwordMismatch: '两次输入的新密码不一致',
+  passwordChanged: '密码已修改',
 }
 
 const enMessages = {
@@ -521,10 +592,16 @@ const enMessages = {
   exportFailed: 'Export failed',
   auditTaskNotFound: 'Audit task not found',
   retry: 'Retry',
+  pause: 'Pause',
+  resume: 'Resume',
   auditCancelled: 'Audit cancelled',
   cancelFailed: 'Cancel failed',
   retryStarted: 'Retry started',
   retryFailed: 'Retry failed',
+  pauseStarted: 'Pause requested',
+  pauseFailed: 'Pause failed',
+  resumeStarted: 'Resume started',
+  resumeFailed: 'Resume failed',
   vulnerabilityNotFound: 'Vulnerability not found',
   backToAudit: 'Back to Audit',
   details: 'Details',
@@ -533,6 +610,7 @@ const enMessages = {
   fixSuggestion: 'Fix Suggestion',
   lines: 'Lines',
   endpoint: 'Endpoint',
+  relatedRoute: 'Related Route',
   pocStatus: 'POC Status',
   pocValidationNote: 'POC Validation Note',
   pocValid: 'POC Valid',
@@ -544,6 +622,38 @@ const enMessages = {
   completed: 'Completed',
   failed: 'Failed',
   cancelled: 'Cancelled',
+  time: 'Time',
+  runActivity: 'Run Activity',
+  diagnosticNotStarted: 'Not Started',
+  diagnosticStarting: 'Starting',
+  diagnosticRunning: 'Running',
+  diagnosticWaiting: 'Waiting',
+  diagnosticStalled: 'Stalled',
+  diagnosticBlocked: 'Blocked',
+  currentStage: 'Current Stage',
+  agentRole: 'Agent Role',
+  lastProgress: 'Last Progress',
+  silenceTime: 'Silence',
+  latestEvent: 'Latest Event',
+  activeAgent: 'Active Agent',
+  runId: 'Run ID',
+  agentAttempts: 'Agent Attempts',
+  orchestrationGuard: 'Orchestration Guard',
+  stageMatrixWorkbench: 'Stage Matrix',
+  stageMatrixSubtitle: 'Summarizes plan, execution, agent attempts, findings, and route coverage by stage.',
+  planState: 'Plan State',
+  notPlanned: 'Not Planned',
+  blockedReason: 'Blocked Reason',
+  plannedStages: 'Planned Stages',
+  completedStages: 'Completed Stages',
+  missingStages: 'Missing Stages',
+  secondsShort: '{count}s',
+  minutesShort: '{count}m',
+  hoursShort: '{count}h',
+  noEvents: 'No run events',
+  loadMore: 'Load more',
+  loadFailed: 'Load failed',
+  streamDegraded: 'Live connection lost, using polling',
   skipped: 'Skipped',
   testPassed: 'Passed',
   latency: 'Latency',
@@ -774,6 +884,38 @@ const enMessages = {
   confidenceHigh: 'High',
   confidenceMedium: 'Medium',
   confidenceLow: 'Low',
+  manualReview: 'Manual Review',
+  reviewConclusionLabel: 'Review Conclusion',
+  reviewLifecycle: 'Lifecycle',
+  reviewNote: 'Review Note',
+  reviewNotePlaceholder: 'Optional review note',
+  reviewer: 'Reviewer',
+  reviewedAt: 'Reviewed At',
+  reviewSaveSuccess: 'Review saved',
+  reviewSaveFailed: 'Failed to save review',
+  reviewFilterAll: 'All',
+  rejectExcludedHint: 'Findings marked as "False Positive" are excluded from the audit report.',
+  projectRoutes: 'Project Routes',
+  projectRuleHits: 'Project Rule Hits',
+  noProjectRoutes: 'No static routes',
+  noProjectRuleHits: 'No rule hits',
+  riskScore: 'Risk Score',
+  weightedScore: 'Weighted Score',
+  ruleLabel: 'Label',
+  loginTitle: 'Please sign in',
+  login: 'Sign in',
+  logout: 'Sign out',
+  username: 'Username',
+  password: 'Password',
+  loginFillWarning: 'Enter your username and password',
+  loginFailed: 'Login failed',
+  changePassword: 'Change Password',
+  oldPassword: 'Current Password',
+  newPassword: 'New Password',
+  confirmPassword: 'Confirm New Password',
+  passwordTooShort: 'New password must be at least 6 characters',
+  passwordMismatch: 'The two new passwords do not match',
+  passwordChanged: 'Password changed',
 }
 
 function normalizeLocale(value) {
@@ -802,8 +944,25 @@ export function setLocale(nextLocale) {
   }
 }
 
+const _SEVERITY_ALIAS = { '严重': 'Critical', '高危': 'High', '高': 'High', '中危': 'Medium', '中': 'Medium', '低危': 'Low', '低': 'Low', '提示': 'Info', '信息': 'Info', critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low', info: 'Info' }
+const _VALID_SEVERITIES = new Set(['Critical', 'High', 'Medium', 'Low', 'Info'])
+
+export function normalizeSeverity(s) {
+  return _SEVERITY_ALIAS[s] || (_VALID_SEVERITIES.has(s) ? s : null)
+}
+
+// 无参数翻译（模板里最高频，如 t('cancel')）按 (locale, key) 缓存成品模板，命中即返回，
+// 跳过逐次 messages 查表 + replaceParams。messages 为静态对象、locale 取值有限，
+// 缓存规模有界（约 2 × key 数），无需淘汰。
+const _templateCache = new Map()
 function getTemplate(key) {
-  return messages[locale.value]?.[key] ?? messages.zh[key] ?? key
+  const lang = locale.value
+  const cacheKey = lang + ' ' + key
+  const hit = _templateCache.get(cacheKey)
+  if (hit !== undefined) return hit
+  const tpl = messages[lang]?.[key] ?? messages.zh[key] ?? key
+  _templateCache.set(cacheKey, tpl)
+  return tpl
 }
 
 function replaceParams(template, params = {}) {
@@ -813,8 +972,18 @@ function replaceParams(template, params = {}) {
   )
 }
 
+// 纯常量映射（不依赖 locale / t），提到模块级避免每次渲染重建对象字面量。
+const STATUS_TAG_TYPE = { pending: 'info', running: 'warning', completed: 'success', failed: 'danger', cancelled: 'info', skipped: 'info', paused: 'warning' }
+const SEVERITY_COLOR = { Critical: '#F56C6C', High: '#E6A23C', Medium: '#409EFF', Low: '#67C23A', Info: '#909399' }
+const POC_TAG_TYPE = { valid: 'success', invalid: 'danger', unknown: 'info' }
+const CONFIDENCE_TAG_TYPE = { high: 'danger', medium: 'warning' }
+
 export function useI18n() {
-  const t = (key, params = {}) => replaceParams(getTemplate(key), params)
+  const t = (key, params = {}) => {
+    // 无参数：模板即成品（replaceParams 对空 params 原样返回），直接走缓存。
+    const tpl = getTemplate(key)
+    return params && Object.keys(params).length ? replaceParams(tpl, params) : tpl
+  }
 
   const statusLabel = (status) => {
     const mapping = {
@@ -829,11 +998,6 @@ export function useI18n() {
     return t(mapping[status] || status || 'unknown')
   }
 
-  const _sevAlias = { '严重': 'Critical', '高危': 'High', '高': 'High', '中危': 'Medium', '中': 'Medium', '低危': 'Low', '低': 'Low', '提示': 'Info', '信息': 'Info', critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low', info: 'Info' }
-  const _validSev = new Set(['Critical', 'High', 'Medium', 'Low', 'Info'])
-
-  const normalizeSeverity = (s) => _sevAlias[s] || (_validSev.has(s) ? s : null)
-
   const severityLabel = (severity) => {
     const zhMap = { Critical: '严重', High: '高危', Medium: '中危', Low: '低危', Info: '提示' }
     const enMap = { Critical: 'Critical', High: 'High', Medium: 'Medium', Low: 'Low', Info: 'Info' }
@@ -842,21 +1006,20 @@ export function useI18n() {
     return locale.value === 'en' ? enMap[key] : zhMap[key]
   }
 
-  const severityColor = (severity) => {
-    const key = normalizeSeverity(severity)
-    const map = { Critical: '#F56C6C', High: '#E6A23C', Medium: '#409EFF', Low: '#67C23A', Info: '#909399' }
-    return map[key] || '#909399'
-  }
+  const severityColor = (severity) => SEVERITY_COLOR[normalizeSeverity(severity)] || '#909399'
 
-  const statusType = (status) => (
-    { pending: 'info', running: 'warning', completed: 'success', failed: 'danger', cancelled: 'info', skipped: 'info', paused: 'warning' }[status] || 'info'
-  )
+  const statusType = (status) => STATUS_TAG_TYPE[status] || 'info'
 
   const boolLabel = (value) => t(value ? 'yes' : 'no')
 
-  const pocTagType = (status) => (
-    { valid: 'success', invalid: 'danger', unknown: 'info' }[status] || 'info'
-  )
+  const pocTagType = (status) => POC_TAG_TYPE[status] || 'info'
+
+  const confidenceTagType = (confidence) => CONFIDENCE_TAG_TYPE[confidence] || 'info'
+
+  const confidenceLabel = (confidence) => {
+    const key = { high: 'confidenceHigh', medium: 'confidenceMedium' }[confidence] || 'confidenceLow'
+    return t(key)
+  }
 
   const formatPercent = (value) => `${Math.round((Number(value || 0) || 0) * 100)}%`
 
@@ -909,6 +1072,8 @@ export function useI18n() {
     normalizeSeverity,
     boolLabel,
     pocTagType,
+    confidenceTagType,
+    confidenceLabel,
     formatPercent,
     formatDateTime,
     formatDate,

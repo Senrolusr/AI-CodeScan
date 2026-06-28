@@ -7,6 +7,8 @@ import os
 from datetime import datetime
 from itertools import groupby
 
+from services.ai_engine.severity import SEVERITY_ORDER
+
 
 def _status_label(status: str) -> str:
     return {
@@ -37,17 +39,12 @@ def _poc_status_label(status: str) -> str:
 
 
 def _severity_rank(severity: str) -> int:
-    return {
-        "Critical": 0,
-        "High": 1,
-        "Medium": 2,
-        "Low": 3,
-        "Info": 4,
-    }.get(severity, 5)
+    # 升序（Critical=0 … Info=4）以服务 sorted/min：Critical 排前
+    return SEVERITY_ORDER.index(severity) if severity in SEVERITY_ORDER else len(SEVERITY_ORDER)
 
 
 def _build_severity_counts(vulns) -> dict:
-    counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
+    counts = {sev: 0 for sev in SEVERITY_ORDER}
     for vuln in vulns:
         severity = getattr(vuln, "severity", "Info") or "Info"
         counts[severity] = counts.get(severity, 0) + 1
@@ -167,6 +164,16 @@ def _render_vulnerability(vuln, index: int) -> str:
     ]
     if endpoint:
         parts.append(f"<dt>接口</dt><dd><code>{_esc(endpoint)}</code></dd>")
+    route_path = getattr(vuln, "route_path", "") or ""
+    route_method = getattr(vuln, "route_method", "") or ""
+    route_handler = getattr(vuln, "route_handler", "") or ""
+    if route_path:
+        route_label = route_path
+        if route_method and route_method not in ("ANY", "UNKNOWN"):
+            route_label = f"{route_method} {route_path}"
+        if route_handler:
+            route_label = f"{route_label} ({route_handler})"
+        parts.append(f"<dt>关联路由</dt><dd><code>{_esc(route_label)}</code></dd>")
     parts.append("</dl>")
 
     description = getattr(vuln, "description", "") or ""
@@ -234,17 +241,21 @@ def _render_vulnerability_groups(vulns) -> str:
     return "\n".join(sections)
 
 
-def _build_html_content(project, task, stages, vulns) -> str:
+def _build_html_content(project, task, stages, vulns, excluded_rejected: int = 0) -> str:
     severity_counts = _build_severity_counts(vulns)
     poc_counts = _build_poc_counts(vulns)
     scan_stats = _get_scan_stats(task)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     project_name = project.name if project else "未知项目"
     tech_stack = project.tech_stack if project and project.tech_stack else "未识别"
+    rejected_note = (
+        f'<div style="margin:8px 0;color:#909399;font-size:13px;">已排除 {excluded_rejected} 条被标记为误报的漏洞。</div>'
+        if excluded_rejected > 0 else ""
+    )
 
     severity_metrics = "".join(
         _render_metric(_severity_label(sev), severity_counts.get(sev, 0))
-        for sev in ["Critical", "High", "Medium", "Low", "Info"]
+        for sev in SEVERITY_ORDER
     )
     scan_metrics = "".join(
         [
@@ -417,6 +428,7 @@ def _build_html_content(project, task, stages, vulns) -> str:
     <section class="panel">
       <h2>审计统计</h2>
       <div class="metrics">{scan_metrics}</div>
+      {rejected_note}
     </section>
 
     {_render_vulnerability_groups(vulns)}
@@ -427,7 +439,10 @@ def _build_html_content(project, task, stages, vulns) -> str:
 
 
 def generate_html(report_dir, project, task, stages, vulns) -> str:
-    content = _build_html_content(project, task, stages, vulns)
+    # M5：报告默认排除被人工标记为误报（rejected）的漏洞（文档 1287.5）
+    visible_vulns = [v for v in (vulns or []) if (getattr(v, "review_status", None) or "unreviewed") != "rejected"]
+    excluded_rejected = len(vulns or []) - len(visible_vulns)
+    content = _build_html_content(project, task, stages, visible_vulns, excluded_rejected=excluded_rejected)
     filepath = os.path.join(report_dir, f"audit_report_{task.id}.html")
     with open(filepath, "w", encoding="utf-8") as file:
         file.write(content)

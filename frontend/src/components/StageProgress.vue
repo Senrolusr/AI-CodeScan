@@ -4,7 +4,6 @@ import { useI18n } from '../i18n'
 
 const props = defineProps({
   stages: Array,
-  current: Number,
 })
 const { t, statusLabel } = useI18n()
 
@@ -48,16 +47,18 @@ const phases = computed(() => {
     color: stageColor(planStage || { status: 'pending' }),
   })
 
+  const plannedAudits = auditStages.length
   const completedAudits = auditStages.filter(s => s.status === 'completed').length
   const runningAudits = auditStages.some(s => s.status === 'running')
   const failedAudits = auditStages.some(s => s.status === 'failed')
   const skippedAudits = auditStages.filter(s => s.status === 'skipped').length
+  const executableAudits = Math.max(0, plannedAudits - skippedAudits)
   const auditColor = runningAudits ? '#409EFF' : failedAudits ? '#F56C6C' : completedAudits > 0 ? '#67C23A' : '#DCDFE6'
 
   result.push({
     key: 'audit',
     label: t('phaseAudit'),
-    subLabel: `${completedAudits}/${auditStages.length - skippedAudits}${skippedAudits ? ` (${skippedAudits} ${t('skipped')})` : ''}`,
+    subLabel: `${completedAudits}/${executableAudits} · ${plannedAudits} ${t('planned') || 'planned'}${skippedAudits ? ` (${skippedAudits} ${t('skipped')})` : ''}`,
     icon: 'A',
     color: auditColor,
     stages: auditStages,
